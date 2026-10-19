@@ -18,13 +18,15 @@ narrative = ["tokenizers>=0.22,<1"]
 novel-translate = "translation.cli:main"
 lightnovel-translate = "lightnovel_translation.cli:main"
 
+[tool.setuptools]
+package-dir = {"" = "src"}
+
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["translation*", "lightnovel_translation*"]
 
 [tool.setuptools.package-data]
-lightnovel_translation = ["py.typed", "resources/*.toml", "resources/skills/lightnovel-translation/*.md",
-                         "resources/skills/lightnovel-translation/references/*.md",
-                         "resources/skills/lightnovel-translation/agents/*.yaml"]
+lightnovel_translation = ["py.typed"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests/translation"]

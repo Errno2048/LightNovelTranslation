@@ -1,24 +1,18 @@
 # LightNovelTranslation
 
-日式轻小说的输入标准化、分层索引、续译定位、连续翻译与审校工具。
-公共 API 位于 `lightnovel_translation`，底层 `translation` 引擎随项目安装。要求 Python >= 3.11。
+日式轻小说的输入标准化、分层索引、续译定位、连续翻译与审校工具。公共 API 为 `lightnovel_translation`，内部 `translation` 引擎随包安装。要求 Python >= 3.11。
 
-## 安装
+## 安装与配置
 
-```powershell
-py -3.11 -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -e ".[dev,narrative]"
+```console
+python -m pip install .
+python -m lightnovel_translation config init
+python -m lightnovel_translation config path
 ```
 
-## 配置
+在本机编辑 `~/.lightnovel_translation/config.toml`，填写模型、兼容 API 端点、API key 和实际容量。不要把凭据粘贴到对话或提交到 Git。`python -m lightnovel_translation config check` 只报告就绪状态与缺失字段，不发起模型请求。
 
-```powershell
-.\.venv\Scripts\python.exe -m lightnovel_translation config init
-.\.venv\Scripts\python.exe -m lightnovel_translation config path
-```
-
-在本机编辑 `~/.lightnovel_translation/config.toml`，填写模型、兼容 API 端点、API key 和容量。不要把凭据粘贴到对话或提交进 Git。`config check` 仅报告就绪状态和缺失字段，不发起模型请求。
-配置模板见 [config.example.toml](lightnovel_translation/resources/config.example.toml)。
+配置模板只有一份：[config.example.toml](skills/lightnovel-translation/assets/config.example.toml)。初始化配置和导出技能均使用它。
 
 ## Python API
 
@@ -34,15 +28,42 @@ with TranslationProject("workspaces/my-novel") as project:
         job.export(include_io=True)
 ```
 
-完整流程见[库使用说明](docs/translation-library-usage.md)、[API 参考](lightnovel_translation/resources/skills/lightnovel-translation/references/api.md)及随包 [SKILL.md](lightnovel_translation/resources/skills/lightnovel-translation/SKILL.md)。跨版本参考需显式构建两侧索引和关联；仅提供中文文件不会自动建立双语映射。
+完整流程见[操作手册](skills/lightnovel-translation/references/workflows.md)、[诊断与恢复](skills/lightnovel-translation/references/diagnostics.md)及[库使用说明](docs/usage.md)。跨版本中文正文可作为文风与术语参考，剧情关联需显式构建两侧索引。通过 `job.reference_report()` 检查实际参考，预算默认按配置容量调整。工程完成不表示译文已经通过人工质量验收。
 
-## 测试与构建
+## Agent 技能
 
-```powershell
-.\.venv\Scripts\python.exe -m pytest tests/translation -q
-.\.venv\Scripts\python.exe -m build
+技能入口为 [skills/lightnovel-translation/SKILL.md](skills/lightnovel-translation/SKILL.md)，使用 Agent Skills 标准目录：入口含 YAML 元信息，按需查阅的文档在 `references/`，配置模板在 `assets/`。技能和所有依赖文档随 Python 安装包分发。
+
+```console
+python -m lightnovel_translation skill export ~/.codex/skills/lightnovel-translation
 ```
 
-`scripts/verify_translation_library.py --wheel <wheel> --output <folder>` 验证隔离安装、CLI、配置与技能导出。工程完成状态不代表语义质量已经通过人工验收。
+Claude Code 工作区可导出到 `.claude/skills/lightnovel-translation`。导出会保留本地定制；遇到内容冲突时改用新目录检查后再合并。
 
-本仓库从 novelfetch 项目的翻译模块独立整理而来；不包含爬虫、小说数据、用户凭据或实验数据库。源版本及迁移验证记录见 [迁移说明](docs/project-extraction.md)。
+## 开发与目录
+
+```text
+src/
+  lightnovel_translation/   公共 Python API、CLI
+  translation/             内部翻译引擎
+skills/lightnovel-translation/
+  SKILL.md                 Agent 技能入口
+  agents/openai.yaml       可选 UI 元信息
+  references/              API、操作流程、诊断、输入修复
+  assets/                  无凭据的配置模板
+docs/usage.md              库使用说明
+examples/library_offline.py
+tests/translation/
+scripts/verify_distribution.py
+```
+
+```console
+python -m pip install -e ".[dev,narrative]"
+python -m pytest -q
+python -m build
+python scripts/verify_distribution.py --wheel dist/lightnovel_translation-0.4.0-py3-none-any.whl --output <temporary-folder>
+```
+
+`src` 布局要求先安装再使用。`skills/` 是技能的唯一维护来源；`setup.py` 仅负责在构建 wheel 时将它打包为库资源，开发安装直接读取源目录。构建验证会检查技能和模板逐字一致，并在仓库外运行隔离安装、CLI、配置初始化、技能导出及离线翻译恢复。
+
+本项目从 novelfetch 的翻译模块独立而来。开发实验、历史设计和小说语料保留在原项目，不属于本仓库的运行依赖。目录依据与维护约定见[开发说明](docs/development.md)。

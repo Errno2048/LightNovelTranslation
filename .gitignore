@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .venv/
+.venv*/
 .pytest_cache/
 *.egg-info/
 build/
@@ -12,9 +13,14 @@ dist/
 !.env.example
 .lightnovel_translation/
 config/*.toml
-!config/library.example.toml
 workspaces/
 artifacts/
 *.sqlite
 *.sqlite3
 *.db
+# User books and local model exports never belong in a source distribution.
+*.epub
+*.mobi
+*.azw*
+*.safetensors
+*.gguf

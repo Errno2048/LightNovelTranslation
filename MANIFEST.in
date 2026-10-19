@@ -1,7 +1,8 @@
-recursive-include lightnovel_translation/resources *.toml *.md *.yaml
-include lightnovel_translation/py.typed
+include AGENTS.md
+include src/lightnovel_translation/py.typed
+recursive-include skills *.md *.toml *.yaml
 recursive-include examples *.py
 recursive-include scripts *.py
 recursive-include tests *.py
 recursive-include docs *.md
-include config/library.example.toml
+global-exclude __pycache__ *.py[cod]

@@ -115,6 +115,10 @@ def test_skill_export_is_complete_idempotent_and_preserves_local_changes(tmp_pat
     result = export_skill(destination)
     assert "SKILL.md" in result["files"] and "references/input-repair.md" in result["files"]
     assert (destination / "agents/openai.yaml").is_file()
+    # Config init and a standalone exported skill must ship the same blank template.
+    init_user_config()
+    assert user_config_path().read_text(encoding="utf-8") == (
+        destination / "assets/config.example.toml").read_text(encoding="utf-8")
     assert export_skill(destination)["files"] == result["files"]
     (destination / "SKILL.md").write_text("local customization", encoding="utf-8")
     with pytest.raises(TranslationError) as caught:
