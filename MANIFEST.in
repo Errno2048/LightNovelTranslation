@@ -1,0 +1,7 @@
+recursive-include lightnovel_translation/resources *.toml *.md *.yaml
+include lightnovel_translation/py.typed
+recursive-include examples *.py
+recursive-include scripts *.py
+recursive-include tests *.py
+recursive-include docs *.md
+include config/library.example.toml

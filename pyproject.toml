@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lightnovel-translation"
+version = "0.4.0"
+description = "Evidence-bound Japanese novel indexing, translation and review"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["httpx>=0.27,<1", "beautifulsoup4>=4.12,<5"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7,<10", "build>=1,<2"]
+narrative = ["tokenizers>=0.22,<1"]
+
+[project.scripts]
+novel-translate = "translation.cli:main"
+lightnovel-translate = "lightnovel_translation.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["translation*", "lightnovel_translation*"]
+
+[tool.setuptools.package-data]
+lightnovel_translation = ["py.typed", "resources/*.toml", "resources/skills/lightnovel-translation/*.md",
+                         "resources/skills/lightnovel-translation/references/*.md",
+                         "resources/skills/lightnovel-translation/agents/*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/translation"]
+

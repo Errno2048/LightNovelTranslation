@@ -1,0 +1,2 @@
+# Preserve exact bytes: experiment identities include source file hashes.
+* -text

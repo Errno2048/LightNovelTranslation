@@ -1,0 +1,3 @@
+interface:
+  display_name: "Light Novel Translation"
+  short_description: "Translate light novels and repair EPUB/TXT inputs"
