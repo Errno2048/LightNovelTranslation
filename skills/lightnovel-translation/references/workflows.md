@@ -2,6 +2,8 @@
 
 本页面向调用已安装库的 agent。示例使用稳定章 ID / `ChapterInfo`，不要求理解内部引擎。先选实际安装包的 Python 解释器；其余操作保持同一解释器、同一工作区。凭据处理见 SKILL.md。
 
+需要解释某一步为什么这样工作、参数如何生效或产物保存在哪时，查[工作原理手册目录](manual/index.md)。目录按本流程排序，每个模块独立成页，附源码文件与符号；不必遍历引擎或加载其他模块全文。
+
 ## 1. 导入、排序与选择目标
 
 ```python
@@ -78,7 +80,7 @@ with project.create_job(
 
 没有 prepared 产物时省略 associations/entity_matches 即可。`resolve_terminology=True` 会在创建任务时进行有界付费补查；其余创建/规划动作不调用模型。它从当前原文发现片假名/技能名候选并结合已有实体，不要求先有同事件匹配。启发式发现可能含普通词，候选不是术语规范。
 
-预检须看两层：`reference_report` 是冻结的候选包，`plan_next.context.edition_reference_selection` 才是经过最终容量检查的入选结果。运行后 report 的 `actual_style_document_ids` 给出已保存请求使用的正文；未运行时该字段为 null。发现没有中文正文时先查 omissions，不能把这一轮作为中文 few-shot 效果证据。
+预检须看两层：`reference_report` 是冻结的候选包，`plan_next.context.edition_reference_selection` 才是经过最终容量检查的入选结果。report 的 `actual_style_document_ids` 给出已保存翻译上下文选入的正文；尚未保存上下文时为 null。上下文可先于 HTTP 请求保存，是否实际发送仍用 `explain` 的 actual-request 确认。发现没有中文正文时先查 omissions，不能把这一轮作为中文 few-shot 效果证据。
 
 ## 5. 恢复、增量与交付
 

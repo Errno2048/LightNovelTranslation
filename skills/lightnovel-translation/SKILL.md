@@ -11,6 +11,8 @@ description: 使用 lightnovel_translation 库标准化 EPUB/TXT 轻小说、建
 
 执行翻译任务时，先阅读 [操作流程](references/workflows.md)，再按需要查 [API](references/api.md)。阻断、参考缺失或预算问题查 [诊断与恢复](references/diagnostics.md)；输入结构异常查 [输入修复](references/input-repair.md)。这些说明随安装包分发，不依赖原仓库。
 
+需要理解内部工作机制时，从 [工作原理手册目录](references/manual/index.md)按流程选择模块：配置与容量、标准化、参考模式、独立索引、跨版检索、续译定位、任务、上下文、输出、审校、增量知识、压缩与恢复。每页附源码位置；先查对应说明，不一次读完整本手册。
+
 优先使用文档示例、公共 API 和结构化诊断完成任务。只有文档缺少必要信息、公开 API 返回无法解释的结果，或任务本身要求修改库时，再定位对应源码。不要为查参数遍历整个引擎。不要一次性加载所有历史设计文档。
 
 ## 配置与凭据

@@ -1,0 +1,128 @@
+# 01 配置与容量预算
+
+[返回目录](index.md) · 下一步：[输入标准化](02-ingestion.md)
+
+## 配置如何加载
+
+`TranslationProject(workspace)` 使用默认私有配置；默认文件不存在时允许本地导入、检查与规划，模型操作才要求配置就绪。`TranslationProject(workspace, config="path.toml")` 使用指定 TOML/JSON；显式 `config=TranslationConfig()` 跳过用户文件，适合离线操作。公共入口不会执行 Python 配置文件，也不读取旧项目的 `config/apikey.py`。
+
+默认目录按“显式 directory 参数 → `LIGHTNOVEL_TRANSLATION_HOME` → `~/.lightnovel_translation`”解析。配置文件名为 `config.toml`。执行 `python -m lightnovel_translation config init` 创建[空模板](../../assets/config.example.toml)，由用户本地填写；agent 用 `config check` 检查就绪状态，不读取含凭据的文件。检查不会访问远端，也不验证模型实际容量。
+
+顶层支持 `schema_version`、`tokenizer_path` 和下面各配置节。当前 schema 为 `1`；未知配置键报错，不会静默忽略。TOML 中不需要的可选字段应省略，不填写 `null`。指定 `tokenizer_path` 时相对配置文件目录解析，需安装 `narrative` 可选依赖；未指定时使用估算计数器。
+
+## `[model]`：连接与模型身份
+
+| 字段 | 作用与默认行为 |
+|---|---|
+| `model` | 网关模型名；不会自动探测其能力 |
+| `base_url` | 兼容接口前缀，Provider 在其后接 `/chat/completions`；禁止 URL 用户密码、query、fragment |
+| `api_key` | 只在进程内用于认证；非空时优先使用 |
+| `api_key_env` | key 为空时读取该环境变量，默认 `LIGHTNOVEL_TRANSLATION_API_KEY` |
+| `timeout` | HTTP 超时秒数；类默认 `240`，模板 `600` |
+| `retries` | 公共入口必须为 `0`；持久化引擎负责有账本的重试 |
+| `thinking` | 默认 `"omit"` 不发送专用思考字段；布尔值发送 enabled/disabled |
+| `reasoning_effort` | 可选，支持 `low/medium/high/max/xhigh/minimal/none`；端点是否接受由上游决定 |
+| `trust_env` | 默认 `true`，使用环境代理；设 `false` 可直连，仍验证 TLS |
+| `dimension` | 可选 embedding 维数；公共翻译主线不要求配置 embedding |
+
+角色共用该生成模型；`[roles.*]` 配置的是预算，不是分别指定不同模型。更换模型或 Provider 身份后创建新任务；原任务的缓存与冻结上下文不能自动换用新身份。
+
+## `[capacity]` 与 `[roles.*]`：单次请求预算
+
+| 字段 | 默认值 | 含义 |
+|---|---:|---|
+| `context_window_tokens` | 131072 | 输入、输出预留和安全空间的总窗口 |
+| `max_output_tokens` | 16384 | 单次允许的最大输出预留 |
+| `max_input_tokens` | 省略 | 端点另有输入上限时设置 |
+| `token_inflation_factor` | 1.05 | token 估算的先验膨胀系数，至少为 1 |
+| `safety_tokens` | 2048 | 协议差异等安全空间，可为 0 |
+
+每个角色支持 `requested_output_tokens` 和 `reasoning_reserve_tokens`。思考预留已经包含在 requested 内，不额外叠加，也不是对上游思考长度的硬控制。
+
+| 角色 | 用途 | 模板输出预留 |
+|---|---|---:|
+| `translator` | 生成初译 | 8192 |
+| `reviewer` | 语义审校 | 8192 |
+| `adjudicator` | 裁决候选问题 | 8192 |
+| `indexer` | 摘要、实体等抽取 | 16384 |
+| `compressor` | 压缩导航摘要 | 8192 |
+| `mapping` | 旧式输出的段落映射 | 未指定时继承 reviewer |
+| `revision` | 根据裁决修订译文 | 未指定时继承 translator |
+| `repair` | 有界格式修复 | 未指定时继承 reviewer |
+
+注意模板与空 `TranslationConfig()` 的默认值不同：未配置角色时，引擎主角色默认 16384、indexer 32768，公共配置先按 capacity 的输出上限裁剪。因此默认容量下均不超过 16384；显式角色预算超出容量会报错。模板还开启 `translation_tools=true`，空配置默认关闭；公共新任务默认使用 `source-records-v1`。
+
+最终请求预算按实际消息计算：
+
+```text
+safe_input = ceil(estimated_final_messages × max(先验膨胀系数, 已校准系数))
+input_limit = min(context_window - requested_output - safety, max_input 或 context_window)
+满足 safe_input <= input_limit 且 requested_output <= max_output 才能发送
+```
+
+估算还包含消息元信息及存在时的工具 schema。usage 可用时以实际输入/估算值并留余量更新系数，只增不减。服务端缓存命中的 tokens 仍占上下文，不能从容量中扣除。分块规划是预估，真正发送前仍检查完整消息。
+
+## `[index]`：已有版本的独立分块
+
+| 字段 | 默认值 | 作用 |
+|---|---:|---|
+| `parent_max_chapters` | 100 | L1 最多包含的章节数 |
+| `child_max_chapters` | 10 | L2 最多包含的章节数 |
+| `child_target_tokens` | 64000 | L2 内容打包目标，受实际可用容量约束 |
+| `child_min_content_tokens` | 4000 | 尽量避免过小 L2；不能突破章界、卷界与硬容量 |
+| `predecessor_reserve_tokens` | 4096 | 为前驱导航预留输入 |
+| `protocol_reserve_tokens` | 4096 | 为提示协议预留输入 |
+
+这些字段属于 `EditionIndexSpec`。连续翻译用另一套自适应分块器；公共配置仅把 parent/child 章数上限及 child 最小内容量作为其默认值，其他字段不会整套共享。
+
+## `[sequence]`：连续运行与增量索引
+
+下表列出可配置项；更改它们不会改写已冻结任务。
+
+| 字段 | 公共新任务默认 | 作用 |
+|---|---|---|
+| `strategy` | `"H"` | R 滚动、U 保留增长、H 分层压缩；见 [13](13-compaction.md) |
+| `mode` | `"working"` | 工作稿提交；也可 `accepted_only` |
+| `n_chapter` / `n_child` | 3 / 2 | 检查点保留的邻近完整双语章/详细 L2 数 |
+| `child_max_chapters` / `parent_max_chapters` | 继承 index | 任务内增量节点上限，可显式覆盖 |
+| `child_min_content_tokens` | 继承 index | 触发避免过小子块的 rollup 策略 |
+| `planning_utilization` | 0.80 | 增量分块使用的规划容量比例 |
+| `parent_summary_input_tokens_per_child` | 8192 | L1 用子摘要 rollup 时的保守输入估算 |
+| `compression_trigger` / `compression_target` | 0.85 / 0.65 | H 压缩触发比例与目标比例 |
+| `soft_input_tokens` | 省略 | 可选输入软预算，最终仍受 capacity 限制 |
+| `max_revisions` | 1 | 初始修订上限，允许 0–2；追加恢复另有接口 |
+| `review_profile` | `"audit-v6"` | 可选 v5/v6 审校协议 |
+| `reference_profile` | `"stable-v1"` | 稳定章/段别名；保留 legacy 兼容 |
+| `mapping_profile` | `"coarse-v1"` | plain 输出映射协议，也支持 audit-v2 |
+| `translation_tools` | false，模板 true | 翻译阶段是否允许只读查证 |
+| `targeted_evidence` / `targeted_evidence_tokens` | true / 12288 | 定向术语及局部证据开关与上限 |
+| `output_profile` | `"source-records-v1"` | 逐源段输出；plain-v1 为兼容路径 |
+
+`source-records-v1` 要求 `stable-v1`。capacity、roles、累计请求/token 限额不能重复放进 sequence，分别在所属节配置。
+
+## `[references]` 与 `[limits]`
+
+| references 字段 | 默认值 | 作用 |
+|---|---|---|
+| `packet_token_budget` | 自动 | 按容量、膨胀系数及最大角色输出推导的参考包预算 |
+| `style_max_documents` | 3 | 中文文风样本最多文档数 |
+| `style_excerpt_paragraphs` | 48 | 完整样本放不下时的局部正文窗口参数 |
+| `terminology_max_terms` | 16 | 每次补查的候选术语上限 |
+| `terminology_input_tokens` | 自动 | 默认约可用输入的四分之一，并受容量限制 |
+| `terminology_output_tokens` | 自动 | 默认 indexer 输出预留，并受单次输出上限限制 |
+| `terminology_max_documents` | 12 | 补查最多读取的参考文档数 |
+| `terminology_radius` | 2 | 参考命中周围的段落半径，可为 0 |
+| `discover_terms` | true | 是否从原文启发式发现片假名、技能等候选 |
+
+`limits` 是耐久的累计上限：`max_requests=300`、`max_input_tokens=20000000`、`max_output_tokens=3000000`、`max_attempts=3`（允许 1–3）。每个索引和每个任务分别记账，不是整个项目共享一份总额度。`capacity.max_output_tokens` 是单次容量，`limits.max_output_tokens` 是累计预算；追加修订次数也不会重置累计账本。
+
+## 查证与代码位置
+
+预算不够先查 `job.plan_next()["context"]["budget"]`、参考 omissions 和分块计划。不要把所有数字一起调大；判断不足来自输入、输出、累计成本还是修订次数。`config.public()` 可用于脱敏诊断，不是恢复凭据的备份。
+
+- `src/lightnovel_translation/config.py`：`TranslationConfig`、`ReferenceConfig`、`Limits`，字段校验、继承、脱敏与自动参考预算。
+- `src/lightnovel_translation/user_config.py`：`user_config_path`、`init_user_config`、`user_config_status`，私有文件管理。
+- `src/translation/config.py`：`ModelConfig`，传输字段与公开身份；其旧 `load_settings` 不属于公共配置路径。
+- `src/translation/budget.py`：`ModelCapacity`、`RoleBudget`、`plan_request`、`observe_usage`。
+- `src/translation/sequence/schemas.py`：`SequenceSpec`，连续任务字段校验与旧任务兼容。
+- 回归入口：`tests/translation/test_library_user_config.py`、`test_library_api.py`、`test_reference_workflows.py`。

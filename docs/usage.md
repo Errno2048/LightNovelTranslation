@@ -2,6 +2,8 @@
 
 执行任务优先查随包[操作手册](../skills/lightnovel-translation/references/workflows.md)和[诊断与恢复](../skills/lightnovel-translation/references/diagnostics.md)，再查 API；无需从内部源码寻找调用配方。新增 `ReferenceConfig`、局部参考准备、实际参考覆盖报告、agent 修订和有界额度扩展均在这些页面说明。
 
+内部运行机制见[工作原理手册目录](../skills/lightnovel-translation/references/manual/index.md)。它按配置、导入、索引与参考、续译、翻译审校、增量知识、压缩恢复的顺序组织，每个模块各一页并附源码位置；按当前问题选读即可。
+
 安装和开发安装：
 
 ```console

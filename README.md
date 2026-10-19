@@ -28,7 +28,7 @@ with TranslationProject("workspaces/my-novel") as project:
         job.export(include_io=True)
 ```
 
-完整流程见[操作手册](skills/lightnovel-translation/references/workflows.md)、[诊断与恢复](skills/lightnovel-translation/references/diagnostics.md)及[库使用说明](docs/usage.md)。跨版本中文正文可作为文风与术语参考，剧情关联需显式构建两侧索引。通过 `job.reference_report()` 检查实际参考，预算默认按配置容量调整。工程完成不表示译文已经通过人工质量验收。
+完整流程见[操作手册](skills/lightnovel-translation/references/workflows.md)、[诊断与恢复](skills/lightnovel-translation/references/diagnostics.md)及[库使用说明](docs/usage.md)。需要理解配置、数据流、模块边界或定位实现时，按流程查阅[工作原理手册目录](skills/lightnovel-translation/references/manual/index.md)，各模块附对应源码文件和函数。跨版本中文正文可作为文风与术语参考，剧情关联需显式构建两侧索引。通过 `job.reference_report()` 检查实际参考，预算默认按配置容量调整。工程完成不表示译文已经通过人工质量验收。
 
 ## Agent 技能
 
@@ -49,7 +49,7 @@ src/
 skills/lightnovel-translation/
   SKILL.md                 Agent 技能入口
   agents/openai.yaml       可选 UI 元信息
-  references/              API、操作流程、诊断、输入修复
+  references/              API、操作流程、诊断、输入修复及 manual/ 工作原理手册
   assets/                  无凭据的配置模板
 docs/usage.md              库使用说明
 examples/library_offline.py
