@@ -4,7 +4,7 @@
 
 ## 配置如何加载
 
-`TranslationProject(workspace)` 使用默认私有配置；默认文件不存在时允许本地导入、检查与规划，模型操作才要求配置就绪。`TranslationProject(workspace, config="path.toml")` 使用指定 TOML/JSON；显式 `config=TranslationConfig()` 跳过用户文件，适合离线操作。公共入口不会执行 Python 配置文件，也不读取旧项目的 `config/apikey.py`。
+`TranslationProject(workspace)` 使用默认私有配置；默认文件不存在时允许本地导入、检查与规划，模型操作才要求配置就绪。`TranslationProject(workspace, config="path.toml")` 使用指定 TOML/JSON；显式 `config=TranslationConfig()` 跳过用户文件，适合离线操作。公共入口只加载指定格式的配置，不执行 Python 配置文件。
 
 默认目录按“显式 directory 参数 → `LIGHTNOVEL_TRANSLATION_HOME` → `~/.lightnovel_translation`”解析。配置文件名为 `config.toml`。执行 `python -m lightnovel_translation config init` 创建[空模板](../../assets/config.example.toml)，由用户本地填写；agent 用 `config check` 检查就绪状态，不读取含凭据的文件。检查不会访问远端，也不验证模型实际容量。
 

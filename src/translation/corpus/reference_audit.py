@@ -281,7 +281,7 @@ def _write_report(chapters, corrected, audits, summary, output):
                  "limitation": "Sequence-key identity checks do not prove every bilingual paragraph or revision matches."}
     write_json(output / "chapter_boundary_checks.json", alignment)
     lines = ["# 参考译文顺序核查", "", f"协议：{PROFILE}。", "",
-             "原因：网页 HTML 经过段落置换，阅读脚本按章节 ID 还原；原爬虫遗漏了这一步。每个 HTTP 分页单独处理，前 20 个非空直接子段落固定。", "",
+             "原因：网页 HTML 经过段落置换，需要按章节 ID 还原阅读顺序。每个 HTTP 分页单独处理，前 20 个非空直接子段落固定。", "",
              f"缓存章节分页：{summary['cached_chapter_pages']}；成功解析：{summary['decoded_pages']}。",
              f"中文正文状态：{summary['narrative_chapter_statuses']}。",
              f"移动段落总数：{summary['moved_paragraphs']}；原输入哈希保持不变：{summary['original_inputs_unchanged']}。", "",

@@ -5,15 +5,15 @@ description: 使用 lightnovel_translation 库标准化 EPUB/TXT 轻小说、建
 
 # Light Novel Translation
 
-使用 Python >= 3.11 的 `lightnovel_translation`，安装名为 `lightnovel-translation`。优先调用公共 API，保留来源、冻结任务和已付费响应。不要依赖某个仓库的 `scripts/run_*.py` 或爬虫布局。
+使用 Python >= 3.11 的 `lightnovel_translation`，安装名为 `lightnovel-translation`。优先调用公共 API，保留来源、冻结任务和已付费响应。
 
 ## 先查文档
 
-执行翻译任务时，先阅读 [操作流程](references/workflows.md)，再按需要查 [API](references/api.md)。阻断、参考缺失或预算问题查 [诊断与恢复](references/diagnostics.md)；输入结构异常查 [输入修复](references/input-repair.md)。这些说明随安装包分发，不依赖原仓库。
+执行翻译任务时，先阅读 [操作流程](references/workflows.md)，再按需要查 [API](references/api.md)。阻断、参考缺失或预算问题查 [诊断与恢复](references/diagnostics.md)；输入结构异常查 [输入修复](references/input-repair.md)。这些说明随安装包分发，可在安装环境中查阅。
 
 需要理解内部工作机制时，从 [工作原理手册目录](references/manual/index.md)按流程选择模块：配置与容量、标准化、参考模式、独立索引、跨版检索、续译定位、任务、上下文、输出、审校、增量知识、压缩与恢复。每页附源码位置；先查对应说明，不一次读完整本手册。
 
-优先使用文档示例、公共 API 和结构化诊断完成任务。只有文档缺少必要信息、公开 API 返回无法解释的结果，或任务本身要求修改库时，再定位对应源码。不要为查参数遍历整个引擎。不要一次性加载所有历史设计文档。
+优先使用文档示例、公共 API 和结构化诊断完成任务。只有文档缺少必要信息、公开 API 返回无法解释的结果，或任务本身要求修改库时，再定位对应源码。不要为查参数遍历整个引擎。
 
 ## 配置与凭据
 
@@ -27,11 +27,13 @@ Agent 不使用 cat/Get-Content、搜索、截图、工具输出或附件读取�
 python -m lightnovel_translation config check
 ```
 
-它仅返回路径、就绪状态和缺失字段名。缺失配置时仍可完成导入、结构检查和本地规划；需要模型的部分待用户本地填写后续跑。不要读取旧项目 `config/apikey.py`、浏览器凭据或其他项目的密钥来自动迁移。
+它仅返回路径、就绪状态和缺失字段名。缺失配置时仍可完成导入、结构检查和本地规划；需要模型的部分待用户本地填写后续跑。不要读取浏览器凭据或其他项目的密钥来自动填充配置。
 
 `TranslationProject(workspace)` 自动加载上述用户配置。显式传入 `TranslationConfig()` 可做完全无模型的本地工作。不要打印 ModelConfig 的 `__dict__` / dataclasses.asdict，也不要向用户请求上传完整配置；`user_config_status()` 是配置排查入口。
 
 ## 工作路径
+
+需要先从中文译本定位或下载 Syosetu 日文原作时，使用随包独立技能 `syosetu-fetch`（`skill export <目录> --name syosetu-fetch`）及 `lightnovel_translation.syosetu` 公共 API。先核对中文头部作者，再检索候选；下载返回的 `epub_path` 可直接作为下述输入。没有采集需求时跳过此步。
 
 先确定用户输入、需要翻译的阅读区间、已有译文版本关系和输出位置。能从本地文件与上下文判断的就继续处理；只有无法判定的歧义才询问用户。读取少量标题和正文确认阅读顺序，不能把标题中的数字直接当作数组下标。
 

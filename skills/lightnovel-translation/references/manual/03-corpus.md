@@ -6,7 +6,7 @@
 
 `TranslationProject(workspace)` 管理配置、Edition 注册表、索引和任务。`project.json` 记录语料位置与指纹；导入产生标准 corpus，`attach_corpus` 则注册已有标准目录而不复制。项目内部路径尽量相对 workspace 保存，外部目录使用绝对路径；移动工作区时必须同时考虑外部语料依赖。
 
-当前部分 schema 名仍为 `novelfetch-project-v1` / `novelfetch-job-v1`，这是保存数据的兼容标识，不表示运行时依赖原爬虫。不要为了名称整齐手工改 schema。
+持久化文件的 schema 是版本兼容标识。不要手工改写 schema；恢复项目与任务时必须保留原标识。
 
 ## 三种“章号”不能混用
 

@@ -11,9 +11,11 @@ python -m pip install .
 python -m pip install -e ".[dev,narrative]"
 ```
 
-分发给其他环境时可先 `python -m build`，再安装 `dist/lightnovel_translation-0.4.0-py3-none-any.whl`。安装名为 `lightnovel-translation`，导入名为 `lightnovel_translation`；原公共名 `novelfetch_translation` 已更名，调用方需更新 import。内部 `translation` 引擎及 `novel-translate` CLI 保留。
+分发给其他环境时可先 `python -m build`，再安装 `dist/lightnovel_translation-0.4.0-py3-none-any.whl`。安装名为 `lightnovel-translation`，导入名为 `lightnovel_translation`。底层引擎入口为 `translation`，CLI 为 `novel-translate`。
 
 ## 私有配置与 agent skill
+
+仅需获取原文时，先用可选的 `lightnovel_translation.syosetu` 模块；不加载翻译凭据、不调用模型。安装 `python -m pip install ".[syosetu]"`，参阅[采集 API 与恢复](../skills/syosetu-fetch/references/acquisition.md)。中文文件先读取有界头部与作者信息，作者全名优先；标题关键词和外部网页只提供待核验候选。`download_work()` 返回清洗过的 EPUB，可直接 `import_book`。独立技能导出为 `python -m lightnovel_translation skill export <destination> --name syosetu-fetch`；不传名称保持原有翻译技能。
 
 ```console
 python -m lightnovel_translation config init
@@ -46,7 +48,7 @@ Claude Code 的工作区技能可导出到 `<workspace>/.claude/skills/lightnove
 
 ## 最简连续翻译
 
-先完成上述本地配置。库不会读取仓库里的 `config/apikey.py`，也不要求配置 embedding。
+先完成上述本地配置。公共 API 使用用户配置文件，不要求配置 embedding。
 
 ```python
 from lightnovel_translation import TranslationProject

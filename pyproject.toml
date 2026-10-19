@@ -13,6 +13,7 @@ dependencies = ["httpx>=0.27,<1", "beautifulsoup4>=4.12,<5"]
 [project.optional-dependencies]
 dev = ["pytest>=7,<10", "build>=1,<2"]
 narrative = ["tokenizers>=0.22,<1"]
+syosetu = ["FanFicFare==4.62.0", "opencc-python-reimplemented>=0.1.7,<0.2"]
 
 [project.scripts]
 novel-translate = "translation.cli:main"

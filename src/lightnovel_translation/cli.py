@@ -19,11 +19,17 @@ def main(argv=None) -> int:
         action.add_argument("--directory", help="Override ~/.lightnovel_translation")
     skill = commands.add_parser("skill", help="Export the bundled agent skill")
     exports = skill.add_subparsers(dest="action", required=True)
-    exports.add_parser("export").add_argument("destination")
+    export = exports.add_parser("export")
+    export.add_argument("destination")
+    export.add_argument("--name", choices=("lightnovel-translation", "syosetu-fetch"), default="lightnovel-translation")
+    from . import syosetu_cli
+    syosetu_cli.add_parser(commands)
     args = parser.parse_args(argv)
+    if args.command == "syosetu":
+        return syosetu_cli.run(args)
     try:
         if args.command == "skill":
-            result = export_skill(args.destination)
+            result = export_skill(args.destination, name=args.name)
         elif args.action == "init":
             result = init_user_config(args.directory)
         elif args.action == "check":

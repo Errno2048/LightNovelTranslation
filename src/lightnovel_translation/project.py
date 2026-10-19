@@ -78,7 +78,7 @@ class Edition:
 class TranslationProject:
     """A reusable local workspace, independent of repository layout and cwd.
 
-    Configuration is never loaded from config/apikey.py. Generation is explicit.
+    Configuration uses the public user configuration loader. Generation is explicit.
     Each job/index has its own persistent request/token limits. One writer per job.
     """
     def __init__(self, workspace: str | Path, config: TranslationConfig | str | Path | None = None,

@@ -7,9 +7,9 @@ from pathlib import Path
 from .errors import TranslationError
 
 
-def export_skill(destination: str | Path) -> dict:
+def export_skill(destination: str | Path, *, name: str = "lightnovel-translation") -> dict:
     destination = Path(destination).expanduser().resolve()
-    root = skill_resources()
+    root = skill_resources(name)
     resources = []
 
     def collect(folder, prefix=Path()):

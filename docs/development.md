@@ -8,12 +8,12 @@ Python 代码采用 [Python Packaging User Guide 的 src layout](https://packagi
 
 ## 维护与验证
 
-修改技能只编辑顶层 `skills/lightnovel-translation/`。模板只编辑其中的 `assets/config.example.toml`，不可加入真实 API key。`setup.py` 在构建时复制技能到 wheel 的包资源内；editable 安装读取顶层技能目录，无需生成第二份文件。
+修改技能只编辑顶层 `skills/` 下对应的技能目录。翻译配置模板只编辑 `skills/lightnovel-translation/assets/config.example.toml`，不可加入真实 API key。`setup.py` 在构建时复制技能到 wheel 的包资源内；editable 安装读取顶层技能目录，无需生成第二份文件。
 
-1. `python -m pip install -e ".[dev,narrative]"` 后运行 `python -m pytest -q`。
+1. `python -m pip install -e ".[dev,narrative,syosetu]"` 后运行 `python -m pytest -q`。
 2. `python -m build` 默认先构建 sdist，再从 sdist 构建 wheel，验证源分发不依赖仓库外文件。
 3. 用 `scripts/verify_distribution.py --wheel <wheel> --output <仓库外临时目录>` 验证技能资源完整性、隔离安装与离线五章翻译恢复。该脚本不访问模型、不读取用户凭据；安装依赖需要包索引网络或本机缓存。
 
 工作区、小说、请求日志、旧构建和临时模型验证脚本保存在仓库外。临时目录应传给示例和验证命令；`.venv`、构建目录及测试缓存可在本地重建，均受 Git 忽略规则约束。
 
-历史实验与 P0–P8 设计记录在原 novelfetch 项目的开发归档。它们不随 wheel 或 sdist 分发，使用当前库无需读取历史实验脚本。公开行为变更同时维护 README、使用说明和技能引用文档。
+公开行为变更同时维护 README、使用说明和技能引用文档。

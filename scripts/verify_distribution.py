@@ -35,6 +35,15 @@ def main():
         bundled_skill = {name.removeprefix(skill_prefix): archive.read(name)
                          for name in names if name.startswith(skill_prefix) and not name.endswith("/")}
         assert bundled_skill == expected_skill, "Wheel skill differs from the canonical skills/ directory"
+        for skill_folder in (root / "skills").iterdir():
+            if not skill_folder.is_dir():
+                continue
+            prefix = "lightnovel_translation/resources/skills/" + skill_folder.name + "/"
+            expected = {p.relative_to(skill_folder).as_posix(): p.read_bytes()
+                        for p in skill_folder.rglob("*") if p.is_file()}
+            actual = {name.removeprefix(prefix): archive.read(name)
+                      for name in names if name.startswith(prefix) and not name.endswith("/")}
+            assert actual == expected, "Wheel skill differs: " + skill_folder.name
         assert "lightnovel_translation/py.typed" in names
         assert "lightnovel_translation/resources/skills/lightnovel-translation/assets/config.example.toml" in names
         assert "lightnovel_translation/resources/skills/lightnovel-translation/SKILL.md" in names
@@ -42,12 +51,11 @@ def main():
         assert "lightnovel_translation/resources/skills/lightnovel-translation/references/diagnostics.md" in names
         assert "translation/editions/retrieval.py" in names
         assert "translation/ingestion/service.py" in names
-        assert not any(name.startswith("novelfetch_translation/") for name in names)
         assert not any("apikey" in name or name.startswith(("config/", "out_", "artifacts/", "workspaces/", "tests/")) for name in names)
     environment = output / "venv"
     venv.EnvBuilder(with_pip=True).create(environment)
     python = environment / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
-    external = Path(tempfile.mkdtemp(prefix="novelfetch-library-"))
+    external = Path(tempfile.mkdtemp(prefix="lightnovel-translation-"))
     shutil.copy2(root / "examples/library_offline.py", external / "demo.py")
 
     def call(label, command, *, expected_returncode=0):
@@ -85,8 +93,17 @@ def main():
     assert {p.relative_to(external / "skill").as_posix(): p.read_bytes()
             for p in (external / "skill").rglob("*") if p.is_file()} == expected_skill
     assert (external / "private/config.toml").read_bytes() == expected_skill["assets/config.example.toml"].replace(b"\r\n", b"\n")
+    acquisition_skill = json.loads(call("source-skill", [str(public_cli), "skill", "export",
+        str(external / "syosetu-fetch"), "--name", "syosetu-fetch"]))
+    assert Path(acquisition_skill["skill_dir"], "references/acquisition.md").is_file()
+    assert "inspect-reference" in call("source-cli", [str(public_cli), "syosetu", "--help"])
+    source_preview = external / "reference-head.txt"
+    source_preview.write_text("作者：某作者\n\n第一章\n\n参考内容。", encoding="utf-8")
+    preview = json.loads(call("source-preview", [str(public_cli), "syosetu", "inspect-reference", str(source_preview)]))
+    assert preview["author_candidates"] == ["某作者"]
     report = {"ok": True, "wheel": str(wheel), "installed": inspected, "external_cwd": str(external),
               "demo": demo, "cli_help_ok": True, "user_config_ok": True, "skill_export_ok": True,
+              "acquisition_skill_export_ok": True, "source_preview_ok": True,
               "model_requests": 0}
     (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(report, ensure_ascii=True, indent=2))
