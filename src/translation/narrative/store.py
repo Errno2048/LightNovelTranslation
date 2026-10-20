@@ -55,9 +55,15 @@ class NarrativeStore:
             requests, inputs, outputs = self.db.execute(
                 "SELECT COUNT(*),COALESCE(SUM(input_reserved),0),COALESCE(SUM(output_reserved),0) FROM attempts").fetchone()
             kind_count = self.db.execute("SELECT COUNT(*) FROM attempts WHERE kind=?", (kind,)).fetchone()[0]
-            if kind_count >= limits[kind + "_requests"] or requests >= limits.get("requests", 24):
+            kind_limit = limits.get(kind + "_requests", 0)
+            request_limit = limits.get("requests", 0)
+            if ((kind_limit and kind_count >= kind_limit) or
+                    (request_limit and requests >= request_limit)):
                 raise NarrativeError("budget_exceeded", "request ledger limit reached")
-            if inputs + input_tokens > limits["input_tokens"] or outputs + output_tokens > limits["output_tokens"]:
+            input_limit = limits.get("input_tokens", 0)
+            output_limit = limits.get("output_tokens", 0)
+            if ((input_limit and inputs + input_tokens > input_limit) or
+                    (output_limit and outputs + output_tokens > output_limit)):
                 raise NarrativeError("budget_exceeded", "cumulative reserved token limit reached")
             cursor = self.db.execute("INSERT INTO attempts(identity,kind,input_reserved,output_reserved,status,payload) VALUES(?,?,?,?,?,?)",
                                      (identity, kind, input_tokens, output_tokens, "running", json.dumps({"started": time.time()})))

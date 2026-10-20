@@ -120,7 +120,7 @@ L2 尚未构建不能使直接 L1 进入 blocked。它只表示：如果直接�
 接口名称可在实现时调整，职责应明确分离：
 
 - 历史规划/准备：接收源版本、可选双语映射、近章窗口和索引参数；先返回本地计划，再由显式构建操作执行模型调用。
-- 父级构建：默认 direct_then_rollup；结果区分 direct、child_summary_rollup、partial、blocked_context 和其他失败。
+- 父级构建：新任务默认严格 direct；预检判定最小 L1 放不下时返回容量决策状态，显式选择后才使用 child_summary_rollup 或 direct_then_rollup。结果区分 direct、child_summary_rollup、partial、blocked_context 和其他失败。
 - 细节检索：指定 parent/child 和请求原因，只确保请求范围内的 L2 存在。
 - 任务规划报告：展示索引修订、最近完整双语、邻近 L2、远距 L1、未覆盖范围和预算。
 - 翻译后的物化：更新提交章节的增量节点，并供下一检查点选择新索引修订。

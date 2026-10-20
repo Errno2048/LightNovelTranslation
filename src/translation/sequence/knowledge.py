@@ -279,4 +279,7 @@ def materialize_nodes(repo,spec,view,provider,*,force_open=False):
         for eid,payload in repo.db.execute("SELECT id,payload FROM sequence_outbox WHERE status='pending'").fetchall():
             if json.loads(payload)['source_id'] in done:
                 repo.db.execute("UPDATE sequence_outbox SET status='completed' WHERE id=?",(eid,))
+    from .entities import update_entity_catalog
+    entity_nodes = latest_nodes(repo) + latest_incremental_nodes(repo)
+    update_entity_catalog(repo, spec, view, caller, entity_nodes)
     return ready

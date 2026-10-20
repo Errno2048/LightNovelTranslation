@@ -166,7 +166,8 @@ def test_incremental_parent_tries_direct_then_rolls_up_only_on_capacity(tmp_path
             return super().generate(request)
 
     config = TranslationConfig(index=EditionIndexSpec(parent_max_chapters=6, child_max_chapters=2),
-                               sequence={'n_chapter': 2, 'n_child': 1})
+                               sequence={'n_chapter': 2, 'n_child': 1,
+                                         'parent_build_mode': 'direct_then_rollup'})
     provider = DirectTooLarge()
     project, _, _, job, _ = make_history(tmp_path, provider=provider,
                                          history=0, total=9, config=config, mode='source_only')
@@ -197,7 +198,7 @@ def test_independent_direct_parent_does_not_need_l2_and_is_cached(tmp_path):
         assert len(provider.requests)==before
 
 
-def test_independent_parent_builds_l2_only_after_context_overflow(tmp_path):
+def test_independent_parent_builds_l2_only_after_explicit_context_fallback(tmp_path):
     class DirectTooLarge(OfflineProvider):
         def generate(self, request):
             self.requests.append(request)
@@ -213,13 +214,35 @@ def test_independent_parent_builds_l2_only_after_context_overflow(tmp_path):
     with project:
         index=project.index([source])
         parent=index.nodes(edition='ja',level=1)[0]
-        result=index.build_parent(parent['node_id'])
+        result=index.build_parent(parent['node_id'], method='direct_then_rollup')
         assert result['build_method']=='child_summary_rollup'
         assert result['coverage_complete']
         assert result['fallback_reason']['kind']=='remote_context_limit'
         assert result['child_revisions']
         assert all(index.read(child)['status']=='found' for child in parent['child_ids'])
         assert sum(':direct-v1:attempt:' in request.task for request in provider.requests)==1
+
+
+def test_independent_parent_default_stops_after_remote_overflow_without_building_l2(tmp_path):
+    class DirectTooLarge(OfflineProvider):
+        def generate(self, request):
+            self.requests.append(request)
+            if ':direct-v1:attempt:' in request.task:
+                raise ProviderError('parameters', 'prompt too long', False,
+                    {'message': 'maximum context length exceeded'})
+            return super().generate(request)
+
+    project,source,_,_,provider=make_history(tmp_path,provider=DirectTooLarge())
+    with project:
+        index=project.index([source])
+        parent=index.nodes(edition='ja',level=1)[0]
+        result=index.build_parent(parent['node_id'])
+        assert result['status']=='blocked_context'
+        assert result['fallback_reason']['kind']=='remote_context_limit'
+        assert all(index.read(child)['status']=='not_built' for child in parent['child_ids'])
+        assert sum(':direct-v1:attempt:' in request.task for request in provider.requests)==1
+        assert not any(request.task.startswith('edition-index:B') and
+                       ':direct-v1:attempt:' not in request.task for request in provider.requests)
 
 
 def test_independent_partial_parent_is_not_reported_complete(tmp_path):
@@ -294,7 +317,11 @@ def test_remote_context_error_alone_triggers_rollup(tmp_path):
                 raise ProviderError('parameters','too long',False,
                     {'message':'maximum context length exceeded'})
             return super().generate(request)
-    project,_,_,job,provider=make_history(tmp_path,provider=Capacity())
+    config = TranslationConfig(
+        index=EditionIndexSpec(parent_max_chapters=6, child_max_chapters=2),
+        sequence={'n_chapter': 2, 'n_child': 1,
+                  'parent_build_mode': 'direct_then_rollup'})
+    project,_,_,job,provider=make_history(tmp_path,provider=Capacity(),config=config)
     with project,job:
         ready=job.prepare_history()
         parents=[n for n in latest_nodes(job.repo) if n['level']==1]
@@ -305,3 +332,27 @@ def test_remote_context_error_alone_triggers_rollup(tmp_path):
         before=len(provider.requests)
         job.prepare_history()
         assert len(provider.requests)==before
+
+
+def test_independent_minimum_l1_capacity_decision_is_reported_before_generation(tmp_path):
+    capacity = ModelCapacity(8192, 4096, max_input_tokens=1000, safety_tokens=0)
+    config = TranslationConfig(capacity=capacity,
+        roles={'indexer': RoleBudget(1024)},
+        index=EditionIndexSpec(parent_max_chapters=6, child_max_chapters=2,
+                               parent_min_chapters=3))
+    provider=OfflineProvider()
+    project=TranslationProject(tmp_path/'capacity-project',config,provider=provider,
+                               provider_id='offline-capacity')
+    source=project.import_book(book(tmp_path,count=8),edition_id='ja',language='ja',
+                              paragraph_policy='blank_line')
+    with project:
+        index=project.index([source])
+        plan=index.plan()['plans'][0]
+        assert plan['planning']['status'] in {'index_capacity_decision_required','oversized_chapter'}
+        assert any(row['kind']=='minimum_l1_does_not_fit'
+                   for row in plan['planning']['diagnostics'])
+        parent=index.nodes(edition='ja',level=1)[0]
+        result=index.build_parent(parent['node_id'])
+        assert result['status']=='index_capacity_decision_required'
+        assert result['not_sent']
+        assert not provider.requests

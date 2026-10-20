@@ -6,6 +6,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import json
+import math
+import tempfile
+import tomllib
 
 from .errors import ConfigurationError
 
@@ -104,3 +108,114 @@ def user_config_status(directory: str | Path | None = None) -> dict:
     return {**result, "valid": True, "credential_present": bool(config.model and
             config.model.api_key.strip() and "model.api_key" not in missing),
             "generation_ready": not missing, "missing_fields": missing}
+
+
+_SAFE_CONFIG_PATHS = {
+    'capacity': {'context_window_tokens', 'max_output_tokens', 'max_input_tokens',
+                 'token_inflation_factor', 'safety_tokens'},
+    'index': {'parent_max_chapters', 'child_max_chapters', 'parent_min_chapters',
+              'expected_l2_count', 'l2_prepartition_min_chapters', 'parent_build_mode',
+              'entity_catalog_threshold', 'core_entity_limit', 'layout', 'child_target_tokens',
+              'child_min_content_tokens', 'predecessor_reserve_tokens', 'protocol_reserve_tokens'},
+    'limits': {'max_requests', 'max_input_tokens', 'max_output_tokens', 'max_attempts'},
+    'references': {'packet_token_budget', 'style_max_documents', 'style_excerpt_paragraphs',
+                   'terminology_max_terms', 'terminology_input_tokens', 'terminology_output_tokens',
+                   'terminology_max_documents', 'terminology_radius', 'discover_terms'},
+    'syosetu': {'concurrency', 'request_interval'},
+    'model': {'model', 'base_url', 'timeout', 'retries', 'thinking', 'reasoning_effort', 'trust_env'},
+    'sequence': {'strategy', 'mode', 'n_chapter', 'n_child', 'compression_trigger',
+                 'compression_target', 'max_revisions', 'translation_tools', 'targeted_evidence',
+                 'targeted_evidence_tokens', 'output_profile', 'reference_profile', 'mapping_profile',
+                 'parent_build_mode', 'entity_catalog_threshold', 'core_entity_limit',
+                 'parent_min_chapters', 'parent_max_chapters', 'expected_l2_count',
+                 'l2_prepartition_min_chapters', 'child_max_chapters', 'planning_utilization',
+                 'child_min_content_tokens', 'parent_summary_input_tokens_per_child',
+                 'soft_input_tokens', 'max_requests', 'max_input_tokens', 'max_output_tokens',
+                 'max_attempts', 'max_attempts'},
+}
+_ROLE_NAMES = {'translator', 'reviewer', 'adjudicator', 'indexer', 'compressor',
+               'mapping', 'revision', 'repair'}
+
+
+def _toml_literal(value):
+    if type(value) is bool:
+        return 'true' if value else 'false'
+    if type(value) is int:
+        return str(value)
+    if type(value) is float and math.isfinite(value):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    raise ConfigurationError('config update values must be strings, finite numbers or booleans')
+
+
+def _allowed_update(path):
+    parts = path.split('.')
+    if len(parts) == 2 and parts[0] in _SAFE_CONFIG_PATHS and parts[1] in _SAFE_CONFIG_PATHS[parts[0]]:
+        return parts
+    if len(parts) == 3 and parts[0] == 'roles' and parts[1] in _ROLE_NAMES and parts[2] == 'requested_output_tokens':
+        return parts
+    raise ConfigurationError('config update path is not an allowed non-credential setting')
+
+
+def _patch_toml(text, updates):
+    lines = text.splitlines()
+    for path, value in updates.items():
+        parts = _allowed_update(path)
+        section = '.'.join(parts[:-1])
+        key = parts[-1]
+        heading = f'[{section}]'
+        section_start = next((i for i, line in enumerate(lines)
+                              if line.strip() == heading), None)
+        if section_start is None:
+            if lines and lines[-1].strip():
+                lines.append('')
+            lines.extend([heading, f'{key} = {_toml_literal(value)}'])
+            continue
+        section_end = next((i for i in range(section_start + 1, len(lines))
+                            if re.fullmatch(r'\s*\[[^]]+\]\s*(?:#.*)?', lines[i])), len(lines))
+        assignment = re.compile(rf'^\s*{re.escape(key)}\s*=')
+        key_line = next((i for i in range(section_start + 1, section_end)
+                         if assignment.match(lines[i])), None)
+        replacement = f'{key} = {_toml_literal(value)}'
+        if key_line is None:
+            lines.insert(section_end, replacement)
+        else:
+            lines[key_line] = replacement
+    return '\n'.join(lines).rstrip() + '\n'
+
+
+def update_user_config(updates: dict[str, object], directory: str | Path | None = None) -> dict:
+    """Safely update allowlisted TOML settings without returning credential data."""
+    if not isinstance(updates, dict) or not updates:
+        raise ConfigurationError('updates must be a nonempty path/value mapping')
+    if any(not isinstance(path, str) for path in updates):
+        raise ConfigurationError('config update paths must be strings')
+    for path in updates:
+        _allowed_update(path)
+    path = user_config_path(directory)
+    if not path.is_file():
+        raise ConfigurationError('user configuration does not exist; initialize it first')
+    original = path.read_text(encoding='utf-8-sig')
+    updated = _patch_toml(original, updates)
+    temp_name = None
+    try:
+        with tempfile.NamedTemporaryFile('w', encoding='utf-8', newline='\n',
+                dir=path.parent, prefix='.config-update-', suffix='.toml', delete=False) as stream:
+            temp_name = stream.name
+            stream.write(updated)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary = Path(temp_name)
+        _private_permissions(temporary)
+        from .config import TranslationConfig
+        TranslationConfig.from_dict(tomllib.loads(updated), base=path.parent)
+        os.replace(temporary, path)
+        _private_permissions(path)
+    except (ConfigurationError, OSError, ValueError):
+        if temp_name:
+            Path(temp_name).unlink(missing_ok=True)
+        raise ConfigurationError('configuration update failed validation; existing file preserved') from None
+    status = user_config_status(directory)
+    return {'path': str(path), 'updated_fields': sorted(updates), 'valid': status['valid'],
+            'generation_ready': status['generation_ready'], 'credential_present': status['credential_present']}

@@ -77,7 +77,7 @@ def create_job(project, name, *, source, chapters, mode, references, index, para
     # Freeze all preceding Japanese bodies for navigation, independently of
     # translation alignment. Missing materialization is not a missing source.
     inputs["history_sources"] = [_source_document(archive, d["entry_id"]) for d in docs[:start]]
-    inputs["history_index_profile"] = "hierarchy-v1"
+    inputs["history_index_profile"] = "hierarchy-v2"
     # Every preceding Web body is frozen in history_sources.  The previous
     # "index not built" marker is no longer an input gap once that body is
     # available; genuine missing-source gaps remain caller-supplied records.
@@ -164,6 +164,46 @@ class TranslationJob:
                 "heads": self.repo.heads(), "attempt_count": len(self.repo.store.attempts()),
                 "reference_mode": self.repo.manifest["inputs"]["reference_mode"],
                 "formal_acceptance": False, "artifact_dir": str(self.path)}
+
+    def cost_usage(self) -> dict[str, Any]:
+        """Return durable request/token totals without exposing request content."""
+        self._check()
+        attempts = self.repo.store.attempts()
+        usage = {}
+        for attempt in attempts:
+            for key, value in attempt.get('usage', {}).items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    usage[key] = usage.get(key, 0) + value
+        return {'local_only': True, 'requests': len(attempts),
+            'reserved_input_tokens': sum(row['input_reserved'] for row in attempts),
+            'reserved_output_tokens': sum(row['output_reserved'] for row in attempts),
+            'reported_usage': usage,
+            'unlimited_cumulative_caps': {
+                'requests': self.engine.spec.max_requests == 0,
+                'input_tokens': self.engine.spec.max_input_tokens == 0,
+                'output_tokens': self.engine.spec.max_output_tokens == 0}}
+
+    def entity_catalog(self) -> dict[str, Any]:
+        """Read the visible compact semantic entity catalog."""
+        from translation.sequence.entities import read_entity_catalog
+        self._check()
+        next_chapter = self.engine.next_chapter()
+        view = self.engine.view(next_chapter['source_id']) if next_chapter else self.engine.view(None)
+        visible = {doc['chapter_id'] for doc in view.visible_sources()}
+        return read_entity_catalog(self.repo, visible_source_ids=visible,
+                                   before_order=view.target_order)
+
+    def entity_evidence(self, entity_id: str) -> dict[str, Any]:
+        """Read visible source snippets for a merged entity by stable ID."""
+        from translation.sequence.entities import read_entity_evidence
+        self._check()
+        if not isinstance(entity_id, str) or not entity_id:
+            raise ValueError('entity_id is required')
+        next_chapter = self.engine.next_chapter()
+        view = self.engine.view(next_chapter['source_id']) if next_chapter else self.engine.view(None)
+        visible = {doc['chapter_id'] for doc in view.visible_sources()}
+        return read_entity_evidence(self.repo, entity_id, visible_source_ids=visible,
+                                    before_order=view.target_order)
 
     def reference_report(self) -> dict[str, Any]:
         """Report frozen references and actual selections, without reading engine code."""

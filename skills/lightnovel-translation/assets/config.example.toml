@@ -37,9 +37,15 @@ requested_output_tokens = 8192
 
 [index]
 parent_max_chapters = 100
-child_max_chapters = 10
+parent_min_chapters = 30
+expected_l2_count = 10
+l2_prepartition_min_chapters = 3
+parent_build_mode = "direct" # Strict one-pass L1; choose rollup explicitly if needed.
+child_max_chapters = 100 # Legacy hard cap; token balance determines normal L2 sizes.
 child_target_tokens = 64000
 child_min_content_tokens = 4000
+entity_catalog_threshold = 50
+core_entity_limit = 50
 
 [sequence]
 strategy = "H"
@@ -66,8 +72,8 @@ terminology_radius = 2
 discover_terms = true
 
 [limits]
-# Separate persistent limits for every index and every translation job.
-max_requests = 300
-max_input_tokens = 20000000
-max_output_tokens = 3000000
+# Separate persistent limits for every index and every translation job. Zero is unlimited.
+max_requests = 0
+max_input_tokens = 0
+max_output_tokens = 0
 max_attempts = 3

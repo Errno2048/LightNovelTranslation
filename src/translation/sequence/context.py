@@ -91,8 +91,22 @@ def _workset(repo,nodes):
     for ident,commit in repo.all_commits():
         for i,item in enumerate(commit['unresolved']):
             unresolved.append({'id':ident+':unresolved:'+str(i),'value':item,'authority':'unresolved'})
-    records=list(repo.manifest['inputs'].get('inherited_candidates',[]))+[{'id':r['id'],'type':r['type'],'fields':r['fields'],'authority':r['authority'],
-              'node_revision':n['id']} for n in nodes for r in n['records'] if r['type'] not in {'SUMMARY','COVERAGE'}]
+    inherited=list(repo.manifest['inputs'].get('inherited_candidates',[]))
+    extracted=[{'id':r['id'],'type':r['type'],'fields':r['fields'],'authority':r['authority'],
+              'node_revision':n['id'],'source_ids':n.get('source_ids',[])}
+              for n in nodes for r in n['records'] if r['type'] not in {'SUMMARY','COVERAGE'}]
+    entity_records=[r for r in inherited+extracted if r.get('type')=='ENTITY']
+    records=[r for r in inherited+extracted if r.get('type')!='ENTITY']
+    from .entities import entity_catalog_for_prompt
+    catalog_id, entities=entity_catalog_for_prompt(repo,nodes,entity_records)
+    for entity in entities:
+        records.append({'id':entity['id'],'type':'ENTITY','fields':entity['fields'],
+            'authority':entity.get('authority','candidate_unreviewed'),
+            # The translation prompt needs the compact name/type/description/
+            # rendering card. Full member lists and excerpts remain available
+            # through entity_catalog()/entity_evidence(), not every turn.
+            'catalog_id':catalog_id,
+            'semantic_status':entity.get('semantic_status','candidate_unreviewed')})
     rebuilt={cid for n in nodes for cid in n['source_ids']}
     inherited_gaps=[g for g in repo.manifest['inputs'].get('inherited_extraction_gaps',[])
         if not (g.get('reason')=='reference_protocol_changed' and set(g['source_ids'])<=rebuilt)]
@@ -102,7 +116,9 @@ def _workset(repo,nodes):
            'coverage_notes':[r['fields']['text'][0] for r in n['records'] if r['type']=='COVERAGE'],
            'authority':'missing_or_unverified_information_not_negative_fact'} for n in nodes
           if n['state']!='extracted' or any(r['type']=='COVERAGE' for r in n['records'])]
-    return {'core':core,'candidates':records,'unresolved':unresolved,'extraction_gaps':gaps,'authority':'candidate_unreviewed'}
+    return {'core':core,'candidates':records,'unresolved':unresolved,'extraction_gaps':gaps,
+            'entity_catalog_id':catalog_id,'entity_candidate_count':len(entities),
+            'authority':'candidate_unreviewed'}
 
 
 def _compact(repo,caller,node,max_chars):

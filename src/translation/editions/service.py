@@ -109,7 +109,7 @@ class EditionPipeline:
                 'entities_exhaustive': False}
 
     def build_parent(self, parent_id, *, allow_partial=False, output_tokens=8192,
-                     method='direct_then_rollup'):
+                     method=None):
         from .parents import build_parent
         return build_parent(self, parent_id, allow_partial=allow_partial,
                             output_tokens=output_tokens, method=method)

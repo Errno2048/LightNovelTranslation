@@ -10,7 +10,7 @@ import pytest
 
 from lightnovel_translation import (
     ConfigurationError, TranslationConfig, TranslationError, TranslationProject,
-    export_skill, init_user_config, user_config_path, user_config_status,
+    export_skill, init_user_config, update_user_config, user_config_path, user_config_status,
 )
 from lightnovel_translation.cli import main
 from lightnovel_translation.ingestion import (
@@ -91,6 +91,23 @@ def test_missing_or_bad_config_cli_never_echoes_key_or_document(capsys):
         TranslationConfig.from_user_config()
     formatted = "".join(traceback.format_exception(caught.value))
     assert "private-marker-do-not-echo" not in formatted
+
+
+def test_config_update_changes_only_allowlisted_noncredential_values():
+    path = ready_file()
+    result = update_user_config({'index.parent_min_chapters': 40,
+                                 'limits.max_requests': 0})
+    serialized = json.dumps(result)
+    saved = path.read_text(encoding='utf-8')
+    assert result['updated_fields'] == ['index.parent_min_chapters', 'limits.max_requests']
+    assert 'private-marker-do-not-echo' not in serialized
+    assert 'api_key = "private-marker-do-not-echo"' in saved
+    config = TranslationConfig.from_user_config()
+    assert config.index.parent_min_chapters == 40
+    assert config.limits.max_requests == 0
+    with pytest.raises(ConfigurationError):
+        update_user_config({'model.api_key': 'must-not-be-set-through-agent-tool'})
+    assert 'api_key = "private-marker-do-not-echo"' in path.read_text(encoding='utf-8')
 
 
 def test_placeholder_endpoint_cannot_receive_requests_even_with_a_key(tmp_path):

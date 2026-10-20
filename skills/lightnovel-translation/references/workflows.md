@@ -23,17 +23,32 @@ with TranslationProject("work/novel") as project:
 
 从标题章号定位时，先检查 `raw_title` / `ChapterInfo.title`；不要把 Web 228 当成 `chapters[228]`。续译定位见 api.md 中 `plan_continuation` / `locate_continuation`。`suggested` 是建议，可能需要用户或 agent 核对支线与重复情节。
 
-## 2. 选择参考模式
+## 2. 阶段 A：选择参考模式
+
+参考模式是独立决策，只声明已有中文材料的证据边界；选择模式本身不会构建模型索引，也不会开始翻译。`mode` 最终随任务冻结，但模式选择、索引准备和翻译仍是三个可分别检查、暂停和恢复的流程。
 
 | 模式 | 何时使用 | 中文的用途 |
 |---|---|---|
 | source_only | 没有中文参考 | 无 |
-| parallel | 已确认目标之前的原译对应 | 历史完整双语样本 |
+| parallel | 已确认目标之前的原译对应 | 确认的双语历史材料；进入任务历史层次索引后按覆盖策略注入 |
 | cross_edition | Web/文库、重排、改写或对应未确认 | 文风及有证据的术语候选 |
 
 跨版本不要求匹配成功才允许翻译。没有关联时，会选择所提供中文译本中的正文样本，标记为独立版本。此类样本不能支持 Web 的剧情、人物状态或时间线。需要指定更合适的样本时传 `style_reference_chapters=[...]`，无需伪造剧情关联。
 
-## 3. 局部建立跨版本索引（可选、收费）
+`mode="auto"` 只根据是否传入 `parallel_pairs` / `references` 选择模式，不负责判断历史规模，也不负责决定是否建立索引。`parallel_pairs` 是映射声明，已确认的长程双语历史可以用于任务历史索引；它本身不代表所有章节都会以全文进入翻译上下文。逐章全文、L2 和 L1 的选择由任务历史索引与上下文覆盖策略决定。
+
+本节后续示例假设目标连续窗口 `targets`、中文候选窗口 `reference_window` 和所选模式已由调用者确定；续译任务先完成定位，再确定这些输入。
+
+## 3. 阶段 B：准备或复用索引（与翻译分开）
+
+默认先检查并准备本次有用的索引，再运行翻译；这不等于要求全书全量建索引。可以跳过不需要的新建工作，但要记录跳过范围，并完成本节的预检。索引分两类，互不替代：
+
+1. **独立版本索引**：分别处理日文和中文 Edition，用于跨版本 L2 关联、L1 实体目录和译名检索。`cross_edition` 默认先检查并准备目标附近所需节点；如果只把中文当文风样本且明确选择跳过剧情/术语检索，可以不构建。已有 `parallel_pairs` 时通常不需要为映射另建独立索引；`source_only` 不需要跨版本索引。
+2. **任务历史索引**：把本次目标之前的冻结历史组织为远距 L1、近距 L2 和最近正文，用于连续翻译的上下文压缩。它按任务检查，默认先复用现有覆盖或准备缺失节点。创建/打开任务后调用 `job.plan_next()`：若返回 `index_required`，必须先 `job.prepare_history()` 并确认 `historical_index.ready`，再重新规划。只有返回 `ready` 才能进入翻译。
+
+模式选择不会自动构建独立版本索引；独立版本索引也不替代任务历史索引。允许跳过独立版本索引，也允许在 `plan_next()` 已返回 `ready` 时不再物化历史索引。若返回 `index_required`，没有跳过选项，必须完成索引准备；不能直接调用 `run()`。
+
+### 3.1 独立版本索引
 
 如果已有需要使用的索引产物，复用它们。不要为十章窗口默认重新抽取全书。
 
@@ -58,29 +73,58 @@ print(prepared["status"])
 
 更细控制可分别调用 `build`、`associate`、`match_entities`。`build` 同一 L1 内串行，不同 L1 间并发。`matching_coverage` 明确区分已报告、supported、未逐项判定与目录缺口；不能用记录中没有 unmatched 推断全覆盖。
 
-## 4. 创建与预检
+### 3.2 任务历史索引与预检
+
+历史索引属于具体任务，因此阶段 B 需要冻结任务输入后才能检查；冻结和预检不开始翻译。调用 `create_job` 时要确保 `name`、目标连续窗口、模式和参考材料已经确定。新的任务可在本节准备后关闭，阶段 C 再以同一名称打开。
 
 ```python
 with project.create_job(
-    "continuation-v2", source=ja, chapters=targets, mode="cross_edition",
-    references=[zh], index=index,
-    associations=prepared["associations"], entity_matches=prepared["entity_matches"],
-    resolve_terminology=True,
-    # 可选：优先作为文风样本的实际中文章节
-    style_reference_chapters=reference_window[-2:],
+    "continuation-v2", source=ja, chapters=targets,
+    mode="cross_edition", references=[zh], index=index,
+    associations=prepared["associations"],
+    entity_matches=prepared["entity_matches"],
 ) as job:
+    plan = job.plan_next()  # 不调用模型
+    if plan["state"] == "index_required":
+        prepared_history = job.prepare_history()  # 可能调用模型
+        if not prepared_history["historical_index"]["ready"]:
+            raise RuntimeError("历史索引未完成；停留在阶段 B")
+        plan = job.plan_next()
+    if plan["state"] == "index_capacity_decision_required":
+        raise RuntimeError("读取 historical_index.planning.diagnostics 后，显式调整分块或选择 rollup 策略")
+    if plan["state"] != "ready":
+        raise RuntimeError(f"索引/翻译预检未通过：{plan['state']}")
     print(job.reference_report())
-    plan = job.plan_next()
     print(plan["context"]["budget"])
-    print(plan["context"].get("edition_reference_selection"))
+```
+
+如果 `plan_next()` 已经返回 `ready`，可复用现有覆盖，或记录本次无需新建任务历史索引。如果返回 `index_required`，不得通过缩小窗口、直接调用 `run()` 或解释成“正文缺失”绕过。如果返回 `index_capacity_decision_required`，先查看 `historical_index.planning.diagnostics`，再显式调整分块参数或选择 rollup；不能把容量诊断当成普通缺索引处理。`run()` 内部的自动准备只是安全兜底，不能替代阶段 B 的显式索引检查。`create_job(..., resolve_terminology=True)` 可能进行独立的有界付费术语查询；应把它作为明确的准备选择。
+
+### 3.3 索引准备的费用和覆盖检查
+
+`index.plan()`、`nodes()`、`select_nodes()`、`read()`、`job.plan_next()` 是本地检查；`index.build()`、`build_parent()`、`prepare_references()`、`job.prepare_history()` 可能调用模型。进入阶段 C 前检查索引返回的状态、覆盖范围、omissions、`historical_index.ready`、参考入选结果和预算。
+
+阶段 B 完成条件是：独立版本索引已按本次用途准备或明确跳过；任务 `plan_next()` 返回 `ready`；预算与参考覆盖检查通过。若用户跳过了索引新建，也必须满足这些条件。续译定位可在目标窗口确定前单独执行，并可能使用独立版本索引；它不会自动开始翻译。
+
+## 4. 阶段 C：运行翻译
+
+本阶段只执行已在阶段 B 冻结并通过预检的任务。若重新打开任务后发现 `index_required`，回到阶段 B 完成索引，再回来运行；不要把这一状态当作可忽略提示。
+
+```python
+with project.open_job("continuation-v2") as job:
+    plan = job.plan_next()
+    if plan["state"] != "ready":
+        raise RuntimeError(
+            f"任务尚未通过阶段 B；当前状态：{plan['state']}"
+        )
     result = job.run(max_chapters=1, materialize=True)
     print(result.to_dict())
     job.export(include_io=True)
 ```
 
-没有 prepared 产物时省略 associations/entity_matches 即可。`resolve_terminology=True` 会在创建任务时进行有界付费补查；其余创建/规划动作不调用模型。它从当前原文发现片假名/技能名候选并结合已有实体，不要求先有同事件匹配。启发式发现可能含普通词，候选不是术语规范。
+`materialize=True` 从已提交译文构建增量知识；它发生在翻译之后，不能替代阶段 B 的独立版本索引或任务历史索引。`checkpoint()` 可显式压缩已提交历史，两者可能收费。远处 L2 默认懒构建；只有翻译、审校或显式 `ensure_details()` 请求时才物化。是否真正发生模型压缩，应根据调用记录判定，不能仅凭存在 checkpoint 对象下结论。
 
-预检须看两层：`reference_report` 是冻结的候选包，`plan_next.context.edition_reference_selection` 才是经过最终容量检查的入选结果。report 的 `actual_style_document_ids` 给出已保存翻译上下文选入的正文；尚未保存上下文时为 null。上下文可先于 HTTP 请求保存，是否实际发送仍用 `explain` 的 actual-request 确认。发现没有中文正文时先查 omissions，不能把这一轮作为中文 few-shot 效果证据。
+阶段 B 的参考检查分三层：`reference_report` 是冻结的候选包，`plan_next` 的 `historical_index` / `context.coverage` 是历史索引覆盖，`plan_next.context.edition_reference_selection` 才是经过最终容量检查的入选中文参考。report 的 `actual_style_document_ids` 给出已保存翻译上下文选入的正文；尚未保存上下文时为 null。上下文可先于 HTTP 请求保存，是否实际发送仍用 `explain` 的 actual-request 确认。发现没有中文正文时先查 omissions，不能把这一轮作为中文 few-shot 效果证据。
 
 ## 5. 恢复、增量与交付
 
@@ -88,6 +132,14 @@ with project.create_job(
 with TranslationProject("work/novel") as project:
     with project.open_job("continuation-v2") as job:
         print(job.status())
+        plan = job.plan_next()
+        if plan["state"] == "index_required":
+            prepared = job.prepare_history()
+            if not prepared["historical_index"]["ready"]:
+                raise RuntimeError("历史索引仍未完成；返回阶段 B 检查")
+            plan = job.plan_next()
+        if plan["state"] != "ready":
+            raise RuntimeError(f"任务未就绪：{plan['state']}")
         result = job.resume(max_chapters=3, materialize=True)
         print(result.to_dict())
         job.export(include_io=True)

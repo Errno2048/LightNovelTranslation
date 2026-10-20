@@ -2,7 +2,9 @@
 
 [返回目录](index.md) · 上一步：[续译定位](07-continuation.md) · 下一步：[上下文与证据](09-context-evidence.md)
 
-## 创建任务时冻结什么
+## 阶段 B：冻结任务与历史索引预检
+
+参考模式和独立版本索引属于阶段 A/B 的独立步骤；创建任务是阶段 B 为历史索引建立冻结边界的动作，不会开始翻译。不要用 `project.translate(...)` 直接掩盖这些步骤，长历史应先显式调用 `create_job`、`plan_next` 并检查历史索引。
 
 `project.create_job(name, source=..., chapters=..., ...)` 校验连续目标窗口、版本语言和参考模式，构造历史材料及每个目标的参考包，再创建持久分支。冻结内容包括目标正文、历史原译、显式缺口、参考包、关联/译名候选、配置、模型公开身份和 token 计数器身份。
 
@@ -11,28 +13,42 @@
 ```python
 with project.create_job(
     "window-01", source=ja, chapters=targets,
-    mode="cross_edition", references=[zh], index=index,
-    # 可按需提供 associations、entity_matches、style_reference_chapters
+    mode="cross_edition", references=[zh],
+    # 若阶段 B 已构建独立版本索引，再传 index=index、associations=...；否则可跳过。
 ) as job:
     print(job.status())
     print(job.reference_report())
     plan = job.plan_next()
-    print(plan)
+    if plan["state"] == "index_required":
+        prepared = job.prepare_history()
+        if not prepared["historical_index"]["ready"]:
+            raise RuntimeError("历史索引未完成；停留在阶段 B")
+        plan = job.plan_next()
+    if plan["state"] != "ready":
+        raise RuntimeError(f"翻译预检未通过：{plan['state']}")
 ```
 
-具体签名见 [API](../api.md)，模式规则见 [04](04-reference-modes.md)。`project.translate(...)` 是创建并运行的便捷方法，不会绕过校验/审校。
+具体签名见 [API](../api.md)，模式规则见 [04](04-reference-modes.md)。`project.translate(...)` 是创建并运行的便捷方法，适合已知不需要显式索引检查的短任务；它不应替代长任务的阶段 B 预检。
 
 ## 本地规划与实际执行的区别
 
 `job.plan_next()` 不调用模型，但可以创建初始本地检查点等元数据。它返回下一目标、上下文及预算、是否需要 checkpoint、哪些增量节点待物化。已有 context 的规划不等于已经发过请求。
 
-采用 `history_index_profile="hierarchy-v1"` 的任务首次规划可能返回 `state="index_required"`。这只表示冻结历史的 L1/L2 导航尚未物化，不表示历史剧情缺失；调用 `job.prepare_history()` 后再规划即可。历史父节点先尝试直接 L1，只有明确的本地或远端上下文超限才会建立 L2 并 rollup。远处 L2 默认懒构建，只有翻译、审校或显式 `ensure_details()` 请求时才物化。
+采用 `history_index_profile="hierarchy-v2"` 的新任务首次规划可能返回 `state="index_required"`（旧任务的 `hierarchy-v1` 仍可恢复）。这只表示冻结历史的 L1/L2 导航尚未物化，不表示历史剧情缺失；调用 `job.prepare_history()` 后再规划即可。如果 token 预检发现最小 L1 也不能直接容纳，规划会返回 `state="index_capacity_decision_required"` 与诊断，要求先调整容量/下限或显式选择 `child_summary_rollup` / `direct_then_rollup`；此时不会发送模型请求。严格模式下远端单次上下文超限也不会自动建满 L2，需显式选择回退策略。远处 L2 默认懒构建，只有翻译、审校或显式 `ensure_details()` 请求时才物化。
 
-预检时检查当前完整日文、参考入选结果、`budget.fits` 及 pending materializations。需要付费的历史抽取或压缩由执行阶段/显式 `checkpoint()` 完成；不要因为 plan_next 便宜就假定接下来的 run 只会调用一次翻译。
+预检时检查当前完整日文、参考入选结果、历史索引状态、`budget.fits` 及 pending materializations。若 `plan_next()` 返回 `state="index_required"`，这是硬门槛：先调用 `job.prepare_history()`，确认 `historical_index.ready` 后重新规划；不能直接运行翻译。若返回 `index_capacity_decision_required`，先读取 `historical_index.planning.diagnostics` 再选择容量策略。若已返回 `ready`，可以记录“本任务跳过了显式历史索引构建”的决定。需要付费的历史抽取或压缩由显式 `prepare_history()`、执行阶段或 `checkpoint()` 完成；不要因为 `plan_next` 便宜就假定接下来的 run 只会调用一次翻译。
+
+## 阶段 C：运行翻译
+
+只有阶段 B 的 `plan_next()` 返回 `ready` 后，才执行 `run()` / `resume()`。如果重新规划又返回 `index_required`，先回到阶段 B 完成 `prepare_history()`，不能直接运行。
 
 ```python
-result = job.run(max_chapters=1, materialize=True)
-print(result.to_dict())
+with project.open_job("window-01") as job:
+    plan = job.plan_next()
+    if plan["state"] != "ready":
+        raise RuntimeError(f"任务尚未通过阶段 B：{plan['state']}")
+    result = job.run(max_chapters=1, materialize=True)
+    print(result.to_dict())
 ```
 
 `max_chapters` 限制本次新增提交数；恢复后可以继续下一个窗口。`materialize=True` 在本次运行末尾还会封口抽取增量尾部，可能产生额外模型调用，甚至在译文已提交后因索引失败返回 blocked。连续任务的提交译文使用独立的 append-only `sequence-node` 增量索引；检查点按统一覆盖账本选择最近完整双语、邻近 L2 和更远 L1，未物化范围保留正文回退，不会误报为 `explicit_gap`。

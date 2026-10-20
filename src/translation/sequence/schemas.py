@@ -20,15 +20,22 @@ class SequenceSpec:
     n_child: int = 2
     child_max_chapters: int = 10
     parent_max_chapters: int = 100
+    index_layout: str = 'token-v2'
+    parent_min_chapters: int | None = None
+    expected_l2_count: int = 10
+    l2_prepartition_min_chapters: int = 3
+    parent_build_mode: str = 'direct'
+    entity_catalog_threshold: int = 50
+    core_entity_limit: int = 50
     planning_utilization: float = .80
     child_min_content_tokens: int = 0
     parent_summary_input_tokens_per_child: int = 8192
     compression_trigger: float = .85
     compression_target: float = .65
     soft_input_tokens: int | None = None
-    max_requests: int = 300
-    max_input_tokens: int = 20000000
-    max_output_tokens: int = 3000000
+    max_requests: int = 0
+    max_input_tokens: int = 0
+    max_output_tokens: int = 0
     max_attempts: int = 3
     max_revisions: int = 1
     review_profile: str = 'audit-v6'
@@ -40,6 +47,8 @@ class SequenceSpec:
     output_profile: str = 'plain-v1'
 
     def __post_init__(self):
+        if self.parent_min_chapters is None:
+            object.__setattr__(self, 'parent_min_chapters', min(30, self.parent_max_chapters))
         if self.output_profile not in {'plain-v1', 'source-records-v1'}:
             raise ValueError('unknown translation output profile')
         if self.output_profile == 'source-records-v1' and self.reference_profile != 'stable-v1':
@@ -55,11 +64,23 @@ class SequenceSpec:
         if not 0<self.planning_utilization<=1:
             raise ValueError('invalid planning utilization')
         for name in ('n_chapter','n_child','child_max_chapters','parent_max_chapters',
-                     'max_requests','max_input_tokens','max_output_tokens','max_attempts'):
+                     'parent_min_chapters','expected_l2_count','l2_prepartition_min_chapters',
+                     'entity_catalog_threshold','core_entity_limit','max_attempts'):
             if type(getattr(self,name)) is not int or getattr(self,name)<=0:
                 raise ValueError('sequence counts and budgets must be positive integers')
-        if self.child_max_chapters>self.parent_max_chapters or not 1<=self.max_attempts<=3 or not 0<=self.max_revisions<=2:
+        if self.entity_catalog_threshold > self.core_entity_limit:
+            raise ValueError('entity_catalog_threshold cannot exceed the core entity limit')
+        for name in ('max_requests','max_input_tokens','max_output_tokens'):
+            if type(getattr(self,name)) is not int or getattr(self,name)<0:
+                raise ValueError('cumulative sequence budgets must be nonnegative; 0 means unlimited')
+        if (self.child_max_chapters>self.parent_max_chapters or
+                (self.index_layout == 'token-v2' and self.parent_min_chapters>self.parent_max_chapters) or
+                not 1<=self.max_attempts<=3 or not 0<=self.max_revisions<=2):
             raise ValueError('invalid block bounds or retry limits')
+        if self.index_layout not in {'token-v2', 'legacy-v1'}:
+            raise ValueError('unknown index layout')
+        if self.parent_build_mode not in {'direct', 'child_summary_rollup', 'direct_then_rollup'}:
+            raise ValueError('invalid L1 build mode')
         if type(self.child_min_content_tokens) is not int or self.child_min_content_tokens < 0:
             raise ValueError('child_min_content_tokens must be a nonnegative integer')
         if type(self.parent_summary_input_tokens_per_child) is not int or self.parent_summary_input_tokens_per_child <= 0:
@@ -77,6 +98,10 @@ class SequenceSpec:
     @classmethod
     def from_dict(cls, value):
         value=dict(value)
+        value.setdefault('index_layout', 'legacy-v1')
+        # Frozen pre-feature jobs retain the historical capacity-fallback policy.
+        value.setdefault('parent_min_chapters', min(30, value.get('parent_max_chapters', 100)))
+        value.setdefault('parent_build_mode', 'direct_then_rollup')
         value.setdefault('review_profile','audit-v5')
         value.setdefault('reference_profile','legacy')
         value.setdefault('mapping_profile','audit-v2')
@@ -94,7 +119,9 @@ class SequenceSpec:
         values=dict(settings.sequence)
         if settings.index.get('layout','adaptive-v1')!='adaptive-v1':
             raise ValueError('P7 currently supports adaptive-v1 for new partitions')
-        mapping={'parent_max_chapters','child_max_chapters','planning_utilization',
+        mapping={'parent_max_chapters','child_max_chapters','parent_min_chapters',
+                 'expected_l2_count','l2_prepartition_min_chapters','entity_catalog_threshold',
+                 'core_entity_limit','parent_build_mode','planning_utilization',
                  'child_min_content_tokens','parent_summary_input_tokens_per_child'}
         values.update({k:v for k,v in settings.index.items() if k in mapping})
         defaults=default_roles()

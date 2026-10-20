@@ -12,6 +12,7 @@
 | 译名未召回 | 查看 terminology_trace 的候选来源、遗漏及 search_scope；允许搜索未建索引的实际中文正文 |
 | no_match / ambiguous | 只是本次有限范围的结果；不证明译本中不存在 |
 | no_reference_scope | 检查 scope_failure_reason：无中文正文、源局部上下文本身超限、或参考片段仍超限 |
+| `plan_next()` 返回 `index_required` | 历史导航尚未物化；停止翻译，调用 `job.prepare_history()`，检查 `historical_index.ready` 后重新规划。它不是正文缺失，也不能通过直接 `run()` 静默绕过预检 |
 | partial / 目录未覆盖 | 补建有用节点；不必为了一个人物全书重抽 |
 
 `index.resolve_terminology(chapter, source_forms=["实际日文名称"], associations=..., entity_matches=...)` 可显式定向补查并保留出处。返回 search_scope、searched_reference_refs、partial_reference_documents、document_limit_omitted 与 trace。只有实际送入模型的段落才可被接受为引用。

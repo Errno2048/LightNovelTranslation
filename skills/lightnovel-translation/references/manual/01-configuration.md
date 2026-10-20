@@ -67,13 +67,18 @@ input_limit = min(context_window - requested_output - safety, max_input 或 cont
 | 字段 | 默认值 | 作用 |
 |---|---:|---|
 | `parent_max_chapters` | 100 | L1 最多包含的章节数 |
+| `parent_min_chapters` | 30 | 完整 L1 的硬下限；不足下限的短书、卷尾或增量尾部可显式标记例外 |
+| `expected_l2_count` | 10 | 每个 L1 预期划分的 L2 数量 |
+| `l2_prepartition_min_chapters` | 3 | 预划分 L1 时估算的每个 L2 最低章数；正式 L2 允许更短 |
+| `parent_build_mode` | `direct` | 默认严格一次摘要；可显式选择 `child_summary_rollup` 或 `direct_then_rollup` |
 | `child_max_chapters` | 10 | L2 最多包含的章节数 |
 | `child_target_tokens` | 64000 | L2 内容打包目标，受实际可用容量约束 |
 | `child_min_content_tokens` | 4000 | 尽量避免过小 L2；不能突破章界、卷界与硬容量 |
+| `entity_catalog_threshold` / `core_entity_limit` | 50 / 50 | 实体目录超过阈值时生成有上限的核心实体视图 |
 | `predecessor_reserve_tokens` | 4096 | 为前驱导航预留输入 |
 | `protocol_reserve_tokens` | 4096 | 为提示协议预留输入 |
 
-这些字段属于 `EditionIndexSpec`。连续翻译用另一套自适应分块器；公共配置仅把 parent/child 章数上限及 child 最小内容量作为其默认值，其他字段不会整套共享。
+这些字段属于 `EditionIndexSpec`，也为新连续任务提供统一 token 分块与实体目录默认值。旧任务读取冻结的 planner 版本与参数，不因升级而重排。
 
 ## `[sequence]`：连续运行与增量索引
 
@@ -86,6 +91,8 @@ input_limit = min(context_window - requested_output - safety, max_input 或 cont
 | `n_chapter` / `n_child` | 3 / 2 | 检查点保留的邻近完整双语章/详细 L2 数 |
 | `child_max_chapters` / `parent_max_chapters` | 继承 index | 任务内增量节点上限，可显式覆盖 |
 | `child_min_content_tokens` | 继承 index | 触发避免过小子块的 rollup 策略 |
+| `parent_build_mode` | 继承 index，默认 `direct` | L1 容量失败策略；严格默认会阻断并报告诊断，rollup 必须显式选择 |
+| `entity_catalog_threshold` / `core_entity_limit` | 继承 index，默认 50 / 50 | 完整合并目录阈值与常驻核心实体上限 |
 | `planning_utilization` | 0.80 | 增量分块使用的规划容量比例 |
 | `parent_summary_input_tokens_per_child` | 8192 | L1 用子摘要 rollup 时的保守输入估算 |
 | `compression_trigger` / `compression_target` | 0.85 / 0.65 | H 压缩触发比例与目标比例 |
@@ -118,7 +125,7 @@ input_limit = min(context_window - requested_output - safety, max_input 或 cont
 | `terminology_radius` | 2 | 参考命中周围的段落半径，可为 0 |
 | `discover_terms` | true | 是否从原文启发式发现片假名、技能等候选 |
 
-`limits` 是耐久的累计上限：`max_requests=300`、`max_input_tokens=20000000`、`max_output_tokens=3000000`、`max_attempts=3`（允许 1–3）。每个索引和每个任务分别记账，不是整个项目共享一份总额度。`capacity.max_output_tokens` 是单次容量，`limits.max_output_tokens` 是累计预算；追加修订次数也不会重置累计账本。
+`limits` 是耐久的累计上限：`max_requests`、`max_input_tokens`、`max_output_tokens` 默认均为 `0`（不设累计上限）；`max_attempts=3`（允许 1–3）。每个索引和每个任务分别记账，不是整个项目共享一份总额度。`capacity.max_output_tokens` 是单次容量，`limits.max_output_tokens` 是累计预算；追加修订次数也不会重置累计账本。累计值设为 0 不会关闭统计。
 
 ## 查证与代码位置
 

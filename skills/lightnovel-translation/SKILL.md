@@ -38,9 +38,12 @@ python -m lightnovel_translation config check
 先确定用户输入、需要翻译的阅读区间、已有译文版本关系和输出位置。能从本地文件与上下文判断的就继续处理；只有无法判定的歧义才询问用户。读取少量标题和正文确认阅读顺序，不能把标题中的数字直接当作数组下标。
 
 1. 用 `import_book` / `import_edition` 导入。即使机械校验通过，也抽查开头、结尾、文件连接处和可疑超长条目，确认没有多个章节被当作一个章节。
-2. 选择 `source_only`、`parallel` 或 `cross_edition`。没有经过确认的双语映射时，不按两侧序号硬配。跨版本可用 `index.select_nodes()` / `prepare_references()` 建立局部参考；即使没有同事件匹配，也允许注入所提供中文译本的文风样本。文库不决定 Web 事实。
-3. `index.plan()` / `job.plan_next()` 检查覆盖和预算，二者不调用模型。模型调用范围应符合用户授权；第一次针对不熟悉的输入可先运行一个小窗口检查工程状态，再继续已授权范围。
-4. 用 `job.reference_report()` 和 `plan_next()` 确认中文正文实际入选，检查省略原因；不能把“有中文文件”当成“已注入参考”。运行 `job.run()` / `resume()`。blocked 时保留工作区，先检查状态、`draft()` 与该章 `explain()`，不要不断换任务名或删数据库来重试。
+2. **阶段 A：选择参考模式。** 只决定已有中文材料可以证明什么；模式选择本身不构建索引、不翻译。选择 `source_only`、`parallel` 或 `cross_edition`。没有经过确认的双语映射时，不按两侧序号硬配。`parallel_pairs` 表示确认过的历史映射；它不意味着所有对应章节都会以全文进入翻译 prompt。跨版本索引是后续独立流程；文库不决定 Web 事实。
+3. **阶段 B：准备索引，默认优先执行但允许跳过。** 先检查并复用已有索引，再只构建本次需要的范围；不要求默认全书抽取。
+   - `cross_edition` 若要使用剧情关联、实体目录或译名检索，先调用 `project.index()` 做本地计划，再按需显式调用 `index.build()` / `build_parent()` / `prepare_references()`。只用文风样本时可以明确跳过独立版本索引；`parallel` 映射和 `source_only` 也不自动要求独立版本索引。
+   - 连续任务的前置历史由任务历史层次索引管理。冻结任务后在阶段 B 调用 `job.plan_next()`，检查 `reference_report()`、索引覆盖和预算。若返回 `state == "index_required"`，必须先调用 `job.prepare_history()`，确认 `historical_index.ready`，重新规划得到 `ready` 后才能进入翻译；不得把它当作可忽略提示。若返回 `index_capacity_decision_required`，先查 `historical_index.planning.diagnostics`，再显式调整分块参数或选择 rollup 策略。`run()` 会自动准备索引作为兜底，但不能替代 agent 显式检查。
+   - 用户选择跳过索引时，独立版本索引可不构建；任务历史索引只有在 `plan_next()` 已返回 `ready`、预算与覆盖通过时才可跳过物化。若返回 `index_required`，必须准备索引。
+4. **阶段 C：运行翻译。** 只对阶段 B 已冻结且预检为 `ready` 的任务调用 `job.run()` / `resume()`。若重新规划时发现 `index_required`，回到阶段 B；不要直接翻译。`run(materialize=True)` 的增量索引发生在已提交译文之后，不能替代阶段 B 的索引。blocked 时保留工作区，先检查状态、`draft()` 与该章 `explain()`，不要不断换任务名或删数据库来重试。
 5. 修订机会用尽且仍在用户已授权的翻译范围内时，可说明理由，通过 `extend_revision_budget()` 追加有界机会后恢复；明确的局部错误可由 agent 用 `submit_revision()` 提交新版本，再 `resume()` 完成复审。两条路径都保留账本与旧证据，不能直接把草稿标成通过。具体上限、并发及失败分类见诊断文档。新索引材料、修正语料、模型身份改变仍需新任务。
 6. 用 `export(include_io=True)` 保留译文、实际请求、原始模型输出和审校证据。报告完成章数、阻断位置和未决质量问题；工程 complete 不等于语义正确或人工接受。
 

@@ -63,7 +63,9 @@ class EditionCaller:
             if pending.exists():
                 raise ProviderError('pending_request', 'remote completion unknown; inspect before resending')
             with self.lock:
-                if self.previous_requests + self.new_requests >= self.max_requests or self.reserved_input + budget['safe_input_tokens'] > self.max_input_tokens or self.reserved_output + output_tokens > self.max_output_tokens:
+                if ((self.max_requests and self.previous_requests + self.new_requests >= self.max_requests) or
+                    (self.max_input_tokens and self.reserved_input + budget['safe_input_tokens'] > self.max_input_tokens) or
+                    (self.max_output_tokens and self.reserved_output + output_tokens > self.max_output_tokens)):
                     raise ProviderError('budget', 'independent edition run request/token limit reached')
                 self.new_requests += 1
                 self.reserved_input += budget['safe_input_tokens']

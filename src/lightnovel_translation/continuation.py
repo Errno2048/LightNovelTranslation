@@ -251,7 +251,7 @@ class Locator:
         self.folder = index.project.path / 'locate' / plan['fingerprint'][:16]
         self.folder.mkdir(parents=True, exist_ok=True)
         limits = asdict(index.project.config.limits)
-        limits['max_requests'] = min(max_requests, limits['max_requests'])
+        limits['max_requests'] = min(max_requests, limits['max_requests']) if limits['max_requests'] else max_requests
         self.caller = EditionCaller(index.project.provider, index.project.counter, index.project.config.capacity,
                                     self.folder / 'calls', **limits)
         self.max_new_nodes, self.max_rounds = max_new_nodes, max_rounds

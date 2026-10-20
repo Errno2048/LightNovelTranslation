@@ -71,15 +71,15 @@ class ModelConfig(_EngineModelConfig):
 @dataclass(frozen=True)
 class Limits:
     """Durable limits, separately applied to each index and translation job."""
-    max_requests: int = 300
-    max_input_tokens: int = 20_000_000
-    max_output_tokens: int = 3_000_000
+    max_requests: int = 0
+    max_input_tokens: int = 0
+    max_output_tokens: int = 0
     max_attempts: int = 3
 
     def __post_init__(self) -> None:
-        if any(type(v) is not int or v <= 0 for v in asdict(self).values()):
-            raise ConfigurationError("limits must be positive integers")
-        if self.max_attempts > 3:
+        if any(type(v) is not int or v < 0 for v in asdict(self).values()):
+            raise ConfigurationError("limits must be nonnegative integers (0 means unlimited)")
+        if not 1 <= self.max_attempts <= 3:
             raise ConfigurationError("max_attempts must be between 1 and 3")
 
 
@@ -141,6 +141,13 @@ class TranslationConfig:
         values = {"output_profile": "source-records-v1",
                   "parent_max_chapters": self.index.parent_max_chapters,
                   "child_max_chapters": self.index.child_max_chapters,
+                  "index_layout": self.index.layout,
+                  "parent_min_chapters": self.index.parent_min_chapters,
+                  "expected_l2_count": self.index.expected_l2_count,
+                  "l2_prepartition_min_chapters": self.index.l2_prepartition_min_chapters,
+                  "parent_build_mode": self.index.parent_build_mode,
+                  "entity_catalog_threshold": self.index.entity_catalog_threshold,
+                  "core_entity_limit": self.index.core_entity_limit,
                   "child_min_content_tokens": self.index.child_min_content_tokens,
                   **values}
         try:

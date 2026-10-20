@@ -188,8 +188,8 @@ class Index:
 
     @operation
     def build_parent(self, parent_id: str, *, allow_partial: bool = False,
-                     method: str = 'direct_then_rollup') -> dict[str, Any]:
-        """Read L1 bodies directly; build children only after a capacity failure."""
+                     method: str | None = None) -> dict[str, Any]:
+        """Build L1 using the configured mode; rollup must be explicitly enabled."""
         self._check()
         self._nodes([parent_id], level=1)
         self.project._require_generation()

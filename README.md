@@ -16,14 +16,24 @@ python -m lightnovel_translation config path
 
 ## Python API
 
+参考模式选择、索引准备和翻译是三个独立步骤。默认先检查/准备索引；没有跨版本检索需求时可以跳过独立版本索引，但若 `plan_next()` 返回 `index_required`，必须先 `prepare_history()`，重新规划为 `ready` 后才能运行翻译。
+
 ```python
 from lightnovel_translation import TranslationProject
 
 with TranslationProject("workspaces/my-novel") as project:
     source = project.import_book("novel.epub", edition_id="web-ja", language="ja")
     with project.create_job("opening", source=source,
-                            chapters=source.chapters()[:3]) as job:
-        print(job.plan_next())
+                            chapters=source.chapters()[:3],
+                            mode="source_only") as job:
+        plan = job.plan_next()
+        if plan["state"] == "index_required":
+            prepared = job.prepare_history()
+            if not prepared["historical_index"]["ready"]:
+                raise RuntimeError("history index is incomplete")
+            plan = job.plan_next()
+        if plan["state"] != "ready":
+            raise RuntimeError(f"translation preflight is not ready: {plan['state']}")
         result = job.run(max_chapters=1)
         job.export(include_io=True)
 ```

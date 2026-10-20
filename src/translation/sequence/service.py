@@ -53,6 +53,11 @@ class SequenceEngine:
         if chapter is None: return {'state':'complete','run_id':self.repo.run_id}
         view=self.view(chapter['source_id'])
         historical_index = pending_report(self.repo, self.spec, view) if hierarchy_enabled(self.repo) else None
+        if (historical_index and historical_index.get('requires_capacity_decision') and
+                not chapter.get('context_id')):
+            return {'state':'index_capacity_decision_required', 'run_id':self.repo.run_id,
+                'source_id':chapter['source_id'], 'historical_index':historical_index,
+                'needs_checkpoint':False, 'context':None, 'local_only':True}
         if historical_index and historical_index['pending'] and not chapter.get('context_id'):
             return {'state':'index_required', 'run_id':self.repo.run_id,
                 'source_id':chapter['source_id'], 'historical_index':historical_index,
@@ -335,8 +340,11 @@ class SequenceEngine:
                     if not hierarchy_enabled(self.repo):
                         materialize_nodes(self.repo,self.spec,view,self.provider)
                 plan=self.plan_next()
-                if plan['state']=='index_required':
-                    raise NarrativeError('incomplete_historical_index', 'historical index is not ready')
+                if plan['state'] in {'index_required','index_capacity_decision_required'}:
+                    code = ('index_capacity_decision_required'
+                            if plan['state'] == 'index_capacity_decision_required'
+                            else 'incomplete_historical_index')
+                    raise NarrativeError(code, 'historical index is not ready for this configured capacity policy')
                 if plan['needs_checkpoint']:
                     self.checkpoint(force=True); plan=self.plan_next()
                 context=plan['context']

@@ -50,6 +50,8 @@ def test_local_import_plan_and_index_reads_never_generate(tmp_path):
         assert index.plan()["local_only"]
         assert index.read(index.nodes()[0]["node_id"])["status"] == "not_built"
         with project.create_job("sample", source=source, index=index) as job:
+            assert job.entity_catalog()["status"] == "not_built"
+            assert job.entity_evidence("unknown-entity")["status"] == "not_found"
             context = job.plan_next()["context"]
             assert context["budget"]["fits"]
             assert context["budget"]["factor"] >= 1.05

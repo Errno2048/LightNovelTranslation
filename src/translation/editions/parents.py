@@ -40,7 +40,8 @@ def save_parent(pipeline, artifact):
 
 
 def build_parent(pipeline, parent_id, *, allow_partial=False, output_tokens=8192,
-                 method='direct_then_rollup'):
+                 method=None):
+    method = method or pipeline.nodes[parent_id].get('build_method', 'direct')
     if method not in {'direct_then_rollup', 'direct', 'child_summary_rollup'}:
         raise ValueError('unknown parent build method')
     parent = pipeline.nodes[parent_id]
@@ -49,6 +50,22 @@ def build_parent(pipeline, parent_id, *, allow_partial=False, output_tokens=8192
     old = read_parent(pipeline, parent_id)
     if old and old.get('coverage_complete', True) and (method == 'direct_then_rollup' or old['build_method'] == method):
         return {**old, 'cache_hit': True}
+    if method == 'direct':
+        plan = next((p for p in pipeline.plans if parent_id in
+                     {n['node_id'] for n in p.get('parents', [])}), None)
+        planning = plan.get('planning', {}) if plan else {}
+        parent_ids = set(parent['entry_ids'])
+        diagnostics = [d for d in planning.get('diagnostics', [])
+                       if d.get('kind') in {'minimum_l1_does_not_fit', 'short_l1_range',
+                                            'oversized_single_chapter'}
+                       and parent_ids.intersection(d.get('entry_ids',
+                           [d.get('entry_id')] if d.get('entry_id') else []))]
+        if diagnostics:
+            return {'status': 'index_capacity_decision_required', 'node_id': parent_id,
+                'not_sent': True, 'diagnostics': diagnostics,
+                'suggested_actions': ['revise_index_capacity_or_l1_minimum',
+                                      'explicit_child_summary_rollup',
+                                      'explicit_direct_then_rollup']}
     reason = None
     if method != 'child_summary_rollup':
         docs = [pipeline.archive.read(eid) for eid in parent['entry_ids']]
@@ -84,6 +101,11 @@ def build_parent(pipeline, parent_id, *, allow_partial=False, output_tokens=8192
         built = pipeline.ensure_index_nodes(parent['child_ids'], workers=1, output_tokens=output_tokens)
         if not built['complete'] and not allow_partial:
             return {'status': 'incomplete', 'fallback_reason': reason, 'children': built}
+    elif method == 'child_summary_rollup':
+        built = pipeline.ensure_index_nodes(parent['child_ids'], workers=1,
+                                            output_tokens=output_tokens)
+        if not built['complete'] and not allow_partial:
+            return {'status': 'incomplete', 'children': built}
     catalog = pipeline.entity_catalog(parent_id)
     if catalog['missing_child_ids'] and not allow_partial:
         return {'status': 'not_built', 'missing_child_ids': catalog['missing_child_ids']}

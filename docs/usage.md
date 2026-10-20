@@ -48,19 +48,26 @@ Claude Code 的工作区技能可导出到 `<workspace>/.claude/skills/lightnove
 
 ## 最简连续翻译
 
-先完成上述本地配置。公共 API 使用用户配置文件，不要求配置 embedding。
+先完成上述本地配置。公共 API 使用用户配置文件，不要求配置 embedding。下面仍显式执行阶段 B 的任务预检；没有跨版本检索需求时可以不建立独立版本索引，但若 `plan_next()` 返回 `index_required`，必须先准备任务历史索引。如果返回 `index_capacity_decision_required`，读取 `historical_index.planning.diagnostics` 并明确选择新的分块参数或 rollup 策略，不能直接运行翻译。`project.translate(...)` 是短任务的便捷入口，适合调用者明确接受库内部兜底，不适合需要检查索引覆盖和费用边界的长任务。
 
 ```python
 from lightnovel_translation import TranslationProject
 
 with TranslationProject("work/my-novel") as project:
     source = project.import_book("novel.epub", edition_id="web-ja", language="ja")
-    result = project.translate(
-        source,
-        name="opening",
-        chapters=source.chapters()[:5],
-    )
-    print(result.to_dict())
+    with project.create_job("opening", source=source,
+                            chapters=source.chapters()[:5],
+                            mode="source_only") as job:
+        plan = job.plan_next()
+        if plan["state"] == "index_required":
+            prepared = job.prepare_history()
+            if not prepared["historical_index"]["ready"]:
+                raise RuntimeError("history index is incomplete")
+            plan = job.plan_next()
+        if plan["state"] != "ready":
+            raise RuntimeError(f"translation preflight is not ready: {plan['state']}")
+        result = job.run(max_chapters=1)
+        print(result.to_dict())
 ```
 
 `result.artifact_dir` 下有 `translation.txt`、`chapters.jsonl` 和 `status.json`。`complete` 表示指定窗口已完成工程闭环，`blocked` 需检查结构化 error 与保存的草稿。译文保留实验工作稿标签，不代表人工审定。
@@ -95,6 +102,13 @@ with TranslationProject("work/my-novel") as project:
     source = project.edition("web-ja")
     with project.create_job("window", source=source, chapters=source.chapters()[400:450]) as job:
         plan = job.plan_next()                 # 不调用模型
+        if plan["state"] == "index_required":
+            prepared = job.prepare_history()   # 可能调用模型；阶段 B
+            if not prepared["historical_index"]["ready"]:
+                raise RuntimeError("history index is incomplete")
+            plan = job.plan_next()
+        if plan["state"] != "ready":
+            raise RuntimeError(f"translation preflight is not ready: {plan['state']}")
         print(plan["context"]["messages"])    # 首章完整 prompt
         print(plan["context"]["budget"])
         result = job.run(max_chapters=2, on_event=print)
@@ -105,6 +119,14 @@ with TranslationProject("work/my-novel") as project:
 # 也可以在之后的另一个进程中恢复。
 with TranslationProject("work/my-novel") as project:
     with project.open_job("window") as job:
+        plan = job.plan_next()
+        if plan["state"] == "index_required":
+            prepared = job.prepare_history()
+            if not prepared["historical_index"]["ready"]:
+                raise RuntimeError("history index is incomplete")
+            plan = job.plan_next()
+        if plan["state"] not in {"ready", "complete"}:
+            raise RuntimeError(f"translation preflight is not ready: {plan['state']}")
         result = job.resume(materialize=True) # 同步构建已提交范围的增量索引
         print(result.to_dict())
 ```
@@ -178,7 +200,15 @@ with project.create_job(
     mode="cross_edition", references=[reference], index=index,
     associations=[association],
 ) as job:
-    print(job.plan_next()["context"]["messages"])
+    plan = job.plan_next()
+    if plan["state"] == "index_required":
+        prepared = job.prepare_history()
+        if not prepared["historical_index"]["ready"]:
+            raise RuntimeError("history index is incomplete")
+        plan = job.plan_next()
+    if plan["state"] != "ready":
+        raise RuntimeError(f"translation preflight is not ready: {plan['state']}")
+    print(plan["context"]["messages"])
     result = job.run()
 ```
 

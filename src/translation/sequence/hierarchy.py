@@ -9,11 +9,11 @@ from ..narrative.service import dependency
 from ..storage import digest
 from .requests import sequence_limits, SequenceCaller
 
-PROFILE = 'hierarchy-v1'
+PROFILE = 'hierarchy-v2'
 
 
 def enabled(repo):
-    return repo.manifest['inputs'].get('history_index_profile') == PROFILE
+    return repo.manifest['inputs'].get('history_index_profile') in {PROFILE, 'hierarchy-v1'}
 
 
 def usable(node):
@@ -34,19 +34,72 @@ def _layout(repo, spec, view):
         sources.update({d['chapter_id']: d for d in node['dependencies'] if d['language'] == 'ja'})
     pairs = [historical.get(d['chapter_id'], {'source': d, 'translation': []})
              for d in sorted(sources.values(), key=lambda d: d['order'])]
-    groups, group = [], []
+    groups, diagnostics = [], []
+    expected_l1_count = 0
+
+    def pair_tokens(pair):
+        docs = [pair['source']] + pair.get('translation', [])
+        return sum(view.counter.count(doc.get('title', '') + '\n' + doc.get('text', '')) for doc in docs)
+
+    def l1_report(members):
+        messages, _ = joint_messages(members, [], [], reference_profile=spec.reference_profile)
+        report = plan_request(messages, spec.capacity, spec.roles['indexer'], view.counter)
+        return report, report['fits'] and report['safe_input_tokens'] <= \
+            report['input_limit'] * spec.planning_utilization
+
+    sections, section = [], []
     for pair in pairs:
-        if group and (len(group) >= spec.parent_max_chapters or
-                      pair['source']['order'] != group[-1]['source']['order'] + 1):
-            groups.append(group)
-            group = []
-        group.append(pair)
-    if group:
-        groups.append(group)
+        if section and pair['source']['order'] != section[-1]['source']['order'] + 1:
+            sections.append(section)
+            section = []
+        section.append(pair)
+    if section:
+        sections.append(section)
+    for segment in sections:
+        minimum = min(spec.parent_min_chapters, spec.parent_max_chapters)
+        expected_l1_count += max(1, round(len(segment) / minimum))
+        cursor = 0
+        while cursor < len(segment):
+            remaining = segment[cursor:]
+            if spec.index_layout == 'token-v2' and len(remaining) >= minimum:
+                report, fits = l1_report(remaining[:minimum])
+                if not fits:
+                    diagnostics.append({'kind': 'minimum_l1_does_not_fit',
+                        'source_ids': [p['source']['chapter_id'] for p in remaining[:minimum]],
+                        'minimum_chapters': minimum, 'budget': report,
+                        'suggested_actions': ['explicit_child_summary_rollup',
+                                              'revise_index_capacity_or_l1_minimum']})
+            members = []
+            for pair in remaining[:spec.parent_max_chapters]:
+                trial = members + [pair]
+                if spec.index_layout == 'token-v2':
+                    _, fits = l1_report(trial)
+                    if members and not fits:
+                        break
+                else:
+                    fits = True
+                members.append(pair)
+                if spec.index_layout != 'token-v2' and len(members) >= spec.parent_max_chapters:
+                    break
+            if not members:
+                raise NarrativeError('index_planning_failed', 'token planner failed to advance')
+            if (spec.index_layout == 'token-v2' and len(members) < minimum and
+                    len(remaining) >= minimum):
+                report, _ = l1_report(members)
+                diagnostics.append({'kind': 'short_l1_before_minimum',
+                    'source_ids': [p['source']['chapter_id'] for p in members],
+                    'minimum_chapters': minimum, 'budget': report})
+            groups.append(members)
+            cursor += len(members)
+
     nodes, roots = [], []
     for gi, members in enumerate(groups):
         rid = 'hierarchy-parent:' + digest({'run': repo.run_id, 'start': members[0]['source']['chapter_id']})[:24]
         children, current = [], []
+        expected_children = min(spec.expected_l2_count,
+            max(1, round(len(members) / spec.l2_prepartition_min_chapters)))
+        target_child_tokens = max(1, sum(pair_tokens(pair) for pair in members) // expected_children)
+        current_tokens = 0
 
         def flush():
             if current:
@@ -57,23 +110,28 @@ def _layout(repo, spec, view):
             trial = current + [pair]
             messages, _ = joint_messages(trial, [], [], reference_profile=spec.reference_profile)
             report = plan_request(messages, spec.capacity, spec.roles['indexer'], view.counter)
-            reserve = sum(view.counter.count(p['source']['text']) for p in trial if not p['translation'])
-            safe = report['safe_input_tokens'] + int(reserve * spec.capacity.token_inflation_factor)
-            if current and (len(current) >= spec.child_max_chapters or
-                            not report['fits'] or
-                            safe > report['input_limit'] * spec.planning_utilization):
+            target_reached = (spec.index_layout == 'token-v2' and current and
+                len(children) < expected_children - 1 and current_tokens >= target_child_tokens)
+            if current and (target_reached or len(current) >= spec.child_max_chapters or
+                            not report['fits'] or report['safe_input_tokens'] >
+                            report['input_limit'] * spec.planning_utilization):
                 flush()
+                current_tokens = 0
                 messages, _ = joint_messages([pair], [], [], reference_profile=spec.reference_profile)
                 report = plan_request(messages, spec.capacity, spec.roles['indexer'], view.counter)
             # An oversized child is diagnosed only if actually needed; its
             # existence must not prevent trying a direct parent request.
             current.append(pair)
+            current_tokens += pair_tokens(pair)
         flush()
         root = {'node_id': rid, 'parent_id': None, 'level': 1,
             'ordered_source_ids': [p['source']['chapter_id'] for p in members],
             'start_position': members[0]['source']['order'], 'end_position': members[-1]['source']['order'],
             'state': 'sealed' if len(members) == spec.parent_max_chapters or gi < len(groups)-1 else 'open',
-            'children': [], 'preferred_build_method': 'direct', 'layout': 'direct_then_rollup'}
+            'expected_l2_count': expected_children,
+            'short_range': len(members) < min(spec.parent_min_chapters, spec.parent_max_chapters),
+            'children': [], 'preferred_build_method': spec.parent_build_mode,
+            'layout': spec.parent_build_mode}
         roots.append(rid)
         nodes.append(root)
         for ci, child in enumerate(children):
@@ -83,9 +141,18 @@ def _layout(repo, spec, view):
                 'ordered_source_ids': [p['source']['chapter_id'] for p in child],
                 'start_position': child[0]['source']['order'], 'end_position': child[-1]['source']['order'],
                 'state': 'sealed' if ci < len(children)-1 or root['state'] == 'sealed' or
-                         len(child) == spec.child_max_chapters else 'open'})
+                         len(child) == spec.child_max_chapters else 'open',
+                'prepartition_minimum_chapters': spec.l2_prepartition_min_chapters,
+                'minimum_exception': spec.index_layout == 'token-v2' and
+                    len(child) < spec.l2_prepartition_min_chapters})
     value = {'schema': PROFILE, 'run_id': repo.run_id, 'roots': roots, 'nodes': nodes,
             'ordered_source_ids': [p['source']['chapter_id'] for p in pairs],
+            'planning': {'status': 'capacity_decision_required' if diagnostics else 'ready',
+                         'diagnostics': diagnostics, 'expected_l1_count': expected_l1_count,
+                         'minimum_l1_chapters': min(spec.parent_min_chapters, spec.parent_max_chapters),
+                         'maximum_l1_chapters': spec.parent_max_chapters,
+                         'expected_l2_count': spec.expected_l2_count,
+                         'l2_prepartition_minimum_chapters': spec.l2_prepartition_min_chapters},
             'fingerprint': digest({'roots': roots, 'nodes': nodes})}
     repo.store.put('sequence-hierarchy-plan', value)
     return value
@@ -115,7 +182,8 @@ def plan_hierarchy(repo, spec, view):
             node['children'] = [cid for cid in node['children'] if cid in existing_ids]
     return {'schema': PROFILE, 'roots': [n['node_id'] for n in nodes if n['level'] == 1],
         'nodes': nodes,
-        'ordered_source_ids': [cid for cid in layout['ordered_source_ids'] if cid in visible]}
+        'ordered_source_ids': [cid for cid in layout['ordered_source_ids'] if cid in visible],
+        'planning': layout.get('planning', {'status': 'ready', 'diagnostics': []})}
 
 
 def latest_nodes(repo, *, allowed_source_ids=None):
@@ -191,7 +259,13 @@ def pending_report(repo, spec, view):
             pending.append({'node_id': node['node_id'], 'level': node['level'],
                 'source_ids': desired, 'reason': 'history_not_materialized',
                 'preferred_build_method': 'direct'})
-    return {'profile': PROFILE, 'pending': pending, 'ready': not pending,
+    planning = plan.get('planning', {'status': 'ready', 'diagnostics': []})
+    requires_decision = (planning.get('status') == 'capacity_decision_required' and
+                         spec.parent_build_mode == 'direct')
+    return {'profile': PROFILE, 'pending': pending,
+        'ready': not pending and not requires_decision,
+        'requires_capacity_decision': requires_decision,
+        'planning': planning,
         'index_revision': index_snapshot(repo),
         'nodes': plan['nodes'], 'generation_calls': 0, 'local_only': True}
 
@@ -286,6 +360,14 @@ def materialize_hierarchy(repo, spec, view, provider, *, force_open=False,
                           requested_child_ids=(), details_only=False):
     from .context import _parent_overview
     plan = plan_hierarchy(repo, spec, view)
+    planning = plan.get('planning', {})
+    if (planning.get('status') == 'capacity_decision_required' and
+            spec.parent_build_mode == 'direct'):
+        diagnostic = {'run_id': repo.run_id, 'planning': planning,
+            'not_sent': True, 'reason': 'minimum L1 range does not fit a direct summary'}
+        ident = repo.store.put('sequence-index-capacity-decision', diagnostic)
+        raise NarrativeError('index_capacity_decision_required',
+            diagnostic['reason'] + '; diagnostic=' + ident)
     by_id = {n['node_id']: n for n in plan['nodes']}
     if any(cid not in by_id or by_id[cid]['level'] != 2 for cid in requested_child_ids):
         raise NarrativeError('visibility_denied', 'unknown or future detail node')
@@ -327,8 +409,21 @@ def materialize_hierarchy(repo, spec, view, provider, *, force_open=False,
                       if n['level'] == 1 and n['end_position'] < root['start_position']]
         failure = None
         if not details_only and ids and (force_open or not set(ids) <= full):
-            _, failure = ensure(root, ids, navigation=navigation)
+            if spec.parent_build_mode == 'child_summary_rollup':
+                failure = {'kind': 'explicit_child_summary_rollup'}
+            else:
+                _, failure = ensure(root, ids, navigation=navigation)
         if failure:
+            if spec.parent_build_mode == 'direct':
+                diagnostic = {'run_id': repo.run_id, 'node_id': root['node_id'],
+                    'source_ids': ids, 'failure': failure, 'planning': planning,
+                    'not_sent': failure.get('kind') == 'local_context_limit',
+                    'reason': 'direct L1 summary needs an explicit capacity fallback decision'}
+                ident = repo.store.put('sequence-index-capacity-decision', diagnostic)
+                raise NarrativeError('index_capacity_decision_required',
+                    diagnostic['reason'] + '; diagnostic=' + ident)
+            if spec.parent_build_mode not in {'direct_then_rollup', 'child_summary_rollup'}:
+                raise NarrativeError('index_capacity_decision_required', 'unknown L1 fallback mode')
             selected = []
             for cid in root['children']:
                 child = by_id[cid]
@@ -373,6 +468,9 @@ def materialize_hierarchy(repo, spec, view, provider, *, force_open=False,
                 repo.db.execute("UPDATE sequence_outbox SET status='completed' WHERE id=?",
                                 (eid,))
     index_snapshot(repo)
+    from .entities import update_entity_catalog
+    entity_nodes = latest_nodes(repo) + latest_incremental_nodes(repo)
+    update_entity_catalog(repo, spec, view, caller, entity_nodes)
     return list(ready.values())
 
 

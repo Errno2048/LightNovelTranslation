@@ -6,7 +6,7 @@ import json
 
 from .errors import ConfigurationError, TranslationError
 from .skill import export_skill
-from .user_config import init_user_config, user_config_path, user_config_status
+from .user_config import init_user_config, update_user_config, user_config_path, user_config_status
 
 
 def main(argv=None) -> int:
@@ -14,9 +14,12 @@ def main(argv=None) -> int:
     commands = parser.add_subparsers(dest="command", required=True)
     config = commands.add_parser("config", help="Initialize or check reusable private settings")
     actions = config.add_subparsers(dest="action", required=True)
-    for name in ("init", "check", "path"):
+    for name in ("init", "check", "path", "update"):
         action = actions.add_parser(name)
         action.add_argument("--directory", help="Override ~/.lightnovel_translation")
+        if name == 'update':
+            action.add_argument('--set', dest='updates', action='append', required=True,
+                                metavar='PATH=VALUE', help='Set an allowlisted non-credential field')
     skill = commands.add_parser("skill", help="Export the bundled agent skill")
     exports = skill.add_subparsers(dest="action", required=True)
     export = exports.add_parser("export")
@@ -34,6 +37,18 @@ def main(argv=None) -> int:
             result = init_user_config(args.directory)
         elif args.action == "check":
             result = user_config_status(args.directory)
+        elif args.action == 'update':
+            updates = {}
+            for item in args.updates:
+                if '=' not in item:
+                    raise ConfigurationError('each update must use PATH=VALUE')
+                key, raw = item.split('=', 1)
+                try:
+                    value = json.loads(raw)
+                except json.JSONDecodeError:
+                    value = raw
+                updates[key] = value
+            result = update_user_config(updates, args.directory)
         else:
             result = {"path": str(user_config_path(args.directory))}
     except (ConfigurationError, TranslationError, OSError):
