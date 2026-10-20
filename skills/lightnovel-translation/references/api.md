@@ -37,7 +37,7 @@ print(index.read(nodes[0]["node_id"]))       # 本地，不隐式补建
 built = index.build([nodes[0]["node_id"]])    # 可收费
 ```
 
-L2 按 token/章节上限装箱，L1 汇总子摘要。`build(..., workers=N)` 在同一 L1 内串行，不同 L1 间并发；不要另开并发写入同一 Job。`include_parents=True` 只有该父节点必要子摘要齐全时才能完整汇总。`build_parent(parent_id, allow_partial=True)` 可显式保存部分汇总，但必须报告缺失覆盖。
+L2 按 token/章节上限装箱，L1 默认先直接读取完整父块，只有明确容量超限才汇总子摘要。`build(..., workers=N)` 在同一 L1 内串行，不同 L1 间并发；不要另开并发写入同一 Job。`include_parents=True` 会对涉及的父节点执行 `direct_then_rollup`，只有完整覆盖才报告 `complete=True`。`build_parent(parent_id, allow_partial=True)` 可显式保存部分汇总，但必须报告缺失覆盖。
 
 三种模式：
 
@@ -84,7 +84,9 @@ with TranslationProject("work/novel") as project:
 
 `run(max_chapters=N)` 表示本次最多新提交 N 章。`paused_at_limit` 是正常暂停，`complete` 才表示冻结窗口全部执行完成。`blocked` 不是成功，error 给出原因，已经生成和提交的内容仍在 SQLite 中。
 
-`checkpoint()` 显式压缩已提交前文；`run(materialize=True)` 还会构建已提交尾部的增量知识，两者都可能收费。所有 index / job 分别有持久预算，不是整个 Project 的总额度。
+层次历史任务首次 `plan_next()` 可能返回 `state="index_required"`；这是本地导航待物化状态，使用 `job.prepare_history()`，不要把它当作正文缺失。`job.ensure_details([node_id, ...])` 只构建明确请求的 L2 细节，旧检查点保持可追溯。父级 L1 默认直接读取整块原文；只有容量超限才采用 L2 rollup。
+
+`checkpoint()` 显式压缩已提交前文；`run(materialize=True)` 还会构建已提交尾部的增量知识，两者都可能收费。检查点上下文采用最近完整双语、邻近 L2、远距 L1 的非重叠覆盖；未建 L2 只表示待物化，不表示 `explicit_gap`。所有 index / job 分别有持久预算，不是整个 Project 的总额度。
 
 模型 / tokenizer 身份变化不能直接恢复旧任务；语料修复、重新选参考或配置策略改变不会改写旧任务。需要新任务以冻结新输入。不要修改 SQLite 让原任务看似接受了新配置。
 

@@ -134,7 +134,9 @@ class Index:
         if include_parents:
             parents = sorted({self._pipeline.nodes[n]["parent_id"] for n in ids})
             result["parents"] = [self._pipeline.build_parent(n, output_tokens=output) for n in parents]
-            result["complete"] = result["complete"] and all("overview" in p for p in result["parents"])
+            result["complete"] = result["complete"] and all(
+                p.get("coverage_complete", "overview" in p) is True
+                and "overview" in p for p in result["parents"])
         return result
 
     def read(self, node_id: str) -> dict[str, Any]:
@@ -144,15 +146,24 @@ class Index:
             raise ValueError("unknown index node")
         if node["level"] == 2:
             return self._pipeline.lookup_reference(node_id)
-        path = self.path / "parents" / (node_id + ".json")
-        if not path.is_file():
-            return {"status": "not_built", "summary": None, "suggested_build_nodes": node["child_ids"]}
-        summary = read_json(path)
+        summary = self._pipeline.read_parent(node_id)
+        if summary is None:
+            return {"status": "not_built", "summary": None, "suggested_build_nodes": [node_id]}
+        if summary.get('schema') == 'edition-parent-v2':
+            complete = summary.get('coverage_complete', True) is True
+            missing = summary.get('missing_child_ids',
+                summary.get('entity_catalog', {}).get('missing_child_ids', []))
+            if not complete and not missing and summary.get('build_method') == 'direct':
+                missing = node.get('child_ids', [])
+            return {"status": "found" if complete else "partial", "summary": summary,
+                    "suggested_build_nodes": [] if complete else missing}
         catalog = self._pipeline.entity_catalog(node_id)
         fingerprints = [self._pipeline.read_summary(n)["fingerprint"] for n in catalog["covered_child_ids"]]
         if summary["child_fingerprints"] != fingerprints:
             raise TranslationError("stale_summary", "parent summary differs from current children")
-        return {"status": "found", "summary": summary, "suggested_build_nodes": []}
+        missing = catalog['missing_child_ids']
+        return {"status": "found" if not missing else "partial", "summary": summary,
+                "suggested_build_nodes": missing}
 
     def entity_catalog(self, parent_id: str) -> dict[str, Any]:
         self._check()
@@ -176,12 +187,13 @@ class Index:
                                    max_requests=max_requests, max_rounds=max_rounds)
 
     @operation
-    def build_parent(self, parent_id: str, *, allow_partial: bool = False) -> dict[str, Any]:
-        """Roll up existing child summaries; never implicitly build missing children."""
+    def build_parent(self, parent_id: str, *, allow_partial: bool = False,
+                     method: str = 'direct_then_rollup') -> dict[str, Any]:
+        """Read L1 bodies directly; build children only after a capacity failure."""
         self._check()
         self._nodes([parent_id], level=1)
         self.project._require_generation()
-        return self._pipeline.build_parent(parent_id, allow_partial=allow_partial,
+        return self._pipeline.build_parent(parent_id, allow_partial=allow_partial, method=method,
             output_tokens=self.project.config.role_budgets()["indexer"].requested_output_tokens)
 
     @operation

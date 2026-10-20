@@ -17,6 +17,7 @@ from .requests import SequenceCaller, sequence_limits
 from .view import SequenceNarrativeView
 from .context import (build_checkpoint, compile_sequence_context, input_soft_limit, budget_for)
 from .knowledge import materialize_nodes
+from .hierarchy import enabled as hierarchy_enabled, materialize_hierarchy, pending_report, index_snapshot
 from ..references import STABLE, prompt_projection
 
 
@@ -40,12 +41,22 @@ class SequenceEngine:
         for ident,c in self.repo.commits(): self.repo.validate_commit(ident)
         return next((c for c in self.repo.chapters() if c['state']!='committed'),None)
 
-    def view(self,target_id): return SequenceNarrativeView(self.repo,target_id,self.counter)
+    def view(self,target_id):
+        view=SequenceNarrativeView(self.repo,target_id,self.counter)
+        if hierarchy_enabled(self.repo):
+            view.detail_builder=lambda ids: materialize_hierarchy(self.repo,self.spec,view,
+                self.provider,requested_child_ids=ids,details_only=True)
+        return view
 
     def plan_next(self):
         chapter=self.next_chapter()
         if chapter is None: return {'state':'complete','run_id':self.repo.run_id}
         view=self.view(chapter['source_id'])
+        historical_index = pending_report(self.repo, self.spec, view) if hierarchy_enabled(self.repo) else None
+        if historical_index and historical_index['pending'] and not chapter.get('context_id'):
+            return {'state':'index_required', 'run_id':self.repo.run_id,
+                'source_id':chapter['source_id'], 'historical_index':historical_index,
+                'needs_checkpoint':False, 'context':None, 'local_only':True}
         if chapter.get('context_id'):
             context=self.repo.store.get(chapter['context_id'],'sequence-context')
             validate_context(view,context)
@@ -68,7 +79,16 @@ class SequenceEngine:
         report=context['budget']; limit=input_soft_limit(self.spec,report)
         checkpoint=self.repo.store.get(context['checkpoint_id'])
         cross_parent=False
-        if self.repo.commits():
+        context_roll=False
+        if hierarchy_enabled(self.repo):
+            cross_parent = checkpoint.get('index_revision') != index_snapshot(self.repo)
+            checkpoint_turns = sum(message.get('role') == 'assistant'
+                                   for message in checkpoint.get('messages', []))
+            checkpoint_commits = set(checkpoint.get('commit_ids', []))
+            appended_commits = sum(ident not in checkpoint_commits
+                                   for ident, _ in self.repo.all_commits())
+            context_roll = checkpoint_turns + appended_commits > self.spec.n_chapter
+        elif self.repo.commits():
             from .knowledge import current_index
             index=current_index(self.repo,self.spec,view)
             represented={c['source_id'] for ident,c in self.repo.commits() if ident in checkpoint['commit_ids']}
@@ -76,9 +96,10 @@ class SequenceEngine:
                              for n in index['nodes'])
         needs=(not chapter.get('context_id') and self.spec.strategy=='H' and
                (report['safe_input_tokens']>limit*self.spec.compression_trigger or
-                cross_parent and checkpoint['head']!=self.repo.heads()['head']))
+                (cross_parent or context_roll) and checkpoint['head']!=self.repo.heads()['head']))
         return {'state':'ready','run_id':self.repo.run_id,'source_id':chapter['source_id'],
                 'context':context,'needs_checkpoint':needs,'input_soft_limit':limit,
+                'historical_index':historical_index,
                 'pending_materializations':[dict(id=r[0],kind=r[1]) for r in self.repo.db.execute(
                     "SELECT id,kind FROM sequence_outbox WHERE status='pending'")],
                 'local_only':True}
@@ -87,8 +108,17 @@ class SequenceEngine:
         chapter=self.next_chapter()
         if chapter is None: return None
         view=self.view(chapter['source_id'])
+        if hierarchy_enabled(self.repo):
+            materialize_hierarchy(self.repo, self.spec, view, self.provider, force_open=force)
+            # Branch translations use the append-only sequence-node store.  It
+            # is independent from the frozen history hierarchy and must be
+            # materialized before compiling the next checkpoint.
+            if self.repo.commits():
+                materialize_nodes(self.repo, self.spec, view, self.provider,
+                                  force_open=force)
         before=compile_sequence_context(self.repo,self.spec,view)['budget'] if self.repo.heads()['checkpoint'] else None
-        materialize_nodes(self.repo,self.spec,view,self.provider,force_open=force)
+        if not hierarchy_enabled(self.repo):
+            materialize_nodes(self.repo,self.spec,view,self.provider,force_open=force)
         return build_checkpoint(self.repo,self.spec,view,caller=self.caller,reason='explicit' if force else 'threshold',fault=self.fault,
             previous_budget=before)
 
@@ -97,10 +127,25 @@ class SequenceEngine:
         if chapter is None: return {'state':'complete','local_only':True}
         view=self.view(chapter['source_id'])
         from .knowledge import current_index
-        plan=current_index(self.repo,self.spec,view) if self.repo.commits() else None
+        plan=(pending_report(self.repo,self.spec,view) if hierarchy_enabled(self.repo) else
+              current_index(self.repo,self.spec,view) if self.repo.commits() else None)
         return {'run_id':self.repo.run_id,'head':self.repo.heads()['head'],'target_id':chapter['source_id'],
             'index_plan':plan,'pending_outbox':[r[0] for r in self.repo.db.execute("SELECT id FROM sequence_outbox WHERE status='pending'")],
-            'force_open_tail':True,'requires_generation':bool(self.repo.commits()),'local_only':True}
+            'force_open_tail':True,'requires_generation':bool(self.repo.commits()) or
+                bool(plan and plan.get('pending')),'local_only':True}
+
+    def prepare_history(self, *, child_ids=()):
+        if not hierarchy_enabled(self.repo):
+            raise NarrativeError('unsupported_policy','frozen legacy job has no history hierarchy; create a new job')
+        chapter=self.next_chapter()
+        view=self.view(chapter['source_id'] if chapter else None)
+        nodes=materialize_hierarchy(self.repo,self.spec,view,self.provider,
+            requested_child_ids=child_ids,details_only=bool(child_ids))
+        if chapter and not chapter.get('context_id'):
+            build_checkpoint(self.repo,self.spec,view,caller=self.caller,reason='history_prepared')
+        return {'index_revision':index_snapshot(self.repo),'nodes':[
+            {k:n[k] for k in ('id','node_id','level','source_ids','build_method','state')} for n in nodes],
+            'historical_index':pending_report(self.repo,self.spec,view)}
 
     def _review(self,view,context,version_id):
         from ..review.requests import ReviewSession
@@ -280,8 +325,18 @@ class SequenceEngine:
                 # A durable context is frozen once. Saved responses resume against
                 # it even if the new usage calibration is more conservative.
                 if not chapter.get('context_id'):
-                    materialize_nodes(self.repo,self.spec,view,self.provider)
+                    if hierarchy_enabled(self.repo):
+                        before = pending_report(self.repo, self.spec, view)
+                        if before['pending']:
+                            materialize_hierarchy(self.repo, self.spec, view, self.provider)
+                            build_checkpoint(self.repo,self.spec,view,caller=self.caller,reason='history_bootstrap')
+                        if self.repo.commits():
+                            materialize_nodes(self.repo, self.spec, view, self.provider)
+                    if not hierarchy_enabled(self.repo):
+                        materialize_nodes(self.repo,self.spec,view,self.provider)
                 plan=self.plan_next()
+                if plan['state']=='index_required':
+                    raise NarrativeError('incomplete_historical_index', 'historical index is not ready')
                 if plan['needs_checkpoint']:
                     self.checkpoint(force=True); plan=self.plan_next()
                 context=plan['context']
@@ -357,6 +412,13 @@ class SequenceEngine:
 
     def materialize_pending(self,*,seal_tail=False):
         view=SequenceNarrativeView(self.repo,None,self.counter)
+        if hierarchy_enabled(self.repo):
+            historical = materialize_hierarchy(self.repo,self.spec,view,self.provider,
+                force_open=seal_tail)
+            incremental = materialize_nodes(self.repo,self.spec,view,self.provider,
+                force_open=seal_tail) if self.repo.commits() else []
+            index_snapshot(self.repo)
+            return historical + incremental
         return materialize_nodes(self.repo,self.spec,view,self.provider,force_open=seal_tail)
 
     def explain_context(self,source_id,output):

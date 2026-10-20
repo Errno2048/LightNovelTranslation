@@ -189,6 +189,12 @@ def create_sequence(path,spec,frozen_inputs,*,branch_name,provider_identity,coun
         raise NarrativeError('visibility_denied','history must be strictly before the window')
     if len({p['source']['chapter_id'] for p in history})!=len(history):
         raise NarrativeError('conflict','duplicate historical source pair')
+    historical_sources=inputs.get('history_sources',[])
+    if len({d['chapter_id'] for d in historical_sources})!=len(historical_sources):
+        raise NarrativeError('conflict','duplicate historical source body')
+    if any(d['language']!='ja' or d['order']>=orders[0] or d['chapter_id'] in reserved
+           for d in historical_sources):
+        raise NarrativeError('visibility_denied','historical source bodies must strictly precede targets')
     for pair in history:
         if pair['source']['language']!='ja' or not pair.get('translation') or any(d['language']!='zh' for d in pair['translation']):
             raise NarrativeError('invalid_record','historical full-pair context requires Japanese and Chinese bodies')

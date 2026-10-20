@@ -11,7 +11,8 @@ from ..narrative.schemas import NarrativeError
 from ..providers import ProviderError
 from ..schemas import GenerationRequest
 from ..storage import digest
-from ..budget import (RoleBudget, plan_request, calibration_profile, read_calibration, observe_usage)
+from ..budget import (RoleBudget, plan_request, calibration_profile, read_calibration, observe_usage,
+                      is_context_overflow)
 
 
 PERMANENT = {'authentication', 'parameters', 'configuration', 'invalid_config', 'visibility_denied'}
@@ -123,7 +124,9 @@ class ExtractionRecovery:
                        'error':None if response.finish_reason=='stop' and response.text.strip() else
                        'truncated' if response.finish_reason=='length' else 'empty'}
             except ProviderError as exc:
-                raw = {'identity':identity,'error':exc.kind,'text':exc.details.get('text',''), 'details':exc.details}
+                raw = {'identity':identity,
+                    'error':'context_length_exceeded' if is_context_overflow(exc) else exc.kind,
+                    'text':exc.details.get('text',''), 'details':exc.details}
             raw_id = self.store.put('extraction-raw',raw)
             usage=raw.get('generation',{}).get('usage',raw.get('details',{}).get('usage',{}))
             if budget and usage:
@@ -134,6 +137,8 @@ class ExtractionRecovery:
                               {'raw_id':raw_id,'usage':usage,'error':error})
             if error in PERMANENT:
                 raise NarrativeError(error,'permanent extraction failure; inspect durable raw')
+            if error in {'context_length_exceeded', 'context_window_exceeded'}:
+                break
             if raw['text']:
                 candidate = parse(normalize(raw['text']))
                 if action=='transcribe' and (not parsed or candidate.get('payload') != parsed.get('payload')):

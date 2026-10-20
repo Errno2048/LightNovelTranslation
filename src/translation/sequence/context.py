@@ -45,6 +45,28 @@ def input_soft_limit(spec,report): return min(report['input_limit'],spec.soft_in
 
 
 def _latest_nodes(repo,allowed_source_ids=None):
+    from .hierarchy import enabled, latest_nodes, latest_incremental_nodes
+    if enabled(repo):
+        if allowed_source_ids is None:
+            # A saved/inspected context may target an earlier chapter than
+            # the current branch head.  Keep both index stores inside that
+            # target's historical visibility boundary.
+            pending = next((c for c in repo.chapters() if c['state'] != 'committed'), None)
+            if pending:
+                docs = list(repo.manifest['inputs'].get('history_sources', []))
+                docs += [p['source'] for p in repo.manifest['inputs'].get('history_pairs', [])]
+                docs += list(repo.manifest['inputs'].get('targets', []))
+                docs += [d for node in repo.manifest['inputs'].get('history_nodes', [])
+                         for d in node.get('dependencies', []) if d.get('language') == 'ja']
+                orders = {d['chapter_id']: d['order'] for d in docs}
+                target_order = orders.get(pending['source_id'])
+                if target_order is not None:
+                    allowed_source_ids = {cid for cid, order in orders.items()
+                                          if order < target_order}
+                    allowed_source_ids.update(c['source_id'] for _, c in repo.all_commits()
+                                              if orders.get(c['source_id'], target_order) < target_order)
+        return (latest_nodes(repo, allowed_source_ids=allowed_source_ids) +
+                latest_incremental_nodes(repo, allowed_source_ids=allowed_source_ids))
     # Longer revisions replace earlier open-prefix revisions only for consumers.
     # Historical revisions themselves remain immutable and addressable.
     if allowed_source_ids is None:
@@ -138,6 +160,10 @@ def _parent_overview(repo,caller,children,parent):
 
 
 def build_checkpoint(repo,spec,view,*,caller=None,reason='initial',fault=None,previous_budget=None):
+    from .hierarchy import enabled
+    if enabled(repo):
+        from .hierarchy_context import build
+        return build(repo,spec,view,caller=caller,reason=reason,fault=fault,previous_budget=previous_budget)
     commits=repo.all_commits(); nodes=_latest_nodes(repo)
     all_generated=[c['source_id'] for _,c in commits]
     materialized={cid for node in nodes for cid in node['source_ids']}
@@ -156,9 +182,9 @@ def build_checkpoint(repo,spec,view,*,caller=None,reason='initial',fault=None,pr
         for doc in node['dependencies']:
             dep=dependency(view.body(doc['chapter_id'])); deps[dep['chapter_id']]=dep
         entry={'id':node['id'],'source_ids':node['source_ids'],'summary':node['summary'],
-               'status':node.get('semantic_status','candidate_unreviewed'),'kind':'L1'}
+               'status':node.get('semantic_status','candidate_unreviewed'),'kind':'L'+str(node.get('level',2)),'level':node.get('level',2)}
         summary_entries.append(entry)
-        coverage.append({'source_ids':node['source_ids'],'representation':'L1','revision_id':node['id']})
+        coverage.append({'source_ids':node['source_ids'],'representation':entry['kind'],'level':entry['level'],'revision_id':node['id']})
     for node in nodes:
         for dep in node['dependencies']:
             if dep.get('commit_id'): view.validate_generated_dependency(dep)
@@ -332,6 +358,8 @@ def compile_sequence_context(repo,spec,view,*,checkpoint_id=None):
         'knowledge_delta':delta,
         'knowledge_quality_delta':gap_delta,
         'budget':budget_for(repo,spec,view.counter,messages)}
+    if checkpoint.get('index_revision'):
+        context['index_revision']=checkpoint['index_revision']
     if spec.reference_profile==STABLE:
         context['reference_profile']=STABLE
     if spec.output_profile != 'plain-v1':

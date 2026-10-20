@@ -16,4 +16,6 @@ Python 代码采用 [Python Packaging User Guide 的 src layout](https://packagi
 
 工作区、小说、请求日志、旧构建和临时模型验证脚本保存在仓库外。临时目录应传给示例和验证命令；`.venv`、构建目录及测试缓存可在本地重建，均受 Git 忽略规则约束。
 
+连续翻译历史索引的已知缺陷、直接 L1 优先及仅在容量不足时回退到 L2 汇总的设计，记录在[连续翻译历史索引修复规划](sequence-index-repair-plan.md)。实现前，不要把当前 parallel_pairs 全文回退行为视为已经完成远距 L1 / 近距 L2 滑动窗口。
+
 公开行为变更同时维护 README、使用说明和技能引用文档。

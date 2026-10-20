@@ -5,6 +5,7 @@ from translation.ingestion import InputSpec, SourceSpec, ReferenceSetPlan, plan_
 from translation.schemas import GenerationRequest, GenerationResult
 
 from .config import Limits, ModelConfig, ReferenceConfig, TranslationConfig
+from .acquisition_config import SyosetuConfig
 from .errors import ConfigurationError, TranslationError
 from .index import Index
 from .job import TranslationJob
@@ -15,7 +16,7 @@ from .skill import export_skill
 
 __version__ = "0.4.0"
 __all__ = ["TranslationProject", "TranslationConfig", "ModelConfig", "ModelCapacity", "RoleBudget",
-           "Limits", "ReferenceConfig", "EditionIndexSpec", "InputSpec", "SourceSpec", "Edition", "Index", "TranslationJob",
+           "Limits", "ReferenceConfig", "SyosetuConfig", "EditionIndexSpec", "InputSpec", "SourceSpec", "Edition", "Index", "TranslationJob",
            "ChapterInfo", "RunResult", "GenerationRequest", "GenerationResult", "ReferenceSetPlan", "plan_reference_set",
            "ConfigurationError", "TranslationError", "init_user_config", "user_config_directory",
            "user_config_path", "user_config_status", "export_skill", "__version__"]

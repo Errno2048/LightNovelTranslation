@@ -220,17 +220,23 @@ def build_sequence_inputs(pipeline, target_ids, *, associations=(), entity_match
     first_order = orders[0]
     history_nodes = []
     source_nodes = sorted((n for n in pipeline.nodes.values()
-                           if n['level'] == 2 and n['edition_id'] == web_edition
+                           if n['edition_id'] == web_edition
                            and n['reading_range'][1] < first_order), key=lambda n: n['reading_range'])
     for node in source_nodes:
-        artifact = pipeline.read_summary(node['node_id'])
+        artifact = (pipeline.read_summary(node['node_id']) if node['level']==2
+                    else pipeline.read_parent(node['node_id']))
         if not artifact:
             continue
+        if node['level']==1 and not artifact.get('coverage_complete',False):
+            continue
         dependencies = [_source_document(pipeline.archive, eid) for eid in node['entry_ids']]
-        history_nodes.append({'id': 'edition-l2:' + node['node_id'],
+        content=(json.dumps(_history_content(artifact),ensure_ascii=False,separators=(',',':'))
+                 if 'content' in artifact else artifact['overview'])
+        history_nodes.append({'id': 'edition-l'+str(node['level'])+':' + node['node_id'],
+            'level':node['level'],'build_method':artifact.get('build_method','direct'),
             'source_ids': list(node['entry_ids']),
             'start_position': node['reading_range'][0], 'end_position': node['reading_range'][1],
-            'summary': json.dumps(_history_content(artifact), ensure_ascii=False, separators=(',', ':')),
+            'summary':content,
             'dependencies': dependencies, 'semantic_status': 'candidate_unreviewed',
             'origin': 'frozen-independent-web-index', 'origin_fingerprint': artifact['fingerprint']})
 

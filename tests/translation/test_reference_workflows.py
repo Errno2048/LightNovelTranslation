@@ -8,11 +8,11 @@ import pytest
 from lightnovel_translation import GenerationResult, ModelCapacity, ReferenceConfig, TranslationConfig
 from translation.editions.archive import EditionArchive
 from translation.editions.context import compile_reference_packet
-from test_library_api import setup, book, OfflineProvider
+from test_library_api import make_project, book, OfflineProvider
 
 
 def test_cross_edition_without_event_match_still_includes_style_prose(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         zh = project.import_book(book(tmp_path, 'zh'), edition_id='print', language='zh', paragraph_policy='blank_line')
         with project.create_job('style', source=source, chapters=source.chapters()[:1], references=[zh]) as job:
@@ -34,7 +34,7 @@ def test_cross_edition_without_event_match_still_includes_style_prose(tmp_path):
 
 
 def test_history_only_never_uses_uncertified_fallback_prose(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         zh = project.import_book(book(tmp_path, 'zh'), edition_id='print', language='zh', paragraph_policy='blank_line')
         index = project.index([source, zh])
@@ -44,7 +44,7 @@ def test_history_only_never_uses_uncertified_fallback_prose(tmp_path):
 
 
 def test_related_block_prose_does_not_become_target_event_evidence(tmp_path):
-    project, source, _ = setup(tmp_path)
+    project, source, _ = make_project(tmp_path)
     with project:
         zh = project.import_book(book(tmp_path, 'zh'), edition_id='print', language='zh', paragraph_policy='blank_line')
         index = project.index([source, zh])
@@ -70,7 +70,7 @@ def test_prepare_references_uses_only_selected_nodes_and_reports_unmatched(tmp_p
                 self.requests.append(request)
                 return GenerationResult('@@SUMMARY\nreviewed_all: yes\n@@END', 'stop', 'offline', 'empty', {}, 0)
             return super().generate(request)
-    project, source, _ = setup(tmp_path, provider=EmptyMatches())
+    project, source, _ = make_project(tmp_path, provider=EmptyMatches())
     with project:
         zh = project.import_book(book(tmp_path, 'zh'), edition_id='print', language='zh', paragraph_policy='blank_line')
         index = project.index([source, zh])
@@ -83,7 +83,7 @@ def test_prepare_references_uses_only_selected_nodes_and_reports_unmatched(tmp_p
 
 
 def test_explicit_style_sample_is_preserved_and_foreign_id_rejected(tmp_path):
-    project, source, _ = setup(tmp_path)
+    project, source, _ = make_project(tmp_path)
     with project:
         zh = project.import_book(book(tmp_path, 'zh'), edition_id='print', language='zh', paragraph_policy='blank_line')
         with project.create_job('explicit', source=source, references=[zh], chapters=source.chapters()[:1],
@@ -112,7 +112,7 @@ class TerminologyProvider(OfflineProvider):
 
 def test_unextracted_name_looks_up_unindexed_long_reference_chapter(tmp_path):
     config = TranslationConfig(references=ReferenceConfig(terminology_input_tokens=2500, terminology_radius=1))
-    project, source, provider = setup(tmp_path, config=config, provider=TerminologyProvider())
+    project, source, provider = make_project(tmp_path, config=config, provider=TerminologyProvider())
     with project:
         ja = tmp_path/'names-ja.txt'
         ja.write_text('第1話 会議\n\n魔族を統治するバルトが報告した。', encoding='utf-8')
@@ -149,7 +149,7 @@ def test_reference_limits_follow_capacity_and_honor_explicit_overrides():
 
 
 def test_repeated_inspection_reuses_validation_but_mutation_is_detected(tmp_path, monkeypatch):
-    project, source, _ = setup(tmp_path)
+    project, source, _ = make_project(tmp_path)
     with project:
         loads = []
         original = EditionArchive.from_folder.__func__
@@ -190,7 +190,7 @@ class BlockedProvider(OfflineProvider):
 
 
 def test_agent_recovery_preserves_paid_work_and_rechecks_new_version(tmp_path):
-    project, source, provider = setup(tmp_path, config=TranslationConfig(sequence={'max_revisions':0}),
+    project, source, provider = make_project(tmp_path, config=TranslationConfig(sequence={'max_revisions':0}),
                                        provider=BlockedProvider())
     with project:
         with project.create_job('recovery', source=source, chapters=source.chapters()[:1]) as job:
@@ -224,7 +224,7 @@ def test_extended_budget_resumes_automatic_revision_without_regenerating(tmp_pat
                     f'expected_text_hash: {expected}\nfindings: f1\nreplacement: 修正后的译文。\n@@END',
                     'stop', 'offline', 'revision', {}, 0)
             return super().generate(request)
-    project, source, provider = setup(tmp_path, config=TranslationConfig(sequence={'max_revisions':0}),
+    project, source, provider = make_project(tmp_path, config=TranslationConfig(sequence={'max_revisions':0}),
                                        provider=RevisingProvider())
     with project:
         with project.create_job('automatic', source=source, chapters=source.chapters()[:1]) as job:

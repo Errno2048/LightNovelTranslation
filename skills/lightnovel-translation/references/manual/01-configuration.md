@@ -100,6 +100,10 @@ input_limit = min(context_window - requested_output - safety, max_input 或 cont
 
 `source-records-v1` 要求 `stable-v1`。capacity、roles、累计请求/token 限额不能重复放进 sequence，分别在所属节配置。
 
+## `[syosetu]`：原文下载
+
+原文下载另用 `[syosetu]`：`concurrency=2`（1–8）和 `request_interval=1.0`（秒，所有下载线程共享）。两项不影响模型调用。`SyosetuConfig.load()` 只解释此节，不要求模型就绪；`download_work` 的显式参数优先。串行设置 `concurrency=1`，详细退避与恢复见[原作采集](00-source-acquisition.md)及 `syosetu-fetch` 技能的采集 API 说明。
+
 ## `[references]` 与 `[limits]`
 
 | references 字段 | 默认值 | 作用 |

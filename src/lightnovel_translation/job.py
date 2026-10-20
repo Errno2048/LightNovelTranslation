@@ -74,6 +74,18 @@ def create_job(project, name, *, source, chapters, mode, references, index, para
     if mode != "cross_edition":
         inputs.pop("edition_reference_packets", None)
         inputs["reference_mode"] = mode
+    # Freeze all preceding Japanese bodies for navigation, independently of
+    # translation alignment. Missing materialization is not a missing source.
+    inputs["history_sources"] = [_source_document(archive, d["entry_id"]) for d in docs[:start]]
+    inputs["history_index_profile"] = "hierarchy-v1"
+    # Every preceding Web body is frozen in history_sources.  The previous
+    # "index not built" marker is no longer an input gap once that body is
+    # available; genuine missing-source gaps remain caller-supplied records.
+    inputs["explicit_gaps"] = [
+        {**gap, "source_ids":[sid for sid in gap["source_ids"]
+            if sid not in {d["entry_id"] for d in docs[:start]}]}
+        for gap in inputs.get("explicit_gaps", [])
+        if gap.get("reason") != "Web historical index not built in the frozen pilot"]
     if mode == "parallel":
         history, used = [], set()
         reference_ids = {d["entry_id"] for r in refs for d in archive.documents(r)}
@@ -95,6 +107,7 @@ def create_job(project, name, *, source, chapters, mode, references, index, para
                 target_docs.append(translated)
             history.append({"source": src, "translation": target_docs, "semantic_status": "caller_asserted_parallel"})
         inputs["history_pairs"] = sorted(history, key=lambda p: p["source"]["order"])
+        # Caller-confirmed bilingual pairs override source-only navigation.
         represented = {p["source"]["chapter_id"] for p in history}
         for gap in inputs.get("explicit_gaps", []):
             gap["source_ids"] = [sid for sid in gap["source_ids"] if sid not in represented]
@@ -202,6 +215,22 @@ class TranslationJob:
         """Inspect exact messages and budget; local checkpoint metadata may be saved."""
         self._check()
         return self.engine.plan_next()
+
+    @operation
+    def prepare_history(self) -> dict[str, Any]:
+        """Build far L1 and near L2 before translation; run() also does this automatically."""
+        self._check()
+        self.project._require_generation()
+        return self.engine.prepare_history()
+
+    @operation
+    def ensure_details(self, node_ids: list[str]) -> dict[str, Any]:
+        """Materialize only explicitly requested visible L2 nodes; preserve old contexts."""
+        self._check()
+        if not node_ids or len(node_ids) != len(set(node_ids)):
+            raise ValueError('unique detail node IDs are required')
+        self.project._require_generation()
+        return self.engine.prepare_history(child_ids=node_ids)
 
     def run(self, *, max_chapters: int | None = None, materialize: bool = False,
             on_event: Callable[[dict[str, Any]], None] | None = None) -> RunResult:

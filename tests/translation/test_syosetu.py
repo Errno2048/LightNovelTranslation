@@ -4,16 +4,25 @@ import json
 from pathlib import Path
 from urllib.parse import urlsplit
 import zipfile
+import re
+from threading import Barrier, Lock
+import time
 
 import httpx
 import pytest
 
 from lightnovel_translation import TranslationConfig, TranslationError, TranslationProject, export_skill
+from lightnovel_translation import ConfigurationError, SyosetuConfig
 from lightnovel_translation.syosetu import (
     NarouCatalog, canonical_work, download_work, inspect_reference, validate_source_epub,
 )
 from lightnovel_translation.cli import main
 import lightnovel_translation.syosetu as module
+
+
+@pytest.fixture(autouse=True)
+def acquisition_home(tmp_path, monkeypatch):
+    monkeypatch.setenv('LIGHTNOVEL_TRANSLATION_HOME', str(tmp_path / 'private'))
 
 
 def make_reference(path, *, author="马场翁"):
@@ -284,3 +293,136 @@ def test_cli_and_both_skills_remain_available_without_model_config(tmp_path, cap
     result = export_skill(tmp_path / "new", name="syosetu-fetch")
     assert "references/acquisition.md" in result["files"]
     assert main(["skill", "export", str(tmp_path / "cli"), "--name", "syosetu-fetch"]) == 0
+
+
+@pytest.mark.parametrize('concurrency', [0, -1, 9, True, 2.0, '2'])
+def test_invalid_concurrency_is_rejected_before_network(tmp_path, concurrency):
+    with pytest.raises(ConfigurationError):
+        download_work('n1234ab', tmp_path / 'bad', concurrency=concurrency)
+    assert not (tmp_path / 'bad').exists()
+
+
+def test_acquisition_config_loads_only_source_section_and_explicit_values_win(tmp_path, site, capsys):
+    private = tmp_path / 'private'
+    private.mkdir()
+    config = private / 'config.toml'
+    config.write_text('[model]\napi_key = "private-marker-do-not-echo"\nretries = 99\n'
+                      '[syosetu]\nconcurrency = 3\nrequest_interval = 0\n', encoding='utf-8')
+    assert SyosetuConfig.load() == SyosetuConfig(3, 0)
+    # An invalid/unready model does not affect source acquisition.
+    first = download_work('n1234ab', tmp_path / 'default', last_chapter=3)
+    assert first['download_stats']['configured_concurrency'] == 3
+    assert main(['syosetu', 'download', 'n1234ab', str(tmp_path / 'override'), '--last', '2',
+                 '--config', str(config), '--concurrency', '2', '--interval', '0']) == 0
+    manifest = json.loads((tmp_path / 'override/manifest.json').read_text(encoding='utf-8'))
+    assert manifest['options']['concurrency'] == 2
+    assert 'private-marker-do-not-echo' not in capsys.readouterr().out
+    assert TranslationConfig.from_dict({'syosetu': {'concurrency': 4}}).syosetu.concurrency == 4
+    assert TranslationConfig().public()['syosetu'] == {'concurrency': 2, 'request_interval': 1.0}
+    config.write_text('[model]\napi_key = "private-marker-do-not-echo"\nbad = [', encoding='utf-8')
+    with pytest.raises(ConfigurationError) as caught:
+        SyosetuConfig.load(config)
+    assert 'private-marker-do-not-echo' not in str(caught.value)
+
+
+def test_parallel_prefetch_uses_isolated_sessions_preserves_order_and_cache(tmp_path, site, monkeypatch):
+    from fanficfare.fetchers.fetcher_requests import RequestsFetcher
+    from fanficfare.fetchers.base_fetcher import FetcherResponse
+    original = RequestsFetcher.request
+    lock, barrier = Lock(), Barrier(4)
+    active = maximum = 0
+    sessions, completed = set(), []
+
+    def request(self, method, url, **kwargs):
+        nonlocal active, maximum
+        match = re.search(r'/n1234ab/(\d+)/$', url)
+        if not match:
+            return original(self, method, url, **kwargs)
+        ordinal = int(match[1])
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+            sessions.add(id(self.get_requests_session()))
+        try:
+            barrier.wait(timeout=5)
+            time.sleep((9 - ordinal) * .005)
+            response = original(self, method, url, **kwargs)
+            with lock:
+                completed.append(ordinal)
+            return FetcherResponse(response.content.replace(b'<p id="L1">',
+                f'<p>episode-{ordinal}</p><p id="L1">'.encode()), url, False)
+        finally:
+            with lock:
+                active -= 1
+
+    monkeypatch.setattr(RequestsFetcher, 'request', request)
+    result = download_work('n1234ab', tmp_path / 'parallel', last_chapter=8, concurrency=4, request_interval=0)
+    assert maximum == 4 and len(sessions) == 4
+    assert completed != list(range(1, 9))
+    stats = result['download_stats']
+    assert stats['max_in_flight'] == 4 and stats['network_requests'] == 12
+    index = json.loads((Path(result['cache_dir']) / 'responses/responses.json').read_text(encoding='utf-8'))
+    assert len(index) == stats['network_requests']
+    with zipfile.ZipFile(result['epub_path']) as archive:
+        chapters = sorted(n for n in archive.namelist() if re.search(r'/file\d+\.xhtml$', n))
+        for ordinal, chapter in enumerate(chapters, 1):
+            assert f'episode-{ordinal}' in archive.read(chapter).decode('utf-8')
+    before = len(site)
+    offline = download_work('n1234ab', tmp_path / 'offline-parallel', last_chapter=8,
+                            cache_dir=result['cache_dir'], offline=True)
+    assert len(site) == before and offline['download_stats']['network_requests'] == 0
+
+
+def test_429_reduces_concurrency_and_retries_without_poisoning_snapshot(tmp_path, site, monkeypatch):
+    from fanficfare.fetchers.fetcher_requests import RequestsFetcher
+    from fanficfare.exceptions import HTTPErrorFFF
+    import lightnovel_translation._source_requests as limits
+    monkeypatch.setattr(limits, 'BACKOFF_SECONDS', .01)
+    original = RequestsFetcher.request
+    lock = Lock()
+    failed = False
+
+    def request(self, method, url, **kwargs):
+        nonlocal failed
+        if url.endswith('/n1234ab/1/'):
+            with lock:
+                if not failed:
+                    failed = True
+                    self._lnt_retry_after = '0'
+                    raise HTTPErrorFFF(url, 429, 'Too many requests')
+        return original(self, method, url, **kwargs)
+
+    monkeypatch.setattr(RequestsFetcher, 'request', request)
+    result = download_work('n1234ab', tmp_path / 'retry', last_chapter=8,
+                           concurrency=4, request_interval=0, retries=1)
+    stats = result['download_stats']
+    assert stats['effective_concurrency'] == 2 and stats['retries'] == 1
+    assert stats['statuses']['429'] == 1
+    assert stats['throttle_events'][0]['wait_seconds'] == .01
+    assert stats['network_requests'] == 13 and stats['statuses']['200'] == 12
+
+
+def test_exhausted_429_cancels_work_preserves_root_error_and_partial_cache(tmp_path, site, monkeypatch):
+    from fanficfare.fetchers.fetcher_requests import RequestsFetcher
+    from fanficfare.exceptions import HTTPErrorFFF
+    import lightnovel_translation._source_requests as limits
+    monkeypatch.setattr(limits, 'BACKOFF_SECONDS', .01)
+    original = RequestsFetcher.request
+    failed_calls = []
+
+    def request(self, method, url, **kwargs):
+        if url.endswith('/n1234ab/1/'):
+            failed_calls.append(url)
+            raise HTTPErrorFFF(url, 429, 'Too many requests')
+        return original(self, method, url, **kwargs)
+
+    monkeypatch.setattr(RequestsFetcher, 'request', request)
+    folder = tmp_path / 'exhausted'
+    with pytest.raises(TranslationError) as caught:
+        download_work('n1234ab', folder, last_chapter=100, concurrency=4, request_interval=0, retries=1)
+    assert caught.value.code == 'source_rate_limited' and len(failed_calls) == 2
+    manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
+    assert manifest['status'] == 'failed' and manifest['error_code'] == 'source_rate_limited'
+    assert manifest['download_stats']['network_requests'] < 20
+    assert (folder / 'cache/responses/responses.json').is_file()
+    assert not (folder / 'source.epub').exists()

@@ -95,6 +95,6 @@ with TranslationProject("work/novel") as project:
 
 恢复既有任务不重新准备参考，不重复已成功的模型请求。`max_chapters` 是本次新增提交的上限。`paused_at_limit` 是正常分段执行，`complete` 表示任务窗口全完成；CLI 退出成功不表示翻译窗口完成。
 
-`materialize=True` 从已提交译文构建增量知识；`checkpoint()` 可显式压缩已提交历史，两者可能收费。是否真正发生模型压缩，应根据调用记录判定，不能仅凭存在 checkpoint 对象下结论。
+`materialize=True` 从已提交译文构建增量知识；`checkpoint()` 可显式压缩已提交历史，两者可能收费。若 `plan_next()` 返回 `index_required`，先执行 `prepare_history()`：它先尝试直接构建冻结历史 L1，只有容量错误才回退为 L2 逐块抽取和 L1 汇总。后续近处保留 L2，远处按父块汇总 L1，未物化范围暂时保留完整正文；`ensure_details()` 可按需建立指定远距 L2。是否真正发生模型压缩，应根据调用记录判定，不能仅凭存在 checkpoint 对象下结论。
 
 用 `translations()` / export 的已提交内容交付；阻断草稿单独标识。报告完成章数、阻断原因、实际参考覆盖及尚未核验的语义问题。恢复方法见 diagnostics.md。

@@ -6,16 +6,20 @@
 
 | 路径 | 输入 | 挂载位置 | 主要用途 |
 |---|---|---|---|
-| 独立版本索引 | 单个版本 L2 完整正文 | 独立 L2；L1 汇总子摘要/目录 | 跨版本导航、关联和译名匹配 |
+| 独立版本索引 | 单个版本完整正文 | 独立 L2；L1 默认直接抽取，容量超限时汇总 L2 | 跨版本导航、关联和译名匹配 |
 | 连续任务增量知识 | 已提交源文与本分支新译文 | 任务内 sequence-node L2；再汇总 L1 | 后续翻译的术语、剧情、时序及知情候选 |
 
 它们都可同摘要一起提取时序等信息，但不是共享一套权威图谱。普通 `Index` 不会自动返回已经过推理审定的动态关系图。
 
 ## 增量节点何时建立
 
-每章提交同时写 `materialize_increment` outbox；正常后续运行对可封闭的节点物化。开放尾部可以先延后，避免每提交一章都重新摘要；`run(materialize=True)` 或检查点流程可强制处理当前尾部。
+每章提交同时写 `materialize_increment` outbox；正常后续运行对可封闭的节点物化。开放尾部可以先延后，避免每提交一章都重新摘要；`run(materialize=True)` 或检查点流程可强制处理当前尾部。层次任务中这套增量节点与冻结历史层次并行保存，二者不会互相改写。
 
-`current_index` 用 `AdaptiveIndexSpec` 规划本分支可见的历史原译与提交结果。已 sealed 的节点成员保持稳定，只有 open 尾部继续增长；节点记录精确 commit 依赖，另一分支不可悄悄复用不同译文的候选。
+增量索引使用 `current_index` 和 `AdaptiveIndexSpec` 规划本分支可见的提交结果；冻结历史 hierarchy 由独立的固定布局维护。已 sealed 的节点成员保持稳定，只有 open 尾部继续增长；节点记录精确 commit 依赖，另一分支不可悄悄复用不同译文的候选。
+
+检查点选择时，最近 `n_chapter` 个源章进入完整双语上下文；邻近的 `n_child` 个可用 L2 保留详细摘要；更远的增量 L2 按父节点汇总成临时 L1 导航。历史 L1 与增量 L1 使用同一覆盖账本，源章只计一次。尚未物化的增量节点不会自动变成 `explicit_gap`，而是让对应章节继续以完整正文表示，直到有可靠摘要可替换它。
+
+冻结历史的“近距”按当前目标章节重算，因此翻译窗口推进后，先前较近的历史 L2 会退到已有 L1 覆盖。增量父范围也先以完整原译双语直接建立 L1；只有明确容量超限才要求完整可用的 L2 并 rollup，格式或服务错误不会触发昂贵的子节点全量抽取。
 
 自适应规划先考虑完整日中正文，结合章数、输入与输出预算。若要求 L1 直接容纳正文会把 L2 压得过小，或 L1 因输入预算被迫拆分，在配置 child 最小内容量时转为 `summary_rollup`：先保留有用大小的 L2，再以子摘要建立父概括。父摘要的上下文容量仍需预算检查，不是无限层级聚合。
 
@@ -40,7 +44,7 @@
 
 失败后保存 attempts、原始响应、缺口与被隔离记录，节点可以是 extracted、partial、summary_only 或 missing 等质量状态。部分坏记录不会因存在摘要就自动进入工作集；失败后也不能把曾需保留的正文当作已经被完整摘要替代。
 
-L1 元信息确定性汇总 L2 records，不执行全局实体/状态真值合并。summary_rollup 需要足够且可用的子摘要才请求父概括，子节点缺失、partial 或覆盖不齐必须显式可见。
+L1 默认直接从完整父块正文抽取；只有容量超限才用完整可用的 L2 rollup。rollup 时元信息会聚合 L2 records，但不执行全局实体/状态真值合并；子节点缺失、partial 或覆盖不齐必须显式可见。格式或服务错误不会触发容量回退。
 
 ## 与 `translation.state` 底层功能的边界
 
@@ -55,5 +59,7 @@ L1 元信息确定性汇总 L2 records，不执行全局实体/状态真值合�
 - `src/translation/narrative/extraction.py`：联合抽取协议及引用校验。
 - `src/translation/mvp/recovery.py`：`ExtractionRecovery.run`、`reparse`，有界恢复与隔离。
 - `src/translation/sequence/context.py`：`_workset`，候选、未决和抽取缺口进入上下文。
+- `src/translation/sequence/hierarchy.py`：`latest_incremental_nodes`、`select_context`，合并冻结历史与增量覆盖并按需生成增量父级导航。
+- `src/translation/sequence/hierarchy_context.py`：检查点 prompt 编译；仅把最近提交章节作为连续对话回放，旧提交使用 L2/L1 表示。
 - `src/translation/state/schemas.py`、`temporal.py`、`epistemic.py`、`service.py`、`dialogue.py`：底层时序/知情接口，未自动接入公共闭环。
 - 回归入口：`tests/translation/test_library_api.py`、`test_reference_workflows.py`。

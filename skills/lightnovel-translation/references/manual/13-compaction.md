@@ -27,6 +27,8 @@
 3. 更远范围使用 L1 整体导航，必要时再压缩导航文字。
 4. 尚未可靠抽取的已提交章仍保留 mandatory full_pair，即使它已经离当前章很远。
 
+冻结历史和本分支增量使用同一覆盖选择器。增量节点单独维护版本；远处节点按父块汇总成 L1，邻近节点保留 L2，最近提交章节才回放完整翻译对话，历史近距也随当前目标滑动更新。这样检查点不会因为旧章节缺少 L2 而把整段历史误判为显式缺口，也不会重复注入同一章的 L1、L2 和全文。
+
 历史范围必须有 full_pair、L2、L1 或 explicit_gap 的覆盖说明，缺失则 `coverage_gap`。explicit_gap 表示已知缺口，不表示该剧情已被掌握。不能为缩短 prompt 把抽取失败的历史静默丢弃。
 
 ## 为什么不是反复“摘要的摘要”
@@ -53,5 +55,7 @@
 - `src/translation/sequence/service.py`：`SequenceEngine.plan_next`、`checkpoint`，策略判断及切换。
 - `src/translation/sequence/store.py`：`SequenceRepository.switch_checkpoint`，按 expected head 原子切换。
 - `src/translation/sequence/knowledge.py`：`materialize_nodes`，检查点需要的历史抽取。
+- `src/translation/sequence/hierarchy.py`：`select_context` 合并冻结历史和增量节点，生成非重叠覆盖。
+- `src/translation/sequence/hierarchy_context.py`：将覆盖编译为检查点消息；旧提交退出逐章对话后仍由导航摘要保留。
 - `src/translation/budget.py`：实际消息计数和校准。
 - 回归入口：`tests/translation/test_library_api.py`。

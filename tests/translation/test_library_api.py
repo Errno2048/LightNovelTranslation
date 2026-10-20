@@ -32,7 +32,7 @@ def book(tmp_path, language="ja", count=5):
     return path
 
 
-def setup(tmp_path, *, config=None, provider=None):
+def make_project(tmp_path, *, config=None, provider=None):
     provider = provider or OfflineProvider()
     config = config or TranslationConfig(index=EditionIndexSpec(child_max_chapters=2, parent_max_chapters=4))
     project = TranslationProject(tmp_path / "project", config, provider=provider, provider_id="offline-v1")
@@ -41,7 +41,7 @@ def setup(tmp_path, *, config=None, provider=None):
 
 
 def test_local_import_plan_and_index_reads_never_generate(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         assert len(source.chapters()) == 5
         assert source.chapters()[0].position == 0
@@ -58,7 +58,7 @@ def test_local_import_plan_and_index_reads_never_generate(tmp_path):
 
 
 def test_source_only_translate_pause_reopen_resume_compress_export(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         events = []
         with project.create_job("source", source=source) as job:
@@ -84,7 +84,7 @@ def test_source_only_translate_pause_reopen_resume_compress_export(tmp_path):
 
 
 def test_parallel_pairs_add_actual_bilingual_history_and_never_target_answers(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         reference = project.import_book(book(tmp_path, "zh"), edition_id="zh", language="zh", paragraph_policy="blank_line")
         ja, zh = source.chapters(), reference.chapters()
@@ -101,7 +101,7 @@ def test_parallel_pairs_add_actual_bilingual_history_and_never_target_answers(tm
 
 
 def test_cross_edition_build_associate_translate_and_reference_boundary(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         reference = project.import_book(book(tmp_path, "zh"), edition_id="print", language="zh", paragraph_policy="blank_line")
         index = project.index([source, reference])
@@ -131,7 +131,7 @@ def test_blocked_protocol_is_durable_and_does_not_become_success(tmp_path):
         def generate(self, request):
             self.requests.append(request)
             return GenerationResult("bad protocol", "stop", "offline", "bad", {}, 0)
-    project, source, provider = setup(tmp_path, provider=Bad())
+    project, source, provider = make_project(tmp_path, provider=Bad())
     with project:
         with project.create_job("bad", source=source, chapters=source.chapters()[:1]) as job:
             result = job.run()
@@ -155,7 +155,7 @@ def test_unconfigured_project_allows_planning_but_rejects_run(tmp_path):
 
 
 def test_model_identity_change_rejects_resume_without_requests(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     project.create_job("frozen", source=source).close()
     project.close()
     with TranslationProject(tmp_path / "project", provider=provider, provider_id="different-model") as changed:
@@ -172,7 +172,7 @@ def test_invalid_workspace_ids(tmp_path, name):
 
 
 def test_reject_skipped_chapters_foreign_handles_and_unknown_options(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project, TranslationProject(tmp_path / "other") as other:
         ja = source.chapters()
         with pytest.raises(ValueError, match="consecutive"):
@@ -231,7 +231,7 @@ def test_http_model_key_is_never_written_to_artifacts_and_client_closes(tmp_path
 
 
 def test_easy_translate_and_context_manager_close(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         result = project.translate(source, name="easy", chapters=source.chapters()[:1])
         assert result.state == "complete", result.to_dict()
@@ -253,7 +253,7 @@ def test_import_needs_resolution_does_not_register_an_edition(tmp_path):
 
 
 def test_project_can_relocate_and_resume_from_frozen_inputs(tmp_path):
-    project, source, provider = setup(tmp_path)
+    project, source, provider = make_project(tmp_path)
     with project:
         project.translate(source, name="moving", chapters=source.chapters()[:2], max_chapters=1)
     moved = tmp_path / "relocated"
@@ -269,7 +269,7 @@ def test_stale_attached_corpus_is_detected_and_custom_provider_stays_owned_by_ca
     class Provider(OfflineProvider):
         def close(self):
             raise AssertionError("caller owns this provider")
-    project, source, provider = setup(tmp_path, provider=Provider())
+    project, source, provider = make_project(tmp_path, provider=Provider())
     with project:
         corpus = project.path / source.info["corpus_folder"]
         paragraphs = corpus / "paragraphs.jsonl"
@@ -282,7 +282,7 @@ def test_stale_attached_corpus_is_detected_and_custom_provider_stays_owned_by_ca
 
 def test_budget_exhaustion_is_persisted_and_resume_does_not_reissue_translation(tmp_path):
     config = TranslationConfig(limits=Limits(max_requests=1))
-    project, source, provider = setup(tmp_path, config=config)
+    project, source, provider = make_project(tmp_path, config=config)
     with project:
         with project.create_job("limited", source=source, chapters=source.chapters()[:1]) as job:
             result = job.run()

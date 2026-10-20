@@ -26,6 +26,8 @@ with project.create_job(
 
 `job.plan_next()` 不调用模型，但可以创建初始本地检查点等元数据。它返回下一目标、上下文及预算、是否需要 checkpoint、哪些增量节点待物化。已有 context 的规划不等于已经发过请求。
 
+采用 `history_index_profile="hierarchy-v1"` 的任务首次规划可能返回 `state="index_required"`。这只表示冻结历史的 L1/L2 导航尚未物化，不表示历史剧情缺失；调用 `job.prepare_history()` 后再规划即可。历史父节点先尝试直接 L1，只有明确的本地或远端上下文超限才会建立 L2 并 rollup。远处 L2 默认懒构建，只有翻译、审校或显式 `ensure_details()` 请求时才物化。
+
 预检时检查当前完整日文、参考入选结果、`budget.fits` 及 pending materializations。需要付费的历史抽取或压缩由执行阶段/显式 `checkpoint()` 完成；不要因为 plan_next 便宜就假定接下来的 run 只会调用一次翻译。
 
 ```python
@@ -33,7 +35,7 @@ result = job.run(max_chapters=1, materialize=True)
 print(result.to_dict())
 ```
 
-`max_chapters` 限制本次新增提交数；恢复后可以继续下一个窗口。`materialize=True` 在本次运行末尾还会封口抽取增量尾部，可能产生额外模型调用，甚至在译文已提交后因索引失败返回 blocked。
+`max_chapters` 限制本次新增提交数；恢复后可以继续下一个窗口。`materialize=True` 在本次运行末尾还会封口抽取增量尾部，可能产生额外模型调用，甚至在译文已提交后因索引失败返回 blocked。连续任务的提交译文使用独立的 append-only `sequence-node` 增量索引；检查点按统一覆盖账本选择最近完整双语、邻近 L2 和更远 L1，未物化范围保留正文回退，不会误报为 `explicit_gap`。
 
 ## 每章状态如何推进
 

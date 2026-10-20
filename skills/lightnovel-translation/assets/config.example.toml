@@ -3,6 +3,10 @@
 schema_version = 1
 # tokenizer_path = "tokenizers/tokenizer.json" # Relative to this file; requires [narrative].
 
+[syosetu]
+concurrency = 2 # Concurrent chapter prefetch, 1-8. Use 1 for serial downloads.
+request_interval = 1.0 # Seconds between request starts, shared by all download workers.
+
 [model]
 model = "YOUR_MODEL"
 base_url = "https://example.invalid/v1" # Replace with your actual compatible endpoint.

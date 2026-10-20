@@ -9,6 +9,7 @@ class FrozenArchive:
         self.chapters={}; self.rows={}; self.canonical_ids={}
         self.input_identity=inputs.get('corpus_identity',inputs.get('origin','frozen-sequence'))
         self.fingerprint=digest(inputs)
+        for doc in inputs.get('history_sources',[]): self.add(doc,doc['chapter_id'])
         for pair in inputs.get('history_pairs',[]):
             self.add(pair['source'],pair['source']['chapter_id'])
             for doc in pair['translation']: self.add(doc,pair['source']['chapter_id'])
@@ -132,6 +133,27 @@ class SequenceNarrativeView(NarrativeView):
         return super().validate_dependency(dep,task=task)
 
     def read_index_candidate(self,node_id):
+        from .hierarchy import enabled, plan_hierarchy, latest_nodes
+        if enabled(self.repo):
+            from .schemas import SequenceSpec
+            spec=SequenceSpec.from_dict(self.repo.manifest['spec'])
+            plan=plan_hierarchy(self.repo,spec,self)
+            ready=latest_nodes(self.repo,allowed_source_ids=plan['ordered_source_ids'])
+            node=next((n for n in ready if node_id in {n['id'],n['node_id']}),None)
+            planned=next((n for n in plan['nodes'] if n['node_id']==node_id),None)
+            generated=False
+            if not node and planned and planned['level']==2 and hasattr(self,'detail_builder'):
+                self.detail_builder([node_id]); generated=True
+                node=next((n for n in latest_nodes(self.repo,allowed_source_ids=plan['ordered_source_ids'])
+                           if n['node_id']==node_id),None)
+            if node:
+                for dep in node['dependencies']: self.validate_dependency(dep)
+                return {'status':'found','node_id':node['node_id'],'revision_id':node['id'],
+                    'level':node['level'],'build_method':node['build_method'],
+                    'summary':node['summary'],'records':node['records'],
+                    'semantic_status':node['semantic_status'],'extraction_status':node['state'],
+                    'quarantined':node['quarantined'],'materialized_on_request':generated,
+                    '_dependencies':node['dependencies']}
         candidates=[(i,n) for i,n in self.repo.store.objects('sequence-node') if node_id in {i,n['node_id']}]
         if not any(i==node_id for i,n in candidates):
             candidates=[(i,n) for i,n in candidates if n['end_position']<self.target_order]

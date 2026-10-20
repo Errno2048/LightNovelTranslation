@@ -15,6 +15,7 @@ from translation.editions.index import EditionIndexSpec
 from translation.sequence.schemas import SequenceSpec, default_roles
 
 from .errors import ConfigurationError
+from .acquisition_config import SyosetuConfig
 
 
 @dataclass(frozen=True)
@@ -106,8 +107,11 @@ class TranslationConfig:
     limits: Limits = field(default_factory=Limits)
     references: ReferenceConfig = field(default_factory=ReferenceConfig)
     tokenizer_path: Path | None = None
+    syosetu: SyosetuConfig = field(default_factory=SyosetuConfig)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.syosetu, SyosetuConfig):
+            raise ConfigurationError('syosetu must be a SyosetuConfig instance')
         if not isinstance(self.references, ReferenceConfig):
             raise ConfigurationError('references must be a ReferenceConfig instance')
         if self.model and self.model.retries != 0:
@@ -152,6 +156,7 @@ class TranslationConfig:
                 "index": asdict(self.index), "sequence": asdict(self.sequence_spec()),
                 "limits": asdict(self.limits),
                 "references": asdict(self.references),
+                "syosetu": asdict(self.syosetu),
                 "reference_budgets": self.references.budgets(self.capacity, self.role_budgets()),
                 "tokenizer_path": str(self.tokenizer_path) if self.tokenizer_path else None}
 
@@ -217,6 +222,7 @@ class TranslationConfig:
                        index=EditionIndexSpec(**value.get("index", {})),
                        sequence=value.get("sequence", {}), limits=Limits(**value.get("limits", {})),
                        references=ReferenceConfig(**value.get('references', {})),
+                       syosetu=SyosetuConfig.from_dict(value.get('syosetu', {})),
                        tokenizer_path=tokenizer)
         except ConfigurationError:
             raise

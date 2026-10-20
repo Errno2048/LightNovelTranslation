@@ -7,6 +7,19 @@ from .narrative.schemas import NarrativeError
 from .storage import digest
 
 
+def is_context_overflow(error):
+    """Only explicit input-capacity errors qualify for a child-rollup fallback."""
+    kind = getattr(error, 'kind', None)
+    if kind in {'context_length_exceeded', 'context_window_exceeded', 'context_budget'}:
+        return True
+    if kind not in {'parameters', 'invalid_request', 'bad_request'}:
+        return False
+    text = str(getattr(error, 'details', {})).lower()
+    return any(marker in text for marker in ('context_length_exceeded',
+        'maximum context length', 'context window exceeded', 'input tokens exceed',
+        'prompt is too long'))
+
+
 @dataclass(frozen=True)
 class ModelCapacity:
     context_window_tokens: int

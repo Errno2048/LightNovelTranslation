@@ -71,7 +71,7 @@ def plan_edition_index(archive, edition_id, capacity, counter, spec=None, *, out
             for c in own:
                 c['parent_id'] = parent['node_id']
                 c['undersized'] = c['content_tokens'] < spec.child_min_content_tokens
-            parent.update(child_ids=[c['node_id'] for c in own], build_method='child_summary_rollup')
+            parent.update(child_ids=[c['node_id'] for c in own], build_method='direct_then_rollup')
             parents.append(parent)
             group = []
 

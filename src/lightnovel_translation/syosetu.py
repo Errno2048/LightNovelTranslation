@@ -6,6 +6,7 @@ No translation provider, personal FanFicFare INI, login cookie or API key is use
 from __future__ import annotations
 
 from collections import Counter
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import codecs
 from hashlib import sha256
 from html import unescape
@@ -14,10 +15,12 @@ from importlib.resources import files
 from io import StringIO
 import json
 import logging
+import math
 from pathlib import Path, PurePosixPath
 import posixpath
 import re
 import time
+from threading import RLock, local
 import unicodedata
 from urllib.parse import unquote, urldefrag, urlsplit
 from xml.etree import ElementTree as ET
@@ -30,6 +33,8 @@ from translation.ingestion.txt import decode_text
 from translation.text import strip_zero_width, zero_width_counts
 
 from .errors import TranslationError
+from .acquisition_config import SyosetuConfig
+from ._source_requests import SourceRequests
 
 API_URL = "https://api.syosetu.com/novelapi/api/"
 API_CACHE_SECONDS = 14 * 24 * 3600
@@ -298,8 +303,9 @@ class NarouCatalog:
 
 class _ResponseSnapshot:
     """GET response bytes only; no headers/cookies/pickle. Existing snapshots are immutable."""
-    def __init__(self, folder: Path, *, offline: bool):
+    def __init__(self, folder: Path, *, offline: bool, requests: SourceRequests | None = None):
         self.folder, self.offline = folder, offline
+        self.requests, self.lock = requests, RLock()
         self.failures = []
         path = folder / "responses.json"
         self.index = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
@@ -307,13 +313,20 @@ class _ResponseSnapshot:
     def install(self, fetcher):
         from fanficfare.fetchers.base_fetcher import FetcherResponse
         original = fetcher.do_request
+        # Each worker owns its own FFF/requests session. Headers are not persisted.
+        if self.requests and hasattr(fetcher, 'get_requests_session'):
+            def remember_retry_after(response, *args, **kwargs):
+                fetcher._lnt_retry_after = response.headers.get('Retry-After')
+                fetcher._lnt_status = response.status_code
+            fetcher.get_requests_session().hooks['response'].append(remember_retry_after)
 
         def request(method, url, **kwargs):
             if method != "GET":
                 raise TranslationError("unsupported_source_request", "This wrapper supports public GET acquisition only")
             canonical = urldefrag(url)[0]
             key = sha256((method + " " + canonical).encode()).hexdigest()
-            row = self.index.get(key)
+            with self.lock:
+                row = self.index.get(key)
             if row:
                 try:
                     if row["file"] != key + ".bin":
@@ -324,27 +337,77 @@ class _ResponseSnapshot:
                 except (OSError, KeyError, ValueError):
                     self.failures.append({"url": canonical, "code": "source_cache_corrupt"})
                     raise TranslationError("source_cache_corrupt", "Response snapshot is missing or corrupt") from None
+                if self.requests:
+                    self.requests.cached()
                 return FetcherResponse(data, row["final_url"], True)
             if self.offline:
                 self.failures.append({"url": canonical, "code": "source_cache_miss"})
                 raise TranslationError("source_cache_miss", "Offline response snapshot is incomplete",
                                        details={"url": canonical})
             try:
-                response = original(method, url, **kwargs)
-            except Exception:
-                self.failures.append({"url": canonical, "code": "source_request_failed"})
+                response = (self.requests.request(original, fetcher, method, url, **kwargs)
+                            if self.requests else original(method, url, **kwargs))
+            except Exception as exc:
+                with self.lock:
+                    self.failures.append({"url": canonical, "code": exc.code if isinstance(exc, TranslationError)
+                                          else "source_request_failed"})
+                if self.requests:
+                    self.requests.abort()
                 raise
             data = response.content
-            self.folder.mkdir(parents=True, exist_ok=True)
-            filename = key + ".bin"
-            (self.folder / filename).write_bytes(data)
-            self.index[key] = {"url": canonical, "final_url": urldefrag(response.redirecturl or canonical)[0],
-                               "file": filename, "sha256": sha256(data).hexdigest(),
-                               "bytes": len(data), "fetched_at": time.time()}
-            _write_json(self.folder / "responses.json", self.index)
+            # Serialize commits, not network calls; responses.json has one atomic writer.
+            with self.lock:
+                self.folder.mkdir(parents=True, exist_ok=True)
+                filename = key + ".bin"
+                (self.folder / filename).write_bytes(data)
+                self.index[key] = {"url": canonical, "final_url": urldefrag(response.redirecturl or canonical)[0],
+                                   "file": filename, "sha256": sha256(data).hexdigest(),
+                                   "bytes": len(data), "fetched_at": time.time()}
+                _write_json(self.folder / "responses.json", self.index)
             return response
 
         fetcher.do_request = request
+
+
+def _prefetch_chapters(chapters, snapshot, make_config, requests):
+    """Bounded byte prefetch; adapter parsing and EPUB assembly remain ordered."""
+    worker = local()
+    fetchers = []
+    lock = RLock()
+
+    def fetch(url):
+        if not hasattr(worker, 'fetcher'):
+            worker.config = make_config()
+            worker.fetcher = worker.config.get_fetcher()
+            with lock:
+                fetchers.append(worker.fetcher)
+            snapshot.install(worker.fetcher)
+        worker.fetcher.do_request('GET', worker.fetcher.condition_url(url))
+
+    urls = iter(dict.fromkeys(chapter['url'] for chapter in chapters))
+    try:
+        with ThreadPoolExecutor(max_workers=requests.concurrency, thread_name_prefix='syosetu') as pool:
+            pending = {pool.submit(fetch, url) for url in [next(urls, None) for _ in range(requests.concurrency)] if url}
+            try:
+                while pending:
+                    done, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    # Check all completed futures before submitting replacements.
+                    for future in done:
+                        future.result()
+                    for _ in done:
+                        url = next(urls, None)
+                        if url:
+                            pending.add(pool.submit(fetch, url))
+            except Exception:
+                requests.abort()
+                for future in pending:
+                    future.cancel()
+                raise
+    finally:
+        for fetcher in fetchers:
+            session = getattr(fetcher, 'requests_session', None)
+            if session is not None:
+                session.close()
 
 
 def _clean_markup(text: str) -> tuple[str, Counter]:
@@ -413,7 +476,8 @@ def validate_source_epub(path: str | Path, *, expected_chapters: int | None = No
 
 def download_work(ncode_or_url: str, output_dir: str | Path, *, first_chapter: int = 1,
                   last_chapter: int | None = None, proxy: str | None = None, timeout: float = 20,
-                  retries: int = 1, request_interval: float = 1, include_images: bool = True,
+                  retries: int = 1, request_interval: float | None = None, concurrency: int | None = None,
+                  config: str | Path | SyosetuConfig | None = None, include_images: bool = True,
                   include_author_notes: bool = True, cache_dir: str | Path | None = None,
                   offline: bool = False, selection_evidence: dict | None = None) -> dict:
     """Write immutable raw/clean EPUBs, response snapshots and a source manifest.
@@ -422,10 +486,14 @@ def download_work(ncode_or_url: str, output_dir: str | Path, *, first_chapter: i
     Use a new output directory for an update; reuse cache_dir only for the same snapshot.
     """
     ncode, url = canonical_work(ncode_or_url)
+    options = config if isinstance(config, SyosetuConfig) else SyosetuConfig.load(config)
+    options = SyosetuConfig(concurrency=options.concurrency if concurrency is None else concurrency,
+                            request_interval=options.request_interval if request_interval is None else request_interval)
+    concurrency, request_interval = options.concurrency, options.request_interval
     if type(first_chapter) is not int or first_chapter < 1 or (last_chapter is not None and
             (type(last_chapter) is not int or last_chapter < first_chapter)):
         raise ValueError("chapter range is inclusive and 1-based")
-    if timeout <= 0 or retries not in range(4) or request_interval < 0:
+    if type(timeout) not in (int, float) or not math.isfinite(timeout) or timeout <= 0 or type(retries) is not int or retries not in range(4):
         raise ValueError("invalid request limits")
     try:
         from fanficfare import adapters, writers
@@ -441,7 +509,9 @@ def download_work(ncode_or_url: str, output_dir: str | Path, *, first_chapter: i
                 "fanficfare_version": version("FanFicFare"), "offline": offline,
                 "cache_dir": str(cache), "requested_range": [first_chapter, last_chapter],
                 "selection_evidence": selection_evidence,
-                "options": {"include_images": include_images, "include_author_notes": include_author_notes}}
+                "options": {"include_images": include_images, "include_author_notes": include_author_notes,
+                            "concurrency": concurrency, "request_interval": request_interval}}
+    requests = SourceRequests(concurrency, request_interval, retries)
     fetcher = None
     fff_logger = logging.getLogger("fanficfare")
     previous_level = fff_logger.level
@@ -459,25 +529,36 @@ def download_work(ncode_or_url: str, output_dir: str | Path, *, first_chapter: i
             with NarouCatalog(proxy=proxy, timeout=timeout, retries=retries) as catalog:
                 work = catalog.work(ncode)
             _write_json(work_path, work)
-        config = Configuration(["syosetu.com"], "epub")
-        config.read_file(StringIO(files("fanficfare").joinpath("defaults.ini").read_text(encoding="utf-8")))
-        if not config.has_section("overrides"):
-            config.add_section("overrides")
+        defaults = files("fanficfare").joinpath("defaults.ini").read_text(encoding="utf-8")
         settings = {"include_images": str(include_images).lower(), "include_author_notes": str(include_author_notes).lower(),
                     "epub_version": "3.0", "include_titlepage": "false", "include_tocpage": "false",
-                    "continue_on_chapter_error": "false", "slow_down_sleep_time": str(request_interval),
-                    "connect_timeout": str(timeout), "max_request_retries": str(retries),
-                    "prepend_section_titles": "firstepisode"}
+                    "continue_on_chapter_error": "false", "slow_down_sleep_time": "0",
+                    "connect_timeout": str(timeout), "max_request_retries": "0",
+                    "prepend_section_titles": "firstepisode",
+                    # Preserve the site's original image bytes.  FanFicFare's
+                    # Pillow conversion path can reject valid PNGs with an
+                    # alpha channel (for example mode LA) when converting to
+                    # JPEG, silently replacing them with ``failedtoload``.
+                    # The acquisition wrapper validates that the referenced
+                    # resource is present, so conversion is unnecessary here.
+                    "no_image_processing": "true"}
         if proxy:
             settings.update(http_proxy=proxy, https_proxy=proxy)
-        for key, value in settings.items():
-            config.set("overrides", key, value)
-        fetcher = config.get_fetcher()
-        if proxy and hasattr(fetcher, "get_requests_session"):
-            fetcher.get_requests_session().trust_env = False
-        snapshot = _ResponseSnapshot(cache / "responses", offline=offline)
+        def make_config():
+            result = Configuration(["syosetu.com"], "epub")
+            result.read_file(StringIO(defaults))
+            if not result.has_section('overrides'):
+                result.add_section('overrides')
+            for key, value in settings.items():
+                result.set('overrides', key, value)
+            if proxy:
+                result.get_fetcher().get_requests_session().trust_env = False
+            return result
+        fff_config = make_config()
+        fetcher = fff_config.get_fetcher()
+        snapshot = _ResponseSnapshot(cache / "responses", offline=offline, requests=requests)
         snapshot.install(fetcher)
-        adapter = adapters.getAdapter(config, url)
+        adapter = adapters.getAdapter(fff_config, url)
         adapter.setChaptersRange(str(first_chapter), str(last_chapter) if last_chapter else None)
         story = adapter.getStoryMetadataOnly()
         # Upstream 4.62.16 compares a Tag to '完結済'; the official API is authoritative here.
@@ -500,9 +581,11 @@ def download_work(ncode_or_url: str, output_dir: str | Path, *, first_chapter: i
                                  "revision_marker": revision, "title": strip_zero_width(episode_title),
                                  "section": strip_zero_width(section) if section else None,
                                  "display_title": strip_zero_width(raw_title)})
+        if concurrency > 1 and not offline:
+            _prefetch_chapters(chapters, snapshot, make_config, requests)
         raw_path = output / "raw.epub"
         with raw_path.open("xb") as stream:
-            writers.getWriter("epub", config, adapter).writeStory(outstream=stream)
+            writers.getWriter("epub", fff_config, adapter).writeStory(outstream=stream)
         # FFF can catch image-fetch failures internally. A missing resource must still fail this wrapper.
         if snapshot.failures:
             raise TranslationError(snapshot.failures[0]["code"], "Source response or image retrieval failed",
@@ -515,15 +598,18 @@ def download_work(ncode_or_url: str, output_dir: str | Path, *, first_chapter: i
         epub_path = output / "source.epub"
         temporary.replace(epub_path)
         manifest.update(status="complete", work=work, chapters=chapters, cleanup_counts=cleaned,
-                        validation=validation, response_count=len(snapshot.index),
+                        validation=validation, response_count=len(snapshot.index), download_stats=requests.summary(),
                         raw_epub_sha256=sha256(raw_path.read_bytes()).hexdigest(),
                         epub_sha256=sha256(epub_path.read_bytes()).hexdigest(), epub_path=str(epub_path))
         _write_json(output / "manifest.json", manifest)
         return {"ok": True, "epub_path": str(epub_path), "manifest_path": str(output / "manifest.json"),
-                "cache_dir": str(cache), "chapter_count": len(chapters), "work": work, "validation": validation}
+                "cache_dir": str(cache), "chapter_count": len(chapters), "work": work, "validation": validation,
+                "download_stats": requests.summary()}
     except Exception as exc:
         code = exc.code if isinstance(exc, TranslationError) else "source_download_failed"
-        manifest.update(status="failed", error_code=code)
+        manifest.update(status="failed", error_code=code, download_stats=requests.summary(),
+                        error=exc.to_dict() if isinstance(exc, TranslationError)
+                        else {'exception_type': type(exc).__name__})
         _write_json(output / "manifest.json", manifest)
         if isinstance(exc, TranslationError):
             raise

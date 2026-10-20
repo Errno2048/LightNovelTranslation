@@ -108,7 +108,17 @@ class EditionPipeline:
                 'missing_child_ids': missing, 'coverage_complete': not missing,
                 'entities_exhaustive': False}
 
-    def build_parent(self, parent_id, *, allow_partial=False, output_tokens=8192):
+    def build_parent(self, parent_id, *, allow_partial=False, output_tokens=8192,
+                     method='direct_then_rollup'):
+        from .parents import build_parent
+        return build_parent(self, parent_id, allow_partial=allow_partial,
+                            output_tokens=output_tokens, method=method)
+
+    def read_parent(self, parent_id):
+        from .parents import read_parent
+        return read_parent(self, parent_id)
+
+    def _legacy_build_parent(self, parent_id, *, allow_partial=False, output_tokens=8192):
         parent = self.nodes[parent_id]
         catalog = self.entity_catalog(parent_id)
         if catalog['missing_child_ids'] and not allow_partial:

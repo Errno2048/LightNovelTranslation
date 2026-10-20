@@ -2,6 +2,33 @@
 
 本模块不依赖翻译工作区、模型或密钥。检索使用官方 Narou 作品 API；正文解析与 EPUB 输出使用 FanFicFare。公共 API 在 `lightnovel_translation.syosetu`，可选依赖安装为 `lightnovel-translation[syosetu]`，固定已测试的正式版 FanFicFare 4.62.0。
 
+## 下载并发与配置
+
+在 `~/.lightnovel_translation/config.toml` 添加以下节即可复用；不存在此节时使用同样的默认值，不需要填写模型或 API key：
+
+```toml
+[syosetu]
+concurrency = 2
+request_interval = 1.0
+```
+
+`concurrency` 支持 1–8，1 为串行；这是库的配置范围，不是站点承诺的允许上限。`request_interval` 是所有下载线程共享的最小请求启动间隔，单位秒，缓存命中不等待。2 个线程与每秒最多启动一次请求同时生效，并发主要用于覆盖网络等待。官方元信息 API 检索仍独立保留至少一秒查询间隔。
+
+优先级为 API / CLI 显式参数 → 指定配置文件中的 `[syosetu]` → 默认用户配置中的 `[syosetu]` → 内置默认值。指定文件替代默认文件；没有指定时才读取默认用户文件。模型节可以不完整，采集不会初始化翻译模型、读取 API key 环境变量或发起模型请求。不要让 agent 输出含密钥的完整文件；可只提交下面的配置片段给用户添加。已有配置不会自动覆盖。
+
+```console
+python -m lightnovel_translation syosetu download n7975cr work/source-01 --first 1 --last 20 --concurrency 2 --interval 1 --proxy http://127.0.0.1:7890
+python -m lightnovel_translation syosetu download n7975cr work/source-02 --first 1 --last 20 --config source-config.toml
+```
+
+Python 同样支持 `download_work(..., concurrency=2, request_interval=1.0, config="source-config.toml")`；也可传入 `config=SyosetuConfig(concurrency=2)`（从 `lightnovel_translation` 导入），完全跳过用户文件。设置后由库校验，非法参数在网络访问前拒绝。
+
+实现先按范围并发预取正文，每个线程独立持有 FanFicFare 配置与 HTTP session；响应索引写入串行化。正文解析、插图处理和 EPUB 打包仍按原目录顺序执行，避免线程改变章序或共享解析状态。图片按需串行获取，也受同一个请求间隔与退避约束。
+
+收到 429 / 503 时，有效并发减半（最低 1），所有线程共享冷却时间，至少 5 秒或服务端指定的 Retry-After，按较长者等待。未提供 Retry-After 时按 5/10/20 秒退避。单个请求最多额外重试 `retries` 次（默认 1，范围 0–3）；底层自动重试关闭，避免叠加。等待超过 60 秒时直接返回可重试错误，不提前重发；403 等非暂时性错误不重试。已在途请求可能完成，后续排队请求停止。恢复用新输出目录和原缓存，长 Retry-After 应等待其到期后再恢复。
+
+返回结果与成功 / 失败 manifest 中的 `download_stats` 记录配置并发、实际最大在途请求数、最终有效并发、网络请求数、缓存命中数、HTTP 状态统计、重试和退避事件。统计涵盖下载器的页面与图片请求，不包含独立的 Narou API 查询或重定向内部跳转。离线重建不预取、不访问网络。
+
 ## 中文反查
 
 ```python
@@ -69,7 +96,7 @@ python -m lightnovel_translation syosetu download n7975cr work/acquisition-01 --
 | `cache/work.json` | 当次作品元信息 |
 | `cache/responses/responses.json` + `.bin` | GET 响应字节、URL、哈希；不保存 cookie、请求头或 pickle |
 
-清洗删除 Unicode Cf 和 U+034F（包括编码成字符实体的控制字符），保留原生注音和有语义的组合符。`validate_source_epub()` 检查 CRC、话数、空正文、资源存在及零宽字符；不等于完整 EPUBCheck 或全本语义验收。FanFicFare 的完结状态使用官方 API `end` 信息校正。
+清洗删除 Unicode Cf 和 U+034F（包括编码成字符实体的控制字符），保留原生注音和有语义的组合符。下载器会要求 FanFicFare 保留原始图片字节，避免其 Pillow 转 JPEG 路径误拒绝带透明通道的合法 PNG；`validate_source_epub()` 检查 CRC、话数、空正文、资源存在及零宽字符；不等于完整 EPUBCheck 或全本语义验收。FanFicFare 的完结状态使用官方 API `end` 信息校正。
 
 ## 缓存、更新和失败
 
@@ -86,7 +113,7 @@ rebuilt = download_work("n7975cr", "work/rebuild-01", first_chapter=1, last_chap
 
 离线必须保留原范围所需的作品元信息、目录、正文和图片。缺少响应时返回 `source_cache_miss`；哈希不符是 `source_cache_corrupt`。打包时间可能变化，离线重建不保证 EPUB 整包字节完全相同，应比较每话正文、ruby、资源和 manifest 的来源身份。
 
-其他错误：`source_search_failed`（API / 格式 / 网络）、`source_not_found`、`source_dependency_missing`、`source_output_exists`、`source_download_failed`、`source_chapter_error`、`source_request_failed`。异常公开为 `TranslationError`，用 `.to_dict()` 查看结构化信息。CLI 错误返回非零退出码。保留失败目录；重试时使用新输出目录和原缓存。不要删除来源标记强行通过。
+其他错误：`source_search_failed`（API / 格式 / 网络）、`source_not_found`、`source_dependency_missing`、`source_output_exists`、`source_download_failed`、`source_chapter_error`、`source_request_failed`、`source_rate_limited`（429，检查 Retry-After 与次数上限）。异常公开为 `TranslationError`，用 `.to_dict()` 查看结构化信息；失败 manifest 也保存脱敏错误类型及状态。CLI 错误返回非零退出码。保留失败目录；重试时使用新输出目录和原缓存。不要删除来源标记强行通过。
 
 ## Skill 导出
 
@@ -96,4 +123,4 @@ python -m lightnovel_translation skill export ~/.codex/skills/syosetu-fetch --na
 
 Claude Code 可导出至 `.claude/skills/syosetu-fetch`。旧命令不传 `--name` 仍导出 `lightnovel-translation`。文件冲突保留本地定制，选择新目录比较后再合并。
 
-源码位置：`src/lightnovel_translation/syosetu.py` 的 `inspect_reference`、`NarouCatalog`、`download_work`、`validate_source_epub`；`syosetu_cli.py`；`skill.py` 和 `_resources.py`。入口流程优先查本页，无需阅读下载器或翻译引擎内部代码。
+源码位置：`src/lightnovel_translation/syosetu.py` 的 `inspect_reference`、`NarouCatalog`、`download_work`、`validate_source_epub`；`_source_requests.py` 的共享并发 / 速率与退避控制；`acquisition_config.py` 的 `SyosetuConfig`；`syosetu_cli.py`；`skill.py` 和 `_resources.py`。入口流程优先查本页，无需阅读下载器或翻译引擎内部代码。

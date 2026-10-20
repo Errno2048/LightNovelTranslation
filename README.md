@@ -42,6 +42,8 @@ python -m lightnovel_translation syosetu download n7975cr work/source-01 --first
 
 反查优先读取中文文件元信息及头部，再按作者全名检索，最后使用 agent 提供的标题关键词。网络检索回退和作品消歧由独立技能 [syosetu-fetch](skills/syosetu-fetch/SKILL.md) 指导。`lookup` 返回候选，下载使用明确 Ncode；`source.epub` 可直接交给 `import_book`。完整 API、代理、来源清单和离线重建见[采集说明](skills/syosetu-fetch/references/acquisition.md)。
 
+下载默认 2 个线程预取正文，全部线程共享 1 秒请求启动间隔；429 / 503 自动降并发并退避。可在用户配置 `~/.lightnovel_translation/config.toml` 的 `[syosetu]` 节设置 `concurrency = 2`、`request_interval = 1.0`，或用 `--concurrency` / `--interval` 覆盖；`--concurrency 1` 恢复串行。并发范围不是站点允许上限，实测速率会受代理和延迟影响。
+
 ## Agent 技能
 
 技能入口为 [skills/lightnovel-translation/SKILL.md](skills/lightnovel-translation/SKILL.md)，使用 Agent Skills 标准目录：入口含 YAML 元信息，按需查阅的文档在 `references/`，配置模板在 `assets/`。技能和所有依赖文档随 Python 安装包分发。

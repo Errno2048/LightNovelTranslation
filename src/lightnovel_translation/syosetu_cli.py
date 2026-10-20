@@ -32,7 +32,9 @@ def add_parser(commands):
     download.add_argument("output_dir")
     download.add_argument("--first", type=int, default=1)
     download.add_argument("--last", type=int)
-    download.add_argument("--interval", type=float, default=1)
+    download.add_argument("--interval", type=float, help="Minimum start interval shared by all workers (default: config or 1s)")
+    download.add_argument("--concurrency", type=int, help="Chapter download workers, 1-8 (default: config or 2)")
+    download.add_argument("--config", help="TOML/JSON containing [syosetu]; model settings are not initialized")
     download.add_argument("--offline", action="store_true")
     download.add_argument("--no-images", action="store_true")
     download.add_argument("--no-author-notes", action="store_true")
@@ -52,6 +54,7 @@ def run(args):
         elif args.action == "download":
             result = download_work(args.ncode, args.output_dir, first_chapter=args.first, last_chapter=args.last,
                 proxy=args.proxy, timeout=args.timeout, retries=args.retries, request_interval=args.interval,
+                concurrency=args.concurrency, config=args.config,
                 include_images=not args.no_images, include_author_notes=not args.no_author_notes,
                 cache_dir=args.cache_dir, offline=args.offline)
         else:
