@@ -74,34 +74,49 @@ v5 实测（185 章历史，128k 预算）：
 
 ### 未决线程整理
 
-线程整理以封口 L2 为边界，按阅读顺序执行：
+线程整理分为两级，避免每个 L2 都调用模型：
 
-1. 从 L2 的 NEED 记录创建稳定线程 `T...`；同一 NEED 的重复观测归入同一线程。
-2. 只把与本节点实体名/摘要相关的 active 线程交给模型；每次最多 40 条，避免发送全部历史问题。
-3. 模型输出 `thread_id`、`status`、`resolution` 和证据段落 ID；程序校验线程 ID、状态和引用是否属于当前节点。
-4. 没有证据时只能保持 active/ambiguous；解析失败保持原状态并记录 `invalid`，不阻塞翻译。
-5. 每个 L2 节点按 `node_revision` 缓存一次；初始冻结历史按顺序 backfill。
-6. 线程目录保存 active/resolved 线程、证据、最后出现位置和 revision。
+1. **L2 / 提交时：确定性筛选，不调用模型**
+   - 从 NEED 创建稳定线程 `T...`；
+   - 共享实体且问题字符 bigram Jaccard ≥ 0.62 的线程合并；
+   - 按核心实体命中、重复次数、近期度计算 salience；
+   - 低 salience 的 active 线程降为 `dormant`，不删除；
+   - 后续实体再次出现时自动重新激活。
+2. **L1 封口时：批量语义判定**
+   - 只在 sealed L1（或冻结历史 L1）触发；
+   - 候选包括 active 和与本 L1 相关的 dormant 线程；
+   - 输入 L1 摘要、相关 L2 摘要、局部记录和紧凑线程卡；
+   - 按 token 预算分批，每批 30–50 张卡；
+   - 模型动作：resolved / partially_resolved / active / dormant / ambiguous / merge；
+   - resolved/partial 必须有真实证据引用；合并只能指向同批线程；
+   - 每批有独立缓存；失败的批次保留原状态。
 
 workset 的接入方式：
 
-- active/partially_resolved/ambiguous 线程的 NEED 固定在常驻层，优先进入 workset；
-- resolved/superseded 的 NEED 不再作为候选，改为紧凑的 resolution 摘要；
-- 线程摘要计入 workset 预算；
-- `job.thread_catalog()` / `job.thread_evidence()` 提供审计入口。
+- active/partially_resolved/ambiguous：固定进 workset；
+- dormant：不固定，但实体命中当前目标时进入 `dormant_relevant` 摘要；
+- resolved：从 selected NEED 移除，进入 resolved 摘要；
+- merged/archived：不再作为候选；
+- 线程摘要计入 workset 预算。
 
-v5 初始历史 backfill 实测：
+v5 L1 批量整理实测：
 
 ```text
-处理 L2 节点              19
-线程总数                 139
-active/partially/ambiguous 127
-resolved                  12
-workset active 摘要        40
-workset resolved 摘要      12
-选中 NEED 记录             44
-整体预计输入               269,666 tokens（上限 980,992）
+历史 L1 节点                  2
+候选线程                     47 / 67
+每 L1 批次数                 1 / 1
+模型更新                     6
+确定性筛选前 active          173
+筛选后 active               133
+dormant                      40
+merged                       0
+resolved                     15
+workset NEED                 44
+workset 线程状态              active 31 / partial 12 / ambiguous 1
+workset 预计输入              388,927 tokens（上限 980,992）
 ```
+
+模型批量判定只解决了少量线程；真正降低 active 数量的是确定性 salience 筛选。这也说明不能只依赖一次模型调用做降级。
 
 ### 真实续译试点
 
@@ -123,7 +138,7 @@ quality_labels           experimental_working, semantics_unreviewed
 阿娜溫、炎龍大人、泰迪叔叔、格雷大人、小魔女、菲亞、妮娜、吉麗、亞馬遜樹人
 ```
 
-### 首次增量 L2 更新实测
+### 早期 L2 逐章原型实测（已由 L1 批量替代）
 
 第 186 话提交并 `materialize=True` 后，产生了新的增量 L2 节点，首次触发线程整理：
 

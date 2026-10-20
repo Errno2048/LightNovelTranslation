@@ -17,7 +17,8 @@ RECENT_GUARANTEE = {'NEED': 4, 'TEMPORAL': 4, 'STATE': 4, 'PERSPECTIVE': 4}
 DEFAULT_BUDGET_TOKENS = 128000
 DEFAULT_RECENT_CHAPTERS = 25
 OMITTED_QUERY_IDS = 40
-DEMOTED_THREAD_STATUSES = {'resolved', 'superseded'}
+DEMOTED_THREAD_STATUSES = {'resolved', 'superseded', 'archived', 'merged'}
+ACTIVE_THREAD_STATUSES = {'active', 'partially_resolved', 'ambiguous'}
 
 
 def _thread_card(thread):
@@ -26,7 +27,8 @@ def _thread_card(thread):
             'subject': (thread.get('subject') or [])[:6],
             'resolution': (thread.get('resolution') or '')[:240],
             'evidence': (thread.get('evidence') or [])[:4],
-            'last_seen': thread.get('last_seen')}
+            'last_seen': thread.get('last_seen'),
+            'filter_reason': thread.get('filter_reason')}
 
 
 def _canonical(value):
@@ -191,7 +193,7 @@ def _select_knowledge(items, target_names, target_order, spec, counter, budget):
 
     active_count = 0
     for item in ranked:
-        if item.get('thread_status') not in {'active', 'partially_resolved', 'ambiguous'}:
+        if item.get('thread_status') not in ACTIVE_THREAD_STATUSES:
             continue
         if add(item, 'active_thread'):
             active_count += 1
@@ -303,13 +305,25 @@ def select_workset(repo, spec, view, nodes, target_text, target_order, *,
     target_names = _target_names(entity_records, entity_cards, target_text)
     thread_values = list((threads or {}).values())
     active_threads = sorted((thread for thread in thread_values
-                             if thread.get('status') not in DEMOTED_THREAD_STATUSES),
+                             if thread.get('status') in ACTIVE_THREAD_STATUSES),
                             key=lambda thread: thread.get('last_seen', -1), reverse=True)[:40]
     resolved_threads = sorted((thread for thread in thread_values
                                if thread.get('status') in DEMOTED_THREAD_STATUSES),
                               key=lambda thread: thread.get('last_seen', -1), reverse=True)[:30]
+    dormant_relevant = []
+    target_corpus = target_text + ' ' + _canonical(
+        [card.get('fields', {}) for card in entity_cards])
+    for thread in thread_values:
+        if thread.get('status') != 'dormant':
+            continue
+        names = thread.get('entity_names') or []
+        if names and any(name in target_corpus for name in names):
+            dormant_relevant.append(thread)
+    dormant_relevant.sort(key=lambda thread: thread.get('last_seen', -1), reverse=True)
+    dormant_relevant = dormant_relevant[:20]
     thread_payload = {'active': [_thread_card(thread) for thread in active_threads],
-                      'resolved': [_thread_card(thread) for thread in resolved_threads]}
+                      'resolved': [_thread_card(thread) for thread in resolved_threads],
+                      'dormant_relevant': [_thread_card(thread) for thread in dormant_relevant]}
     fixed = [counter.count(_canonical(value))
              for value in core + unresolved + gaps + [thread_payload]]
     available = max(0, budget - sum(fixed))
@@ -384,7 +398,8 @@ def select_workset(repo, spec, view, nodes, target_text, target_order, *,
             'omitted_counts': dict(omitted_counts),
             'omitted_query_ids': omitted_query_ids,
             'thread_counts': {'active': len(active_threads),
-                              'resolved': len(resolved_threads)},
+                              'resolved': len(resolved_threads),
+                              'dormant_relevant': len(dormant_relevant)},
             'target_order': target_order,
             'recent_chapters': spec.workset_recent_chapters,
         },
