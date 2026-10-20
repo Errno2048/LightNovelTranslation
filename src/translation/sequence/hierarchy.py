@@ -471,6 +471,12 @@ def materialize_hierarchy(repo, spec, view, provider, *, force_open=False,
     from .entities import update_entity_catalog
     entity_nodes = latest_nodes(repo) + latest_incremental_nodes(repo)
     update_entity_catalog(repo, spec, view, caller, entity_nodes)
+    if spec.thread_reconcile and caller is not None:
+        from .threads import update_thread_catalog
+        try:
+            update_thread_catalog(repo, spec, view, caller, entity_nodes, allow_model=True)
+        except NarrativeError:
+            pass
     return list(ready.values())
 
 

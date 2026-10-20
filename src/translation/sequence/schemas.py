@@ -44,6 +44,9 @@ class SequenceSpec:
     mapping_profile: str = 'coarse-v1'
     targeted_evidence: bool = True
     targeted_evidence_tokens: int = 12288
+    workset_max_tokens: int = 128000
+    workset_recent_chapters: int = 25
+    thread_reconcile: bool = False
     output_profile: str = 'plain-v1'
 
     def __post_init__(self):
@@ -55,6 +58,11 @@ class SequenceSpec:
             raise ValueError('source-bound output requires stable-v1 source references')
         if type(self.targeted_evidence) is not bool or type(self.targeted_evidence_tokens) is not int or self.targeted_evidence_tokens<=0:
             raise ValueError('invalid targeted evidence settings')
+        if any(type(value) is not int or value<=0 for value in
+               (self.workset_max_tokens,self.workset_recent_chapters)):
+            raise ValueError('invalid workset budget settings')
+        if type(self.thread_reconcile) is not bool:
+            raise ValueError('thread_reconcile must be boolean')
         if self.reference_profile not in {'legacy', 'stable-v1'} or self.mapping_profile not in {'audit-v2', 'coarse-v1'}:
             raise ValueError('unknown reference or mapping protocol')
         if self.strategy not in {'R','U','H'} or self.mode not in {'working','accepted_only'}:
@@ -107,6 +115,9 @@ class SequenceSpec:
         value.setdefault('mapping_profile','audit-v2')
         # Frozen pre-feature runs must retain their exact prompts and cache keys.
         value.setdefault('targeted_evidence',False)
+        value.setdefault('workset_max_tokens',128000)
+        value.setdefault('workset_recent_chapters',25)
+        value.setdefault('thread_reconcile',False)
         value.setdefault('output_profile','plain-v1')
         value['capacity']=ModelCapacity(**value['capacity'])
         value['roles']={k:RoleBudget(**v) for k,v in value['roles'].items()}

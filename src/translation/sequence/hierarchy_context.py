@@ -23,7 +23,8 @@ def build(repo, spec, view, *, caller, reason, fault, previous_budget):
         raise NarrativeError('coverage_gap',
             'hierarchy coverage must represent each visible chapter exactly once; '
             f'missing={missing[:8]}; duplicate={duplicate[:8]}')
-    workset = _workset(repo, nodes)
+    target_doc = view.body(view.policy.target_id, task=True)
+    workset = _workset(repo, nodes, spec=spec, view=view, target_text=target_doc['text'])
 
     def project(value):
         return (prompt_projection(value, view.archive.chapters.values())
@@ -120,7 +121,7 @@ def build(repo, spec, view, *, caller, reason, fault, previous_budget):
                 })
         previous_unresolved = commit['unresolved']
 
-    current = source_message(view.body(view.policy.target_id, task=True),
+    current = source_message(target_doc,
         reference_profile=spec.reference_profile,
         documents=view.archive.chapters.values())
     report = budget_for(repo, spec, view.counter, messages + [current])

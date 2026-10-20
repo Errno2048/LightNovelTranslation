@@ -205,6 +205,57 @@ class TranslationJob:
         return read_entity_evidence(self.repo, entity_id, visible_source_ids=visible,
                                     before_order=view.target_order)
 
+    def _checkpoint_workset_catalog_id(self):
+        checkpoint_id = self.repo.heads().get('checkpoint')
+        if not checkpoint_id:
+            return None
+        checkpoint = self.repo.store.get(checkpoint_id)
+        return (checkpoint.get('workset') or {}).get('workset_catalog_id')
+
+    def workset_catalog(self) -> dict[str, Any]:
+        """Read the compact knowledge selection summary for the current target."""
+        from translation.sequence.workset import read_workset_catalog
+        self._check()
+        next_chapter = self.engine.next_chapter()
+        view = self.engine.view(next_chapter['source_id']) if next_chapter else self.engine.view(None)
+        return read_workset_catalog(self.repo, before_order=view.target_order,
+                                    catalog_id=self._checkpoint_workset_catalog_id())
+
+    def knowledge_evidence(self, short_id: str) -> dict[str, Any]:
+        """Read selected or omitted knowledge by its compact workset ID."""
+        from translation.sequence.workset import read_workset_evidence
+        self._check()
+        if not isinstance(short_id, str) or not short_id:
+            raise ValueError('short_id is required')
+        next_chapter = self.engine.next_chapter()
+        view = self.engine.view(next_chapter['source_id']) if next_chapter else self.engine.view(None)
+        return read_workset_evidence(self.repo, short_id, before_order=view.target_order,
+                                     catalog_id=self._checkpoint_workset_catalog_id())
+
+    def reconcile_threads(self) -> dict[str, Any]:
+        """Reconcile unresolved threads against sealed L2 nodes; may call the model."""
+        self._check()
+        self.project._require_generation()
+        return self.engine.reconcile_threads()
+
+    def thread_catalog(self) -> dict[str, Any]:
+        """Read the compact unresolved-thread catalog for the current target."""
+        from translation.sequence.threads import read_thread_catalog
+        self._check()
+        next_chapter = self.engine.next_chapter()
+        view = self.engine.view(next_chapter['source_id']) if next_chapter else self.engine.view(None)
+        return read_thread_catalog(self.repo, before_order=view.target_order)
+
+    def thread_evidence(self, thread_id: str) -> dict[str, Any]:
+        """Read one thread's status, resolution and evidence."""
+        from translation.sequence.threads import read_thread_evidence
+        self._check()
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ValueError('thread_id is required')
+        next_chapter = self.engine.next_chapter()
+        view = self.engine.view(next_chapter['source_id']) if next_chapter else self.engine.view(None)
+        return read_thread_evidence(self.repo, thread_id, before_order=view.target_order)
+
     def reference_report(self) -> dict[str, Any]:
         """Report frozen references and actual selections, without reading engine code."""
         self._check()

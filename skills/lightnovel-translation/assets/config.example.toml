@@ -57,6 +57,9 @@ compression_target = 0.65
 max_revisions = 1
 translation_tools = true
 targeted_evidence = true
+workset_max_tokens = 128000
+workset_recent_chapters = 25
+thread_reconcile = true
 output_profile = "source-records-v1"
 
 [references]

@@ -46,6 +46,114 @@
 
 当前目标正文中确切出现的非核心名称仍可定向召回；核心上限只限制长期常驻视图。其他实体仍可通过目录/证据接口查询。核心清单是模型选择的候选，并非权威事实。
 
+### 非实体 workset
+
+事件、状态、视角、时序和未决信息继续保留原始记录，但不再每条复制节点范围或长 ID。进入 prompt 的 workset 使用以下规则：
+
+1. 按 `(type, fields)` 精确消重，合并父子节点副本；不对不同时间或不同人物认知做激进语义合并。
+2. 记录使用 `K` + 8–10 个 base32 字符的稳定短 ID；完整 ID、节点修订和出处只保存在 `sequence-workset-catalog`。
+3. prompt 字段做有界投影：描述最多 240 字符，引用最多 8 条，参与者/主体最多 8 条；完整字段通过短 ID 查询。
+4. 相关性评分由目标章实体名的 IDF 加权命中、近期章节距离和记录类型共同决定；每类先保证少量近期记录，再按类型最低配额选取，最后按分数填满预算。
+5. 默认 workset 预算 `workset_max_tokens = 128000`，近期窗口 `workset_recent_chapters = 25`；实体卡最多占可用预算的三分之一。
+6. 未选记录保留短 ID 和分数。prompt 只带少量最高分未选 ID；完整目录可通过 `job.workset_catalog()` 查看，按短 ID 用 `job.knowledge_evidence()` 取回原始字段与出处。
+
+v5 实测（185 章历史，128k 预算）：
+
+```text
+原始 workset            1,849,940 字符 / 约 2.18M 输入 tokens
+压缩后 workset 消息        89,018 字符
+整体检查点预计输入        271,370 tokens（上限 980,992）
+选中知识记录             199 条 + 50 张实体卡
+知识记录目标名命中          199 / 199
+目标实体名覆盖              30 / 30
+最近 10 章内记录            59 条
+选中分数 min/median       34.30 / 50.77
+```
+
+未选记录中仍有一些高价值候选（最高分约 37.3），多为远距离未决 NEED 或与其他近期记录重复的视角/状态；它们保留在目录中，可按需查询。没有发现因去重而丢失的唯一重要记录。
+
+### 未决线程整理
+
+线程整理以封口 L2 为边界，按阅读顺序执行：
+
+1. 从 L2 的 NEED 记录创建稳定线程 `T...`；同一 NEED 的重复观测归入同一线程。
+2. 只把与本节点实体名/摘要相关的 active 线程交给模型；每次最多 40 条，避免发送全部历史问题。
+3. 模型输出 `thread_id`、`status`、`resolution` 和证据段落 ID；程序校验线程 ID、状态和引用是否属于当前节点。
+4. 没有证据时只能保持 active/ambiguous；解析失败保持原状态并记录 `invalid`，不阻塞翻译。
+5. 每个 L2 节点按 `node_revision` 缓存一次；初始冻结历史按顺序 backfill。
+6. 线程目录保存 active/resolved 线程、证据、最后出现位置和 revision。
+
+workset 的接入方式：
+
+- active/partially_resolved/ambiguous 线程的 NEED 固定在常驻层，优先进入 workset；
+- resolved/superseded 的 NEED 不再作为候选，改为紧凑的 resolution 摘要；
+- 线程摘要计入 workset 预算；
+- `job.thread_catalog()` / `job.thread_evidence()` 提供审计入口。
+
+v5 初始历史 backfill 实测：
+
+```text
+处理 L2 节点              19
+线程总数                 139
+active/partially/ambiguous 127
+resolved                  12
+workset active 摘要        40
+workset resolved 摘要      12
+选中 NEED 记录             44
+整体预计输入               269,666 tokens（上限 980,992）
+```
+
+### 真实续译试点
+
+第 186 话（157「等価交換」）已提交：
+
+```text
+译文长度                 2,577 字
+段落覆盖                 125 个非空段落（源文标题除外）
+审查状态                 review_complete=true
+findings                 []
+unresolved               []
+quality_labels           experimental_working, semantics_unreviewed
+唯一信号                 “一度”数量词，审查判定为等价后 dismissed
+```
+
+译文使用简体提交，最终 EPUB 阶段用 OpenCC `s2tw` 转繁体。抽样转换后术语与既有 185 章一致：
+
+```text
+阿娜溫、炎龍大人、泰迪叔叔、格雷大人、小魔女、菲亞、妮娜、吉麗、亞馬遜樹人
+```
+
+### 首次增量 L2 更新实测
+
+第 186 话提交并 `materialize=True` 后，产生了新的增量 L2 节点，首次触发线程整理：
+
+```text
+线程目录 revision        19 → 20
+线程总数                 139 → 144
+active                   127 → 132
+resolved                  12 → 12
+新增线程                   5
+状态变化                  1（active → partially_resolved）
+完整解决                   0
+```
+
+新增线程来自本话留下的问题：炎龙所说的人情、小魔女交易如何履行、“フェアギスマインニヒト”与小菲亚的关系、小菲亚身世的说法、炎龙是否仍认为主角已死。被部分解决的线程是主角被吞后到醒来之间的空白期：本话补足了魔王城女仆经历，但具体经过和时间仍未说明。
+
+workset 前后：
+
+```text
+NEED            44 → 44（其中 10 个 ID 被新线程替换）
+PERSPECTIVE     20 → 31
+EVENT           88 → 83
+STATE/TEMPORAL  12 / 8（不变）
+ENTITY          50（不变）
+总选中          222 → 228
+workset tokens  127,869 → 127,977
+检查点预计输入    涨至 302,422（上限 980,992，仍可容纳）
+```
+
+行为符合设计：新 active 线程被固定进 workset；partial 线程保留并更新说明；没有线程被完全 resolved，所以没有 NEED 被移除。完整差异保存在 `work/pilot-186/workset-update-diff.json`。
+
 ## 4. 上下文与 API
 
 - `index.plan()`：展示 token 布局、预检、短区间例外和需处理的容量诊断，本地调用不产生模型费用。
@@ -53,6 +161,10 @@
 - `index.entity_catalog(parent_id)`：本地读取原始实体，稳定消重，保留成员来源；独立版次实体匹配继续使用可追溯条目。
 - `job.prepare_history()` / 译后增量：物化节点后构建/更新语义目录；超过阈值时准备核心视图。`plan_next()` 保持本地，无可用视图则明确返回待准备状态。
 - `job.entity_catalog()`：读取完整合并目录的精简视图和核心选择状态，不返回长成员列表、全量来源清单或原文摘录；按条目 ID 用 `job.entity_evidence()` 取回出处。
+- `job.workset_catalog()`：读取当前目标的 workset 选择摘要、预算、已选/未选短 ID 与类型计数，不返回完整记录。
+- `job.knowledge_evidence(short_id)`：按 `K...` 短 ID 读取选中或未选的原始知识字段、节点范围和出处。
+- `job.reconcile_threads()`：按封口 L2 顺序执行模型判定，可能产生调用；用于初始历史 backfill 或显式整理。
+- `job.thread_catalog()` / `job.thread_evidence(thread_id)`：读取 active/resolved 线程、摘要、证据和最后出现位置。
 - `config update` / `update_user_config()`：只允许修改非凭据字段，库内部读写完整配置，校验后原子替换，结果只返回字段名和配置状态；agent 不读取 API key。
 - `cost_usage()`：返回持久请求数、预留输入/输出和已返回 usage。默认累计上限均为 0（无限制），单次容量与重试上限仍生效；0 不能被错误解释为没有预算。
 

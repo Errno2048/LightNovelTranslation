@@ -152,6 +152,18 @@ class SequenceEngine:
             {k:n[k] for k in ('id','node_id','level','source_ids','build_method','state')} for n in nodes],
             'historical_index':pending_report(self.repo,self.spec,view)}
 
+    def reconcile_threads(self):
+        from .hierarchy import latest_nodes, latest_incremental_nodes
+        from .threads import update_thread_catalog, read_thread_catalog
+        chapter=self.next_chapter()
+        if chapter is None:
+            return {'processed':[],'threads':0,'active':0,'resolved':0}
+        view=self.view(chapter['source_id'])
+        result=update_thread_catalog(self.repo,self.spec,view,self.caller,
+            latest_nodes(self.repo)+latest_incremental_nodes(self.repo),allow_model=True)
+        result['thread_catalog']=read_thread_catalog(self.repo,before_order=view.target_order)
+        return result
+
     def _review(self,view,context,version_id):
         from ..review.requests import ReviewSession
         version=read_version(view,version_id)

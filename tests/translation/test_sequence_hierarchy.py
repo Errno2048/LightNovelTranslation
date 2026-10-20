@@ -356,3 +356,22 @@ def test_independent_minimum_l1_capacity_decision_is_reported_before_generation(
         assert result['status']=='index_capacity_decision_required'
         assert result['not_sent']
         assert not provider.requests
+
+
+def test_workset_catalog_is_compact_and_queryable(tmp_path):
+    project,source,reference,job,provider=make_history(tmp_path)
+    with project,job:
+        job.prepare_history()
+        context=job.plan_next()['context']
+        message=next(m['content'] for m in context['messages']
+            if m['role']=='user' and '候选知识' in m['content'])
+        assert len(message)<30000
+        catalog=job.workset_catalog()
+        assert catalog['status']=='found'
+        assert catalog['used_tokens']<=catalog['budget_tokens']
+        value=job.repo.store.get(catalog['catalog_id'])
+        omitted=[row for row in value.get('omitted',[])
+                 if row.get('type') in {'EVENT','STATE','PERSPECTIVE','TEMPORAL','NEED'}]
+        if omitted:
+            evidence=job.knowledge_evidence(omitted[0]['short_id'])
+            assert evidence['status']=='found'
