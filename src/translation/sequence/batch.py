@@ -8,6 +8,7 @@ import unicodedata
 from ..narrative.schemas import NarrativeError
 from ..references import pair_rows
 from ..review.versions import create_version, read_version, source_segments
+from .provisional import build_provisional_index, provisional_message
 from ..storage import digest
 from .context import compile_sequence_context
 from .output import parse_output, recovery_feedback
@@ -183,27 +184,66 @@ def _extract_glossary(job, window, known):
     return {term['source_form']: term['translation'] for term in unique}
 
 
-def _batch_contexts(job, window, glossary, provisional=None):
+def _batch_contexts(job, window, glossary, provisional=None, allowed_commits=None):
     checkpoint_id = job.repo.heads().get('checkpoint')
     if not checkpoint_id:
         raise RuntimeError('window translation requires an existing checkpoint')
+    spec = job.engine.spec
+    counter = job.engine.counter
+    positions = {doc['chapter_id']: index for index, doc in enumerate(window)}
+    output_tokens = spec.roles['translator'].requested_output_tokens
+    limit = spec.capacity.context_window_tokens - spec.capacity.safety_tokens
     items = []
     for doc in window:
         view = job.engine.view(doc['chapter_id'])
-        context = compile_sequence_context(job.repo, job.engine.spec, view,
-                                           checkpoint_id=checkpoint_id)
-        messages = list(context['messages'])
-        if glossary:
-            messages.insert(1, {'role': 'user', 'content':
-                '【本窗口冻结术语；翻译时优先使用，未列出的新词保留不确定性】\n' +
-                json.dumps(glossary, ensure_ascii=False, separators=(',', ':'))})
+        context = compile_sequence_context(job.repo, spec, view,
+                                           checkpoint_id=checkpoint_id,
+                                           allowed_commits=allowed_commits)
+        glossary_message = ({'role': 'user', 'content':
+            '【本窗口冻结术语；翻译时优先使用，未列出的新词保留不确定性】\n' +
+            json.dumps(glossary, ensure_ascii=False, separators=(',', ':'))}
+            if glossary else None)
+        provisional_message_value = None
         if provisional:
             remaining = (context.get('budget') or {}).get('remaining_input_tokens', 0)
-            message = _provisional_message(provisional, counter=job.engine.counter,
-                                           max_tokens=max(0, remaining - 8192))
-            if message:
-                messages.insert(2 if glossary else 1, message)
-        items.append({'doc': doc, 'view': view, 'context': context, 'messages': messages})
+            provisional_message_value = provisional_message(
+                provisional, counter=counter, max_tokens=max(0, remaining - 8192))
+        index = positions[doc['chapter_id']]
+        prefix_docs = window[max(0, index - 3):index]
+        prefix_message = None
+        if prefix_docs:
+            prefix_message = {'role': 'user', 'content':
+                '【本窗口前文日文（尚未翻译，仅供承接；专名以 glossary 为准）】\n' +
+                '\n\n'.join('### ' + item.get('title', '') + '\n' + item.get('text', '')
+                            for item in prefix_docs)}
+
+        def assemble(include_provisional, include_prefix):
+            messages = list(context['messages'])
+            position = 1
+            if glossary_message:
+                messages.insert(position, glossary_message)
+                position += 1
+            if include_provisional and provisional_message_value:
+                messages.insert(position, provisional_message_value)
+                position += 1
+            if include_prefix and prefix_message:
+                messages.insert(position, prefix_message)
+                position += 1
+            return messages
+
+        selected = None
+        for include_provisional, include_prefix in ((True, True), (True, False), (False, False)):
+            candidate = assemble(include_provisional, include_prefix)
+            if counter.messages(candidate) + output_tokens <= limit:
+                selected = (candidate, include_prefix, include_provisional)
+                break
+        if selected is None:
+            raise NarrativeError('window_too_large',
+                'window chapter %s does not fit the configured context' % doc['chapter_id'])
+        messages, used_prefix, used_provisional = selected
+        items.append({'doc': doc, 'view': view, 'context': context, 'messages': messages,
+                      'context_optional': {'provisional': used_provisional,
+                                           'prefix': used_prefix}})
     return items
 
 
@@ -331,13 +371,15 @@ def _staged_snapshot(job, window):
                                   'versions': [doc['version_id'] for doc in documents]})}
 
 
-def translate_stage(job, window, *, concurrency=None, provisional=None, retry_failed=False):
+def translate_stage(job, window, *, concurrency=None, provisional=None,
+                    retry_failed=False, allowed_commits=None):
     """Translate one explicit window and leave versions staged for review."""
     spec = job.engine.spec
     concurrency = concurrency or spec.translation_concurrency
     known = _known_glossary(job)
     glossary = _extract_glossary(job, window, known)
-    items = _batch_contexts(job, window, glossary, provisional)
+    items = _batch_contexts(job, window, glossary, provisional,
+                            allowed_commits=allowed_commits)
     translations = _parallel_translate(job, items, concurrency, retry_failed=retry_failed)
     versions = {}
     for item in items:
@@ -353,11 +395,17 @@ def translate_stage(job, window, *, concurrency=None, provisional=None, retry_fa
         job.repo.stage(source_id, 'generated', version_id=version_id,
                        generation_id=translated.get('generation_id'))
         versions[source_id] = version_id
-    snapshot = _staged_snapshot(job, window)
-    if snapshot:
-        job.repo.store.put('sequence-provisional-snapshot', snapshot)
+    provisional_index = None
+    provisional_error = None
+    if len(versions) == len(window):
+        try:
+            provisional_index = build_provisional_index(job, window, versions)
+        except Exception as exc:
+            provisional_error = repr(exc)
     return {'window': [doc['chapter_id'] for doc in window], 'versions': versions,
-            'translations': translations, 'glossary': glossary, 'snapshot': snapshot}
+            'translations': translations, 'glossary': glossary,
+            'provisional_index': provisional_index,
+            'provisional_error': provisional_error}
 
 
 def review_commit_window(job, window, *, review_concurrency=None, materialize=True):

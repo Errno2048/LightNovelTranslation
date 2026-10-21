@@ -140,17 +140,18 @@ def _materialize_parent_rollup(repo, view, caller, root, children, fallback_reas
                        and node.get('state') in {'extracted','partial','summary_only'}
                        and set(node['source_ids']) <= set(ids)]
     covered = [cid for node in usable_children for cid in node['source_ids']]
-    if covered != ids:
-        raise NarrativeError('incomplete_incremental_index',
-            'L1 capacity fallback lacks usable L2 coverage: ' + root['node_id'])
+    missing = [cid for cid in ids if cid not in set(covered)]
     summary, summary_id = _parent_overview(repo, caller, usable_children, root['node_id'])
     payload = {'summary': summary, 'summary_revision': summary_id,
         'records': [record for node in usable_children for record in node.get('records', [])],
         'quarantined': [record for node in usable_children for record in node.get('quarantined', [])],
         'references': {key: value for node in usable_children
                        for key, value in node.get('references', {}).items()},
-        'state': 'partial' if any(node['state'] in {'partial','summary_only'} for node in usable_children) else 'extracted',
-        'failure_reason': None, 'open_prefix': root['state'] == 'open'}
+        'coverage_gaps': missing,
+        'state': 'partial' if missing or any(node['state'] in {'partial','summary_only'}
+                                             for node in usable_children) else 'extracted',
+        'failure_reason': 'incomplete_l2_coverage' if missing else None,
+        'open_prefix': root['state'] == 'open'}
     return _save(repo, view, root, ids, payload, method='child_summary_rollup',
                  fallback_reason=fallback_reason,
                  child_revisions=[node['id'] for node in usable_children],
@@ -161,7 +162,7 @@ def materialize_nodes(repo,spec,view,provider,*,force_open=False):
     if not repo.all_commits(): return []
     plan=current_index(repo,spec,view)
     recovery=ExtractionRecovery(repo.store,view.counter,provider,provider_identity=repo.manifest['provider'],
-        limits=sequence_limits(spec),max_retries=spec.max_attempts-1,capacity=spec.capacity,
+        limits=sequence_limits(repo,spec),max_retries=spec.max_attempts-1,capacity=spec.capacity,
         max_output_tokens=spec.capacity.max_output_tokens)
     # Summary-rollup parents are durable logical tasks too. Reuse the same
     # ledger and attempt cap as translation/checkpoint work so a retry or

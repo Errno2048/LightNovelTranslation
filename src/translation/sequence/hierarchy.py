@@ -316,7 +316,7 @@ def _extract(repo, spec, view, provider, node, ids, navigation=(), predecessors=
             return None, {'kind': 'local_context_limit', 'budget': budget}
         raise NarrativeError('budget_exceeded', 'index output reservation exceeds model capacity')
     recovery = ExtractionRecovery(repo.store, view.counter, provider,
-        provider_identity=repo.manifest['provider'], limits=sequence_limits(spec),
+        provider_identity=repo.manifest['provider'], limits=sequence_limits(repo,spec),
         max_retries=spec.max_attempts - 1, capacity=spec.capacity,
         max_output_tokens=spec.capacity.max_output_tokens)
     try:

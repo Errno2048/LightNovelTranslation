@@ -394,6 +394,34 @@ class TranslationJob:
         return self.run(**options)
 
     @operation
+    def extend_budget_limits(self, *, input_tokens: int | None = None,
+                             output_tokens: int | None = None,
+                             requests: int | None = None,
+                             reason: str) -> dict[str, Any]:
+        """Extend cumulative ledger caps without forking the frozen run."""
+        self._check()
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError('a reason is required')
+        limits = {}
+        for key, value in (('input_tokens', input_tokens),
+                           ('output_tokens', output_tokens),
+                           ('requests', requests)):
+            if value is None:
+                continue
+            if type(value) is not int or value <= 0:
+                raise ValueError('limits must be positive integers')
+            limits[key] = value
+        if not limits:
+            raise ValueError('at least one limit is required')
+        previous = [value for _, value in self.repo.store.objects('sequence-limits-extension')
+                    if value.get('run_id') == self.repo.run_id]
+        revision = max((value.get('revision', 0) for value in previous), default=0) + 1
+        record = {'run_id': self.repo.run_id, 'limits': limits,
+                  'reason': reason, 'revision': revision}
+        ident = self.repo.store.put('sequence-limits-extension', record)
+        return {'extension_id': ident, **record}
+
+    @operation
     def extend_revision_budget(self, *, additional_rounds: int = 1, reason: str) -> dict[str, Any]:
         """Append an explicit recovery allowance; preserve spec, responses and total ledger."""
         self._check()

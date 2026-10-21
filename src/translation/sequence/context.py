@@ -295,7 +295,7 @@ def build_checkpoint(repo,spec,view,*,caller=None,reason='initial',fault=None,pr
     return ident
 
 
-def compile_sequence_context(repo,spec,view,*,checkpoint_id=None):
+def compile_sequence_context(repo,spec,view,*,checkpoint_id=None,allowed_commits=None):
     checkpoint_id=checkpoint_id or repo.heads()['checkpoint']
     checkpoint=repo.store.get(checkpoint_id,'sequence-checkpoint')
     if checkpoint['run_id']!=repo.run_id:
@@ -316,6 +316,7 @@ def compile_sequence_context(repo,spec,view,*,checkpoint_id=None):
     injected_gaps={r['id']:r for r in checkpoint['workset'].get('extraction_gaps',[])}
     for ident,commit in repo.commits():
         if ident in checkpoint['commit_ids']: continue
+        if allowed_commits is not None and ident not in allowed_commits: continue
         source=view.body(commit['source_id'])
         assistant = commit['text']
         if repo.manifest['inputs'].get('history_output_profile') == 'source-records-v1':

@@ -8,7 +8,8 @@ import queue
 import threading
 import time
 
-from .batch import (_staged_snapshot, review_commit_window, translate_stage)
+from .batch import review_commit_window, translate_stage
+from .provisional import build_provisional_index
 
 
 def _window_docs(job, start, size):
@@ -16,13 +17,15 @@ def _window_docs(job, start, size):
     return targets[start:start + size]
 
 
-def _reuse_snapshot(job, docs):
+def _reuse_provisional(job, docs):
     chapters = {chapter['source_id']: chapter for chapter in job.repo.chapters()}
+    versions = {}
     for doc in docs:
         chapter = chapters.get(doc['chapter_id'], {})
         if not chapter.get('version_id') or chapter.get('state') == 'committed':
             return None
-    return _staged_snapshot(job, docs)
+        versions[doc['chapter_id']] = chapter['version_id']
+    return build_provisional_index(job, docs, versions)
 
 
 def run_pipeline(job, *, windows=3, size=30, translation_concurrency=None,
@@ -58,6 +61,8 @@ def run_pipeline_windows(job, window_docs, *, translation_concurrency=None,
         raise ValueError('lookahead must be a non-negative integer')
     if not window_docs:
         return {'state': 'no_targets'}
+    if getattr(job.engine, 'gate', None) is not None:
+        job.engine.gate.max_calls = max(8, translation_concurrency + review_concurrency)
 
     condition = threading.Condition()
     review_queue = queue.Queue()
@@ -106,12 +111,14 @@ def run_pipeline_windows(job, window_docs, *, translation_concurrency=None,
             if previous_reviewed:
                 provisional = None
             try:
-                snapshot = _reuse_snapshot(job, docs) if reuse_staged else None
+                snapshot = _reuse_provisional(job, docs) if reuse_staged else None
                 if snapshot is None:
+                    allowed = {ident for ident, _ in job.repo.commits()}
                     stage = translate_stage(job, docs,
                                             concurrency=translation_concurrency,
-                                            provisional=provisional)
-                    snapshot = stage.get('snapshot')
+                                            provisional=provisional,
+                                            allowed_commits=allowed)
+                    snapshot = stage.get('provisional_index')
                 snapshots[index] = snapshot
             except Exception as exc:
                 errors.append({'window': index, 'stage': 'translate',

@@ -10,11 +10,18 @@ from ..schemas import GenerationRequest
 from ..storage import digest
 
 
-def sequence_limits(spec):
+def sequence_limits(repo,spec):
     kinds=('translation','mapping','review','adjudication','revision','repair','summary','analysis','compression')
-    return {**{k+'_requests':spec.max_requests for k in kinds},'requests':spec.max_requests,
+    limits={**{k+'_requests':spec.max_requests for k in kinds},'requests':spec.max_requests,
             'input_tokens':spec.max_input_tokens,'output_tokens':spec.max_output_tokens,
             'context_limit':spec.capacity.context_window_tokens,'safety_tokens':spec.capacity.safety_tokens}
+    extensions=[value for _,value in repo.store.objects('sequence-limits-extension')
+                if value.get('run_id')==repo.run_id]
+    if extensions:
+        extension=max(extensions,key=lambda value:value.get('revision',0))
+        for key,value in extension.get('limits',{}).items():
+            if key in limits: limits[key]=value
+    return limits
 
 
 class SequenceCaller:
@@ -66,7 +73,7 @@ class SequenceCaller:
             # Object ID excludes its own id; ledger identity uses an equally
             # immutable request binding, not the database object's hash.
             request_id=self.store.put('sequence-request',request_data)
-            seq=self.store.reserve(request_data['id'],kind,report['safe_input_tokens'],output,sequence_limits(self.spec))
+            seq=self.store.reserve(request_data['id'],kind,report['safe_input_tokens'],output,sequence_limits(self.repo,self.spec))
             self.store.put('sequence-reservation',{'request_id':request_id,'ledger_identity':request_data['id'],'seq':seq})
             try:
                 if self.fault: self.fault('before_request')
@@ -108,7 +115,7 @@ class SequenceCaller:
             request_id=self.store.put('sequence-request',request_data)
             request_data['id']=request_id
             seq=self.store.reserve(request_data['id'],kind,report['safe_input_tokens'],output,
-                                   sequence_limits(self.spec),retry_failed=retry_failed)
+                                   sequence_limits(self.repo,self.spec),retry_failed=retry_failed)
             self.store.put('sequence-reservation',{'request_id':request_id,
                 'ledger_identity':request_data['id'],'seq':seq})
             prepared.append({'job':job,'task':task,'kind':kind,'role':role,'messages':messages,

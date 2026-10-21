@@ -33,8 +33,12 @@ from ..references import STABLE, prompt_projection
 
 class SequenceEngine:
     def __init__(self,repo,provider,counter,*,dictionary=None,fault=None,context_enricher=None):
-        self.repo,self.provider,self.counter=repo,provider,counter
+        self.repo,self.counter=repo,counter
         self.spec=SequenceSpec.from_dict(repo.manifest['spec'])
+        from .gate import GatedProvider, ModelGate
+        self.gate=ModelGate(max_calls=max(8,self.spec.translation_concurrency+
+            self.spec.review_concurrency),max_tokens=8_000_000)
+        self.provider=GatedProvider(provider,self.gate)
         self.dictionary,self.fault=dictionary,fault
         if context_enricher is None and repo.manifest['inputs'].get('reference_mode')=='cross_edition':
             from ..editions.sequence import CrossEditionSequenceBridge
@@ -45,7 +49,7 @@ class SequenceEngine:
         config=getattr(provider,'config',None)
         if config and config.public()!=repo.manifest['provider']:
             raise NarrativeError('conflict','model configuration changed; fork the run')
-        self.caller=SequenceCaller(repo,self.spec,counter,provider,fault=fault)
+        self.caller=SequenceCaller(repo,self.spec,counter,self.provider,fault=fault)
 
     def next_chapter(self):
         for ident,c in self.repo.commits(): self.repo.validate_commit(ident)
@@ -198,7 +202,7 @@ class SequenceEngine:
         self._require_paragraph_layout(version)
         broker=EvidenceBroker(view,chain_key=version_id,dictionary=self.dictionary,context=context)
         session=ReviewSession(view,self.provider,provider_identity=self.repo.manifest['provider'],
-            limits=sequence_limits(self.spec),capacity=self.spec.capacity,role_budgets=self.spec.roles,
+            limits=sequence_limits(self.repo,self.spec),capacity=self.spec.capacity,role_budgets=self.spec.roles,
             evidence_broker=broker,request_retries=self.spec.max_attempts-1,max_task_attempts=self.spec.max_attempts)
         # A chapter can restart between adjudication and patch application.
         # Keep that exact frozen review, including its presentation revision.
