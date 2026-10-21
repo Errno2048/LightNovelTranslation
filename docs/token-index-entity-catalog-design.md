@@ -118,6 +118,37 @@ workset 预计输入              388,927 tokens（上限 980,992）
 
 模型批量判定只解决了少量线程；真正降低 active 数量的是确定性 salience 筛选。这也说明不能只依赖一次模型调用做降级。
 
+### 窗口并行翻译
+
+公共入口：
+
+```python
+job.translate_window(size=None, concurrency=None, materialize=True)
+```
+
+- 窗口默认 `window_l2_blocks * child_max_chapters`，即 3 × 10 ≈ 30 章；
+- 窗口开始前从日文和历史实体/译名目录预抽取新专词，冻结 batch glossary；
+- 窗口内章节共享冻结 glossary 和窗口开始前的历史上下文，并行预翻译；
+- 已知历史译名不得被改译；历史实体从全部 L1/L2 ENTITY 读取，并统一用 `t2s` 转成简体注入；
+- 并行草稿只用于审校输入；按阅读顺序逐章审校/裁决/提交；
+- 并行审校的 minor confirmed 记入 unresolved 后允许提交；审校协议/覆盖不完整或 confirmed critical/major 才回退到串行重审；
+- 窗口全部提交后再统一 materialize，更新 L2/L1、实体目录和线程目录；
+- 同一窗口内后续章节看不到前章新译文，窗口结束后需要术语/语气一致性检查。
+
+2 章窗口试点：
+
+```text
+窗口章节                 2
+预抽取术语               17
+并行翻译完成             2 / 2
+提交                     2
+本轮请求                 18
+本轮 prompt tokens       1,338,101
+本轮 completion tokens   183,036
+```
+
+试点暴露并修复了一个重要问题：初版已知术语只读取了 selected workset 实体，导致已有的 `キーリ`、`アマゾネストレント`、`ガルデーニア` 被误当作新词，产生“琪莉 / 亞馬遜特倫特 / 加爾德尼亞”等不一致译名。现在已知术语来自全部历史 L1/L2 ENTITY，并用 `t2s` 统一注入简体。
+
 ### 真实续译试点
 
 第 186 话（157「等価交換」）已提交：

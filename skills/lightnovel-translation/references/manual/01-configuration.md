@@ -103,6 +103,9 @@ input_limit = min(context_window - requested_output - safety, max_input 或 cont
 | `mapping_profile` | `"coarse-v1"` | plain 输出映射协议，也支持 audit-v2 |
 | `translation_tools` | false，模板 true | 翻译阶段是否允许只读查证 |
 | `targeted_evidence` / `targeted_evidence_tokens` | true / 12288 | 定向术语及局部证据开关与上限 |
+| `workset_max_tokens` / `workset_recent_chapters` | 128000 / 25 | 压缩 workset 预算与近期窗口 |
+| `thread_reconcile` | false，模板 true | 封口 L1 时批量判定未决线程 |
+| `window_l2_blocks` / `translation_concurrency` | 3 / 3 | 窗口翻译的 L2 块数与并行翻译数 |
 | `output_profile` | `"source-records-v1"` | 逐源段输出；plain-v1 为兼容路径 |
 
 `source-records-v1` 要求 `stable-v1`。capacity、roles、累计请求/token 限额不能重复放进 sequence，分别在所属节配置。

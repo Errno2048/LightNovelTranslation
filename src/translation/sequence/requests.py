@@ -1,4 +1,5 @@
 """Durable, budgeted generation shared by translation and compression."""
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 
 from ..budget import (RoleBudget, plan_request, require_budget, observe_usage,
@@ -89,3 +90,53 @@ class SequenceCaller:
                 output=min(output*2,self.spec.capacity.max_output_tokens)
             elif last_error not in {'network','timeout','server','rate_limit'}: break
         raise NarrativeError(last_error or 'request_failed','bounded sequence task failed; raw attempts retained')
+
+    def call_many(self, jobs, *, workers=2):
+        """Reserve/settle serially, run independent provider calls concurrently."""
+        prepared=[]
+        for job in jobs:
+            task=job['task']; kind=job.get('kind','translation'); role=job.get('role','translator')
+            messages=job['messages']; role_budget=self.spec.roles[role]
+            output=job.get('max_tokens') or role_budget.requested_output_tokens
+            logical=digest({'run':self.repo.run_id,'task':task,'kind':kind})
+            profile=calibration_profile(self.identity,self.counter,role)
+            report=require_budget(plan_request(messages,self.spec.capacity,
+                RoleBudget(output,min(role_budget.reasoning_reserve_tokens,output-1)),self.counter,
+                profile=profile,calibration=read_calibration(self.store,profile)))
+            request_data={'schema':'sequence-request-v1','logical':logical,'task':task,'kind':kind,
+                'number':0,'messages':messages,'max_tokens':output,'provider':self.identity,'budget':report}
+            request_id=self.store.put('sequence-request',request_data)
+            request_data['id']=request_id
+            seq=self.store.reserve(request_data['id'],kind,report['safe_input_tokens'],output,
+                                   sequence_limits(self.spec))
+            self.store.put('sequence-reservation',{'request_id':request_id,
+                'ledger_identity':request_data['id'],'seq':seq})
+            prepared.append({'job':job,'task':task,'kind':kind,'role':role,'messages':messages,
+                'output':output,'report':report,'profile':profile,'seq':seq,
+                'request_id':request_data['id'],'request_object_id':request_id})
+        def run_one(item):
+            try:
+                result=self.provider.generate(GenerationRequest(item['messages'],
+                    max_tokens=item['output'],temperature=0,task='p7_'+item['kind']))
+                return {'generation':asdict(result)}
+            except ProviderError as exc:
+                return {'error':exc.kind,'details':exc.details}
+            except Exception as exc:
+                return {'error':'provider','details':{'transport_error':type(exc).__name__}}
+        with ThreadPoolExecutor(max_workers=max(1,workers)) as pool:
+            raws=list(pool.map(run_one,prepared))
+        results=[]
+        for item,raw in zip(prepared,raws):
+            raw={'request_id':item['request_id'],'request_object_id':item['request_object_id'],**raw}
+            raw_id=self.store.put('sequence-response',raw)
+            usage=raw.get('generation',{}).get('usage',raw.get('details',{}).get('usage',{}))
+            if usage:
+                self.store.put('budget-calibration',observe_usage(item['report'],usage,
+                    read_calibration(self.store,item['profile'])))
+            last_error=raw.get('error')
+            self.store.finish(item['seq'],
+                'unknown_remote_result' if last_error in {'network','timeout'} else
+                'failed' if last_error else 'completed',
+                {'response_id':raw_id,'usage':usage,'error':last_error})
+            results.append({'id':raw_id,**raw})
+        return results

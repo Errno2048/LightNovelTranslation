@@ -27,6 +27,8 @@ class ReviewSession:
         self.role_budgets = role_budgets or {}
         self.max_task_attempts=max_task_attempts
         self.logical_task=None
+        self._task_key=None
+        self._task_used=0
         if type(request_retries) is not int or not 0<=request_retries<=2:
             raise ValueError('at most two explicit transport retries')
         self.request_retries=request_retries
@@ -127,14 +129,22 @@ class ReviewSession:
                 if error_kind in {'network','timeout','rate_limit','server'}:
                     raise ProviderError(error_kind,'retained earlier failure; reservation remains charged')
         if self.max_task_attempts is not None:
-            used=[x for _,x in self.view.store.objects('review-request') if x.get('logical_task')==self.logical_task]
-            if len(used)>=self.max_task_attempts:
+            if self._task_key != self.logical_task:
+                with self.view.store.lock:
+                    self._task_used = self.view.store.db.execute(
+                        "SELECT COUNT(*) FROM objects WHERE kind='review-request' "
+                        "AND json_extract(payload,'$.logical_task')=?",
+                        (self.logical_task,)).fetchone()[0]
+                self._task_key = self.logical_task
+            if self._task_used >= self.max_task_attempts:
                 raise NarrativeError('budget_exceeded','shared logical task retry/tool-call cap reached')
         seq = self.view.store.reserve(identity, kind, estimate, max_tokens, self.limits)
         self.view.store.put("review-request", {**value, "identity": identity, "input_reserved": estimate,
                                               "output_reserved": max_tokens, "limits": self.limits,
                                               **({'logical_task':self.logical_task} if self.max_task_attempts is not None else {}),
                                               **({'budget':budget} if budget else {})})
+        if self.max_task_attempts is not None:
+            self._task_used += 1
         try:
             result = self.provider.generate(request)
             saved = {**value, "identity": identity, "generation": asdict(result)}

@@ -76,8 +76,15 @@ class SequenceRepository:
                 (state,json.dumps(value,ensure_ascii=False,sort_keys=True),source_id))
 
     def commits(self):
-        return [(r[0],self.store.get(r[0],'chapter-commit')) for r in self.db.execute(
-            'SELECT c.id FROM sequence_commits c JOIN sequence_chapters s ON c.source_id=s.source_id ORDER BY s.position')]
+        with self.store.lock:
+            cached = getattr(self, '_commits_cache', None)
+            if cached is None:
+                cached = [(r[0], self.store.get(r[0], 'chapter-commit'))
+                          for r in self.db.execute(
+                              'SELECT c.id FROM sequence_commits c JOIN sequence_chapters s '
+                              'ON c.source_id=s.source_id ORDER BY s.position')]
+                self._commits_cache = cached
+            return cached
 
     def inherited_commits(self):
         return [(r['id'],r['commit']) for r in self.manifest['inputs'].get('inherited_commits',[])]
@@ -143,6 +150,7 @@ class SequenceRepository:
                     ensure_ascii=False),prepared['source_id']))
             if fault: fault('inside_commit')
             self.db.commit()
+            self._commits_cache = None
         except BaseException:
             self.db.rollback(); raise
         if fault: fault('after_commit')
@@ -171,6 +179,8 @@ class SequenceRepository:
                     stale.append(ident)
         with self.db:
             self.db.executemany('INSERT OR REPLACE INTO sequence_invalidations VALUES(?,?)',[(x,reason) for x in stale])
+        self._latest_nodes_cache = None
+        self._latest_incremental_nodes_cache = None
         return stale
 
 

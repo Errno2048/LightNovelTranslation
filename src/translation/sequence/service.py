@@ -18,6 +18,16 @@ from .view import SequenceNarrativeView
 from .context import (build_checkpoint, compile_sequence_context, input_soft_limit, budget_for)
 from .knowledge import materialize_nodes
 from .hierarchy import enabled as hierarchy_enabled, materialize_hierarchy, pending_report, index_snapshot
+
+try:
+    from opencc import OpenCC
+    _T2S = OpenCC('t2s')
+except Exception:
+    _T2S = None
+
+
+def _simplify_translation(text):
+    return _T2S.convert(text) if _T2S is not None else text
 from ..references import STABLE, prompt_projection
 
 
@@ -163,6 +173,24 @@ class SequenceEngine:
             latest_nodes(self.repo)+latest_incremental_nodes(self.repo),allow_model=True)
         result['thread_catalog']=read_thread_catalog(self.repo,before_order=view.target_order)
         return result
+
+    def review_many(self, entries, *, workers=3):
+        """Run independent chapter reviews concurrently; store writes are locked."""
+        from concurrent.futures import ThreadPoolExecutor
+        def run(entry):
+            source_id, context, version_id = entry
+            view = self.view(source_id)
+            result, _ = self._review(view, context, version_id)
+            return source_id, result
+        results = []
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            futures = [pool.submit(run, entry) for entry in entries]
+            for future in futures:
+                try:
+                    results.append(future.result())
+                except Exception as exc:
+                    results.append((None, {'error': str(exc)}))
+        return results
 
     def _review(self,view,context,version_id):
         from ..review.requests import ReviewSession
@@ -377,13 +405,15 @@ class SequenceEngine:
                         raw,extra=self._translate(view,context,cid)
                         text=(raw['parsed_output']['text'] if raw.get('parsed_output') else
                               raw['generation']['text'].replace('\r\n','\n').replace('\r','\n').rstrip('\n'))
+                        text=_simplify_translation(text)
                         vid=create_version(view,context,text,finish_reason=raw['generation']['finish_reason'],
                             additional_dependencies=extra,
                             output_generation=raw['id'] if raw.get('parsed_output') else None)
                         self.repo.stage(cid,'generated',version_id=vid,generation_id=raw['id'])
                     result,session=self._review(view,context,vid)
                     self.repo.stage(cid,'review_finished',review=result)
-                    while result['confirmed'] and read_version(view,vid)['round']<self.repo.revision_limit(cid,self.spec.max_revisions):
+                    while (result['confirmed'] and not result.get('minor_only') and
+                           read_version(view,vid)['round']<self.repo.revision_limit(cid,self.spec.max_revisions)):
                         proposal=propose_revision(session,vid,result['report_id'],result['adjudication_id'])
                         try:
                             revised=apply_revision(view,vid,proposal)

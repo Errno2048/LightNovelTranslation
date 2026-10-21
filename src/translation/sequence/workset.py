@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 from collections import Counter
 
 from ..storage import digest
@@ -297,6 +298,24 @@ def _catalog_entry(item, selected):
     return entry
 
 
+_CATALOG_INDEX_LOCK = threading.RLock()
+
+
+def _catalog_index(repo):
+    """Keep catalog metadata in memory; the payloads are large and immutable."""
+    with _CATALOG_INDEX_LOCK:
+        index = getattr(repo, '_workset_catalog_index', None)
+        with repo.store.lock:
+            count = repo.store.db.execute(
+                "SELECT COUNT(*) FROM objects WHERE kind='sequence-workset-catalog'").fetchone()[0]
+        if index is None or len(index) != count:
+            index = [(ident, value.get('run_id'), value.get('fingerprint'),
+                      value.get('revision', 0))
+                     for ident, value in repo.store.objects('sequence-workset-catalog')]
+            repo._workset_catalog_index = index
+        return index
+
+
 def select_workset(repo, spec, view, nodes, target_text, target_order, *,
                    entity_catalog_id, entity_cards, entity_records, records,
                    core, unresolved, gaps, threads=None):
@@ -358,18 +377,17 @@ def select_workset(repo, spec, view, nodes, target_text, target_order, *,
         'threads': sorted((thread.get('thread_id'), thread.get('status'),
                            thread.get('revision')) for thread in thread_values),
     })
-    existing = next((ident for ident, value in repo.store.objects('sequence-workset-catalog')
-                     if value.get('run_id') == repo.run_id and
-                     value.get('fingerprint') == fingerprint), None)
+    index = _catalog_index(repo)
+    existing = next((ident for ident, run_id, catalog_fingerprint, revision in index
+                     if run_id == repo.run_id and catalog_fingerprint == fingerprint), None)
     if existing:
         catalog_id = existing
     else:
-        revisions = [value.get('revision', 0)
-                     for _, value in repo.store.objects('sequence-workset-catalog')]
+        revision = max((entry[3] for entry in index), default=0) + 1
         catalog = {
             'schema': 'sequence-workset-catalog-v1', 'run_id': repo.run_id,
             'target_id': view.policy.target_id, 'target_order': target_order,
-            'revision': max(revisions, default=0) + 1,
+            'revision': revision,
             'budget_tokens': budget, 'used_tokens': sum(fixed) + entity_cost + knowledge_cost,
             'entities': [_catalog_entry(item, True) for item in entity_selected],
             'selected': [_catalog_entry(item, True) for item in selected],
@@ -378,6 +396,8 @@ def select_workset(repo, spec, view, nodes, target_text, target_order, *,
             'fingerprint': fingerprint,
         }
         catalog_id = repo.store.put('sequence-workset-catalog', catalog)
+        with _CATALOG_INDEX_LOCK:
+            index.append((catalog_id, catalog['run_id'], catalog['fingerprint'], revision))
     selected_counts = Counter(item['record'].get('type') for item in selected)
     selected_counts['ENTITY'] += len(entity_selected)
     omitted_counts = Counter(item['record'].get('type') for item in omitted)

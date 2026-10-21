@@ -32,6 +32,23 @@ def make_history(tmp_path, *, provider=None, history=12, total=22, config=None, 
     return project,source,reference,job,provider
 
 
+def test_confirmed_severities_are_read_from_the_report():
+    from translation.sequence.batch import _confirmed_severities
+    class Store:
+        def get(self, ident, kind):
+            assert ident == 'report' and kind == 'review-report'
+            return {'findings': [{'id': 'f1', 'severity': 'minor'},
+                                 {'id': 'f2', 'severity': 'major'}]}
+    class Job:
+        repo = type('Repo', (), {'store': Store()})()
+    job = Job()
+    assert _confirmed_severities(job, {'confirmed': ['f1'], 'report_id': 'report'}) == {'minor'}
+    assert _confirmed_severities(job, {'confirmed': ['f2'], 'report_id': 'report'}) == {'major'}
+    assert _confirmed_severities(job, {'confirmed': []}) == set()
+    assert _confirmed_severities(job, {'confirmed': ['f1']}) is None
+    assert _confirmed_severities(job, {'confirmed': ['missing'], 'report_id': 'report'}) is None
+
+
 def assert_cover(context, expected):
     counts=Counter(cid for row in context['coverage'] for cid in row['source_ids'])
     assert counts==Counter(expected)

@@ -60,6 +60,8 @@ targeted_evidence = true
 workset_max_tokens = 128000
 workset_recent_chapters = 25
 thread_reconcile = true
+window_l2_blocks = 3
+translation_concurrency = 3
 output_profile = "source-records-v1"
 
 [references]

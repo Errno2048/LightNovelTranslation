@@ -188,6 +188,12 @@ def plan_hierarchy(repo, spec, view):
 
 def latest_nodes(repo, *, allowed_source_ids=None):
     from .knowledge import node_is_valid
+    key = (repo.run_id,
+           frozenset(allowed_source_ids) if allowed_source_ids is not None else None,
+           repo.store.kind_version('sequence-hierarchy-node'))
+    cached = getattr(repo, '_latest_nodes_cache', None)
+    if cached is not None and cached[0] == key:
+        return list(cached[1])
     allowed = set(allowed_source_ids) if allowed_source_ids is not None else None
     grouped = {}
     for ident, node in repo.store.objects('sequence-hierarchy-node'):
@@ -197,7 +203,9 @@ def latest_nodes(repo, *, allowed_source_ids=None):
         previous = grouped.get(node['node_id'])
         if previous is None or len(node['source_ids']) > len(previous['source_ids']):
             grouped[node['node_id']] = {'id': ident, **node}
-    return sorted(grouped.values(), key=lambda n: (n['start_position'], n['level']))
+    result = sorted(grouped.values(), key=lambda n: (n['start_position'], n['level']))
+    repo._latest_nodes_cache = (key, result)
+    return result
 
 
 def latest_incremental_nodes(repo, *, allowed_source_ids=None):
@@ -210,6 +218,12 @@ def latest_incremental_nodes(repo, *, allowed_source_ids=None):
     """
     from .knowledge import node_is_valid
 
+    key = (repo.run_id,
+           frozenset(allowed_source_ids) if allowed_source_ids is not None else None,
+           repo.store.kind_version('sequence-node'))
+    cached = getattr(repo, '_latest_incremental_nodes_cache', None)
+    if cached is not None and cached[0] == key:
+        return list(cached[1])
     allowed = set(allowed_source_ids) if allowed_source_ids is not None else None
     grouped = {}
     for ident, node in repo.store.objects('sequence-node'):
@@ -223,7 +237,9 @@ def latest_incremental_nodes(repo, *, allowed_source_ids=None):
         if previous is None or (len(node['source_ids']), node.get('end_position', -1), ident) > \
                 (len(previous['source_ids']), previous.get('end_position', -1), previous['id']):
             grouped[node['node_id']] = {'id': ident, **node}
-    return sorted(grouped.values(), key=lambda n: (n['start_position'], n['end_position'], n['level']))
+    result = sorted(grouped.values(), key=lambda n: (n['start_position'], n['end_position'], n['level']))
+    repo._latest_incremental_nodes_cache = (key, result)
+    return result
 
 
 def _desired_ids(repo, node, plan, force_open=False):

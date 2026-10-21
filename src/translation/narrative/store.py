@@ -1,18 +1,25 @@
 """Append-only content-addressed objects and durable request attempts in SQLite."""
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
 from ..storage import digest, write_json
 from .schemas import NarrativeError
 
+OBJECT_CACHE_LIMIT = 16 * 1024 * 1024
+
 
 class NarrativeStore:
     def __init__(self, path: Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path)
+        self.lock = threading.RLock()
+        self._object_cache = {}
+        self._object_cache_bytes = 0
+        self._kind_versions = {}
+        self.db = sqlite3.connect(self.path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.executescript("""
           CREATE TABLE IF NOT EXISTS objects (id TEXT PRIMARY KEY, kind TEXT NOT NULL, payload TEXT NOT NULL);
@@ -23,30 +30,68 @@ class NarrativeStore:
         self.db.commit()
 
     def close(self):
-        self.db.close()
+        with self.lock:
+            self.db.close()
 
     def put(self, kind, data):
-        ident = kind + ":" + digest(data)
-        encoded = json.dumps(data, ensure_ascii=False, sort_keys=True)
-        with self.db:
-            self.db.execute("INSERT OR IGNORE INTO objects VALUES(?,?,?)", (ident, kind, encoded))
-        return ident
+        with self.lock:
+            ident = kind + ":" + digest(data)
+            encoded = json.dumps(data, ensure_ascii=False, sort_keys=True)
+            with self.db:
+                self.db.execute("INSERT OR IGNORE INTO objects VALUES(?,?,?)", (ident, kind, encoded))
+            self._kind_versions[kind] = self._kind_versions.get(kind, 0) + 1
+            cached = self._object_cache.pop(kind, None)
+            if cached is not None:
+                self._object_cache_bytes -= cached[2]
+            return ident
 
     def get(self, ident, kind=None):
-        row = self.db.execute("SELECT kind,payload FROM objects WHERE id=?", (ident,)).fetchone()
-        if not row or (kind and row[0] != kind):
-            raise NarrativeError("coverage_gap", "missing immutable object: " + ident)
-        data = json.loads(row[1])
-        if ident != row[0] + ":" + digest(data):
-            raise NarrativeError("stale_summary", "stored object failed hash validation")
-        return data
+        with self.lock:
+            row = self.db.execute("SELECT kind,payload FROM objects WHERE id=?", (ident,)).fetchone()
+            if not row or (kind and row[0] != kind):
+                raise NarrativeError("coverage_gap", "missing immutable object: " + ident)
+            data = json.loads(row[1])
+            if ident != row[0] + ":" + digest(data):
+                raise NarrativeError("stale_summary", "stored object failed hash validation")
+            return data
 
     def objects(self, kind):
-        return [(row[0], self.get(row[0], kind)) for row in self.db.execute(
-            "SELECT id FROM objects WHERE kind=? ORDER BY id", (kind,)).fetchall()]
+        with self.lock:
+            version = self._kind_versions.get(kind, 0)
+            cached = self._object_cache.get(kind)
+            if cached is not None and cached[0] == version:
+                return list(cached[1])
+            rows = self.db.execute("SELECT id,payload FROM objects WHERE kind=? ORDER BY id",
+                                   (kind,)).fetchall()
+            result = []
+            size = 0
+            for ident, payload in rows:
+                data = json.loads(payload)
+                if ident != kind + ":" + digest(data):
+                    raise NarrativeError("stale_summary", "stored object failed hash validation")
+                result.append((ident, data))
+                size += len(payload)
+            if size <= OBJECT_CACHE_LIMIT:
+                self._object_cache[kind] = (version, result, size)
+                self._object_cache_bytes += size
+                while (self._object_cache_bytes > OBJECT_CACHE_LIMIT and
+                       len(self._object_cache) > 1):
+                    oldest = next(iter(self._object_cache))
+                    _, _, old_size = self._object_cache.pop(oldest)
+                    self._object_cache_bytes -= old_size
+            return result
+
+    def kind_version(self, kind):
+        with self.lock:
+            return self._kind_versions.get(kind, 0)
 
     def reserve(self, identity, kind, input_tokens, output_tokens, limits, *, retry_failed=False):
         # Reserve before making any HTTP request. Crashes/unknown billing retain the reservation.
+        with self.lock:
+            return self._reserve_locked(identity, kind, input_tokens, output_tokens, limits,
+                                        retry_failed=retry_failed)
+
+    def _reserve_locked(self, identity, kind, input_tokens, output_tokens, limits, *, retry_failed=False):
         self.db.execute("BEGIN IMMEDIATE")
         try:
             old = self.db.execute("SELECT status FROM attempts WHERE identity=? ORDER BY seq DESC LIMIT 1", (identity,)).fetchone()
@@ -74,19 +119,22 @@ class NarrativeStore:
         return cursor.lastrowid
 
     def finish(self, seq, status, result):
-        with self.db:
-            self.db.execute("UPDATE attempts SET status=?,payload=? WHERE seq=?",
-                            (status, json.dumps(result, ensure_ascii=False, sort_keys=True), seq))
+        with self.lock:
+            with self.db:
+                self.db.execute("UPDATE attempts SET status=?,payload=? WHERE seq=?",
+                                (status, json.dumps(result, ensure_ascii=False, sort_keys=True), seq))
 
     def attempts(self):
-        return [{"seq": r[0], "identity": r[1], "kind": r[2], "input_reserved": r[3],
-                 "output_reserved": r[4], "status": r[5], **json.loads(r[6])}
-                for r in self.db.execute("SELECT * FROM attempts ORDER BY seq")]
+        with self.lock:
+            return [{"seq": r[0], "identity": r[1], "kind": r[2], "input_reserved": r[3],
+                     "output_reserved": r[4], "status": r[5], **json.loads(r[6])}
+                    for r in self.db.execute("SELECT * FROM attempts ORDER BY seq")]
 
     def export(self, path):
-        data = {"version": "narrative-export-v1", "objects": [
-            {"id": r[0], "kind": r[1], "data": self.get(r[0])}
-            for r in self.db.execute("SELECT id,kind FROM objects ORDER BY id")]}
-        data["fingerprint"] = digest(data)
-        write_json(path, data)
-        return data["fingerprint"]
+        with self.lock:
+            data = {"version": "narrative-export-v1", "objects": [
+                {"id": r[0], "kind": r[1], "data": self.get(r[0])}
+                for r in self.db.execute("SELECT id,kind FROM objects ORDER BY id")]}
+            data["fingerprint"] = digest(data)
+            write_json(path, data)
+            return data["fingerprint"]

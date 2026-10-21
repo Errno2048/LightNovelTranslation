@@ -126,6 +126,36 @@ with project.open_job("continuation-v2") as job:
 
 阶段 B 的参考检查分三层：`reference_report` 是冻结的候选包，`plan_next` 的 `historical_index` / `context.coverage` 是历史索引覆盖，`plan_next.context.edition_reference_selection` 才是经过最终容量检查的入选中文参考。report 的 `actual_style_document_ids` 给出已保存翻译上下文选入的正文；尚未保存上下文时为 null。上下文可先于 HTTP 请求保存，是否实际发送仍用 `explain` 的 actual-request 确认。发现没有中文正文时先查 omissions，不能把这一轮作为中文 few-shot 效果证据。
 
+### 4.1 窗口并行翻译与批量 materialize
+
+长任务默认按窗口执行，不再每章 materialize：
+
+```python
+result = job.translate_window(
+    size=None,          # 默认 window_l2_blocks * child_max_chapters，约 30 章
+    concurrency=None,   # 默认 translation_concurrency
+    materialize=True,   # 窗口提交后统一 materialize
+)
+```
+
+窗口流程：
+
+1. 按 `window_l2_blocks`（默认 3）和 `child_max_chapters`（默认 10）确定约 30 章的窗口；
+2. 从窗口日文和历史实体/译名目录预抽取新专词，冻结窗口 glossary；
+3. 同一窗口内的章节并行预翻译，共享冻结 glossary 和窗口开始前的历史上下文；
+4. 按阅读顺序逐章审校、裁决、提交；同窗口内后续章节**不会**看到前章新译文；并行审校的 minor confirmed 记入 unresolved 后允许 prepare/commit，仅审校协议/覆盖不完整或 confirmed critical/major 回退到串行重审；
+5. 窗口全部提交后再 materialize 一次，更新 L2/L1、实体目录和线程目录；
+6. 若 L1 已封口，再执行 L1 批量线程判定；
+7. 重建下一窗口的 workset/checkpoint。
+
+约束：
+
+- 窗口内并行翻译只用于草稿；正式译文侧索引只在审校/提交后 materialize；
+- 新专词必须有窗口日文证据；已有历史译名不得被模型改译；
+- 同窗口译文可能出现术语/语气差异，窗口结束后应做一次一致性检查；
+- `translation_concurrency` 受实际模型端点并发和限流约束；
+- 提交顺序、L1 汇总、线程目录合并和下一窗口上下文仍必须串行。
+
 ## 5. 恢复、增量与交付
 
 ```python

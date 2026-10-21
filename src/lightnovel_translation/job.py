@@ -238,6 +238,15 @@ class TranslationJob:
         self.project._require_generation()
         return self.engine.reconcile_threads()
 
+    def translate_window(self, *, size: int | None = None, concurrency: int | None = None,
+                         materialize: bool = True) -> dict[str, Any]:
+        """Pre-extract window terms, translate concurrently, then review/commit in order."""
+        self._check()
+        self.project._require_generation()
+        from translation.sequence.batch import run_window
+        return run_window(self, size=size, concurrency=concurrency,
+                          materialize=materialize)
+
     def thread_catalog(self) -> dict[str, Any]:
         """Read the compact unresolved-thread catalog for the current target."""
         from translation.sequence.threads import read_thread_catalog
