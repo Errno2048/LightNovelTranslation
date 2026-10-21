@@ -305,9 +305,7 @@ def _catalog_index(repo):
     """Keep catalog metadata in memory; the payloads are large and immutable."""
     with _CATALOG_INDEX_LOCK:
         index = getattr(repo, '_workset_catalog_index', None)
-        with repo.store.lock:
-            count = repo.store.db.execute(
-                "SELECT COUNT(*) FROM objects WHERE kind='sequence-workset-catalog'").fetchone()[0]
+        count = repo.store.count('sequence-workset-catalog')
         if index is None or len(index) != count:
             index = [(ident, value.get('run_id'), value.get('fingerprint'),
                       value.get('revision', 0))

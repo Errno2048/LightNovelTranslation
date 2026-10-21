@@ -21,6 +21,16 @@ class FrozenArchive:
                 self.add(doc,doc.get('canonical_source_id',doc['chapter_id'] if doc['language']=='ja' else None))
         self.sources={c['match_key']:c for c in self.chapters.values() if c['language']=='ja'}
 
+    def clone(self):
+        other=object.__new__(FrozenArchive)
+        other.chapters=dict(self.chapters)
+        other.rows=dict(self.rows)
+        other.canonical_ids=dict(self.canonical_ids)
+        other.input_identity=self.input_identity
+        other.fingerprint=self.fingerprint
+        other.sources=dict(self.sources)
+        return other
+
     def add(self,doc,canonical):
         if not canonical:
             raise NarrativeError('invalid_record','historical Chinese needs a canonical source binding')
@@ -51,7 +61,14 @@ class SequenceNarrativeView(NarrativeView):
     def __init__(self,repo,target_id,counter):
         self.repo=repo
         manifest=repo.manifest; inputs=manifest['inputs']
-        archive=FrozenArchive(inputs)
+        base=getattr(repo,'_frozen_archive',None)
+        if base is None:
+            with repo._archive_lock:
+                base=getattr(repo,'_frozen_archive',None)
+                if base is None:
+                    base=FrozenArchive(inputs)
+                    repo._frozen_archive=base
+        archive=base.clone()
         if target_id is None:
             committed={c['source_id'] for _,c in repo.all_commits()}
             cutoff=max((archive.chapters[c]['order'] for c in committed),default=-1)
@@ -90,14 +107,22 @@ class SequenceNarrativeView(NarrativeView):
             row=self.repo.db.execute('SELECT acceptance_id FROM accepted_heads WHERE source_id=?',(c['source_id'],)).fetchone()
             if not row or row[0]!=c['acceptance_id']:
                 raise NarrativeError('stale_summary','formal acceptance has been superseded or revoked')
+        cache=getattr(self.repo,'_generated_documents',None)
+        if cache is None:
+            cache={}; self.repo._generated_documents=cache
+        cached=cache.get(commit_id)
+        if cached is not None:
+            return cached
         text=c['text']; paragraphs=text.splitlines()
-        return {'chapter_id':'generated:sequence:'+digest({'run':self.repo.run_id,'commit':commit_id})[:24],
+        doc={'chapter_id':'generated:sequence:'+digest({'run':self.repo.run_id,'commit':commit_id})[:24],
             'revision_id':c['version_id'],'language':'zh','match_key':source['match_key'],'order':source['order'],
             'title':source['title'],'text':text,'text_hash':digest(text),
             'paragraph_ids':['generated:sequence:'+digest([commit_id,i])[:24] for i in range(len(paragraphs))],
             'paragraph_texts':paragraphs,'source':'generated_accepted' if c.get('acceptance_id') else 'generated_working',
             'canonical_source_id':c['source_id'],'commit_id':commit_id,'branch_id':self.repo.run_id,
             'quality_labels':c['quality_labels'],'unresolved':c['unresolved']}
+        cache[commit_id]=doc
+        return doc
 
     def body(self,chapter_id,*,task=False):
         if chapter_id.startswith('generated:sequence:'):

@@ -132,9 +132,11 @@ with project.open_job("continuation-v2") as job:
 
 ```python
 result = job.translate_window(
-    size=None,          # 默认 window_l2_blocks * child_max_chapters，约 30 章
-    concurrency=None,   # 默认 translation_concurrency
-    materialize=True,   # 窗口提交后统一 materialize
+    size=None,              # 默认 window_l2_blocks * child_max_chapters，约 30 章
+    concurrency=None,       # 默认 translation_concurrency；翻译可高并发
+    review_concurrency=None,# 默认 review_concurrency；审校建议 4-8
+    materialize=True,       # 窗口提交后统一 materialize
+    reuse_staged=False,     # 中断后续跑时复用已生成版本
 )
 ```
 
@@ -153,7 +155,7 @@ result = job.translate_window(
 - 窗口内并行翻译只用于草稿；正式译文侧索引只在审校/提交后 materialize；
 - 新专词必须有窗口日文证据；已有历史译名不得被模型改译；
 - 同窗口译文可能出现术语/语气差异，窗口结束后应做一次一致性检查；
-- `translation_concurrency` 受实际模型端点并发和限流约束；
+- `translation_concurrency` 受实际模型端点并发和限流约束；`review_concurrency` 应独立设置，通常低于翻译并发；
 - 提交顺序、L1 汇总、线程目录合并和下一窗口上下文仍必须串行。
 
 ## 5. 恢复、增量与交付

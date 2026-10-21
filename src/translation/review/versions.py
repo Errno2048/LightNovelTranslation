@@ -168,6 +168,13 @@ def validate_output_binding(view, value, context):
 
 def read_version(view, version_id):
     value = view.store.get(version_id, "translation-version")
+    cache = getattr(view.store, '_validated_versions', None)
+    if cache is None:
+        cache = {}
+        view.store._validated_versions = cache
+    cached = cache.get(version_id)
+    if cached is not None:
+        return cached
     context = view.store.get(value["context_id"], "review-context")
     validate_context(view, context)
     validate_additional_dependencies(view, value.get("additional_dependencies", []))
@@ -184,4 +191,5 @@ def read_version(view, version_id):
         raise NarrativeError("stale_summary", "translation version binding changed")
     if value.get('output_binding'):
         validate_output_binding(view, value, context)
+    cache[version_id] = value
     return value

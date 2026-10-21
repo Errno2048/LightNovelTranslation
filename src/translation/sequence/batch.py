@@ -5,8 +5,9 @@ import json
 import re
 import unicodedata
 
+from ..narrative.schemas import NarrativeError
 from ..references import pair_rows
-from ..review.versions import create_version, source_segments
+from ..review.versions import create_version, read_version, source_segments
 from ..storage import digest
 from .context import compile_sequence_context
 from .output import parse_output, recovery_feedback
@@ -290,40 +291,69 @@ def _confirmed_severities(job, result):
     return {severities[finding_id] for finding_id in result['confirmed']}
 
 
-def run_window(job, *, size=None, concurrency=None, materialize=True):
+def run_window(job, *, size=None, concurrency=None, review_concurrency=None,
+               materialize=True, reuse_staged=False):
     """Pre-extract terms, translate a window concurrently, then review/commit in order."""
     spec = job.engine.spec
     size = size or max(2, spec.window_l2_blocks * spec.child_max_chapters)
     concurrency = concurrency or spec.translation_concurrency
+    review_concurrency = review_concurrency or spec.review_concurrency
     window = _window_targets(job, size)
     if not window:
         return {'state': 'no_targets'}
     before_cost = job.cost_usage()
-    known = _known_glossary(job)
-    glossary = _extract_glossary(job, window, known)
-    items = _batch_contexts(job, window, glossary)
-    translations = _parallel_translate(job, items, concurrency)
-    items_by_id = {item['doc']['chapter_id']: item for item in items}
+    chapters = {chapter['source_id']: chapter for chapter in job.repo.chapters()}
     versions = {}
+    translations = {}
+    missing = []
+    for doc in window:
+        chapter = chapters.get(doc['chapter_id'], {})
+        if (reuse_staged and chapter.get('version_id') and
+                chapter.get('state') != 'committed'):
+            versions[doc['chapter_id']] = chapter['version_id']
+            translations[doc['chapter_id']] = {
+                'status': 'staged', 'generation_id': chapter.get('generation_id')}
+        else:
+            missing.append(doc)
+    glossary = {}
+    if missing:
+        known = _known_glossary(job)
+        glossary = _extract_glossary(job, missing, known)
+        items = _batch_contexts(job, missing, glossary)
+        items_by_id = {item['doc']['chapter_id']: item for item in items}
+        translations.update(_parallel_translate(job, items, concurrency))
+        for doc in missing:
+            source_id = doc['chapter_id']
+            translated = translations.get(source_id, {})
+            if translated.get('status') != 'complete':
+                continue
+            item = items_by_id[source_id]
+            try:
+                vid = create_version(item['view'], item['context'], translated['text'],
+                                     finish_reason='stop')
+            except Exception:
+                continue
+            job.repo.stage(source_id, 'generated', version_id=vid,
+                           generation_id=translated.get('generation_id'))
+            versions[source_id] = vid
     review_entries = []
+    review_ok = {}
     for doc in window:
         source_id = doc['chapter_id']
-        translated = translations.get(source_id, {})
-        if translated.get('status') != 'complete':
+        vid = versions.get(source_id)
+        if not vid:
             continue
-        item = items_by_id[source_id]
-        try:
-            vid = create_version(item['view'], item['context'], translated['text'],
-                                 finish_reason='stop')
-        except Exception:
+        chapter = chapters.get(source_id, {})
+        if (reuse_staged and chapter.get('state') == 'review_finished' and
+                chapter.get('review')):
+            review_ok[source_id] = chapter['review']
             continue
-        job.repo.stage(source_id, 'generated', version_id=vid,
-                       generation_id=translated.get('generation_id'))
-        versions[source_id] = vid
-        review_entries.append((source_id, item['context'], vid))
-    review_results = job.engine.review_many(review_entries, workers=concurrency) \
+        view = job.engine.view(source_id)
+        version = read_version(view, vid)
+        context = job.repo.store.get(version['context_id'], 'review-context')
+        review_entries.append((source_id, context, vid))
+    review_results = job.engine.review_many(review_entries, workers=review_concurrency) \
         if review_entries else []
-    review_ok = {}
     review_fallback = {}
     for source_id, result in review_results:
         if source_id is None:
@@ -347,6 +377,15 @@ def run_window(job, *, size=None, concurrency=None, materialize=True):
     committed = []
     for doc in window:
         source_id = doc['chapter_id']
+        chapter = next((c for c in job.repo.chapters() if c['source_id'] == source_id), None)
+        if (chapter and chapter['state'] == 'review_finished' and
+                chapter.get('review') and chapter.get('version_id')):
+            try:
+                job.engine.commit_reviewed(source_id)
+                committed.append(source_id)
+                continue
+            except NarrativeError:
+                pass
         result = job.run(max_chapters=1, materialize=False)
         if not result.ok or result.committed_count == 0:
             if source_id in review_ok:

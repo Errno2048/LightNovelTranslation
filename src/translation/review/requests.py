@@ -130,11 +130,8 @@ class ReviewSession:
                     raise ProviderError(error_kind,'retained earlier failure; reservation remains charged')
         if self.max_task_attempts is not None:
             if self._task_key != self.logical_task:
-                with self.view.store.lock:
-                    self._task_used = self.view.store.db.execute(
-                        "SELECT COUNT(*) FROM objects WHERE kind='review-request' "
-                        "AND json_extract(payload,'$.logical_task')=?",
-                        (self.logical_task,)).fetchone()[0]
+                self._task_used = self.view.store.count_where(
+                    'review-request', 'logical_task', self.logical_task)
                 self._task_key = self.logical_task
             if self._task_used >= self.max_task_attempts:
                 raise NarrativeError('budget_exceeded','shared logical task retry/tool-call cap reached')

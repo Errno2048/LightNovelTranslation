@@ -16,8 +16,10 @@ def insert(store,kind,data):
 
 class SequenceRepository:
     def __init__(self,path):
+        import threading
         self.store=NarrativeStore(path)
         self.db=self.store.db
+        self._archive_lock=threading.Lock()
         self.db.executescript('''
           CREATE TABLE IF NOT EXISTS sequence_head (singleton INTEGER PRIMARY KEY CHECK(singleton=1),
             run_id TEXT NOT NULL, head TEXT, checkpoint TEXT, workset TEXT, epoch INTEGER NOT NULL DEFAULT 0);
@@ -35,9 +37,12 @@ class SequenceRepository:
 
     @property
     def run_id(self):
-        row=self.db.execute('SELECT run_id FROM sequence_head WHERE singleton=1').fetchone()
-        if not row: raise NarrativeError('invalid_record','sequence has not been created')
-        return row[0]
+        value=getattr(self,'_run_id_cache',None)
+        if value is None:
+            row=self.db.execute('SELECT run_id FROM sequence_head WHERE singleton=1').fetchone()
+            if not row: raise NarrativeError('invalid_record','sequence has not been created')
+            value=row[0]; self._run_id_cache=value
+        return value
 
     @property
     def manifest(self):
@@ -76,15 +81,14 @@ class SequenceRepository:
                 (state,json.dumps(value,ensure_ascii=False,sort_keys=True),source_id))
 
     def commits(self):
-        with self.store.lock:
-            cached = getattr(self, '_commits_cache', None)
-            if cached is None:
-                cached = [(r[0], self.store.get(r[0], 'chapter-commit'))
-                          for r in self.db.execute(
-                              'SELECT c.id FROM sequence_commits c JOIN sequence_chapters s '
-                              'ON c.source_id=s.source_id ORDER BY s.position')]
-                self._commits_cache = cached
-            return cached
+        cached = getattr(self, '_commits_cache', None)
+        if cached is None:
+            cached = [(r[0], self.store.get(r[0], 'chapter-commit'))
+                      for r in self.db.execute(
+                          'SELECT c.id FROM sequence_commits c JOIN sequence_chapters s '
+                          'ON c.source_id=s.source_id ORDER BY s.position')]
+            self._commits_cache = cached
+        return cached
 
     def inherited_commits(self):
         return [(r['id'],r['commit']) for r in self.manifest['inputs'].get('inherited_commits',[])]
@@ -92,15 +96,23 @@ class SequenceRepository:
     def all_commits(self): return self.inherited_commits()+self.commits()
 
     def validate_commit(self,commit_id):
+        cache=getattr(self,'_validated_commits',None)
+        if cache is None:
+            cache={}; self._validated_commits=cache
+        cached=cache.get(commit_id)
+        if cached is not None:
+            return cached
         commit=self.store.get(commit_id,'chapter-commit')
         inherited=dict(self.inherited_commits())
         if commit_id in inherited:
             if commit!=inherited[commit_id]: raise NarrativeError('stale_summary','inherited commit changed')
+            cache[commit_id]=commit
             return commit
         if commit['run_id']!=self.run_id or not self.db.execute('SELECT 1 FROM sequence_commits WHERE id=?',(commit_id,)).fetchone():
             raise NarrativeError('visibility_denied','foreign branch commit')
         if self.db.execute('SELECT 1 FROM sequence_invalidations WHERE object_id=?',(commit_id,)).fetchone():
             raise NarrativeError('stale_summary','commit requires re-review')
+        cache[commit_id]=commit
         return commit
 
     def commit_chapter(self,prepared_id,*,expected_head,idempotency_key,fault=None):
@@ -181,6 +193,8 @@ class SequenceRepository:
             self.db.executemany('INSERT OR REPLACE INTO sequence_invalidations VALUES(?,?)',[(x,reason) for x in stale])
         self._latest_nodes_cache = None
         self._latest_incremental_nodes_cache = None
+        self._validated_commits = {}
+        self._generated_documents = {}
         return stale
 
 

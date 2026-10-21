@@ -360,6 +360,23 @@ class SequenceEngine:
         prepared['admission_id']=admission
         return self.repo.store.put('chapter-prepared',prepared)
 
+    def commit_reviewed(self, source_id, *, fault=None):
+        """Commit a staged review without rebuilding hierarchy or re-planning context."""
+        chapter = next(c for c in self.repo.chapters() if c['source_id'] == source_id)
+        if (chapter['state'] != 'review_finished' or not chapter.get('version_id') or
+                not chapter.get('review')):
+            raise NarrativeError('invalid_record', 'chapter is not ready for reviewed commit')
+        view = self.view(source_id)
+        version = read_version(view, chapter['version_id'])
+        context = self.repo.store.get(version['context_id'], 'review-context')
+        result, _ = self._review(view, context, chapter['version_id'])
+        prepared_id = self._prepare(view, context, result)
+        self.repo.stage(source_id, 'commit_prepared', prepared_id=prepared_id)
+        prepared = self.repo.store.get(prepared_id)
+        return self.repo.commit_chapter(
+            prepared_id, expected_head=prepared['parent'],
+            idempotency_key=self.repo.run_id + ':' + source_id, fault=fault)
+
     def advance_sequence(self,*,stop_after=None):
         completed=[]
         while stop_after is None or len(completed)<stop_after:
