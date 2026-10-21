@@ -50,6 +50,7 @@ class SequenceSpec:
     window_l2_blocks: int = 3
     translation_concurrency: int = 3
     review_concurrency: int = 4
+    provisional_lookahead: int = 1
     output_profile: str = 'plain-v1'
 
     def __post_init__(self):
@@ -69,6 +70,8 @@ class SequenceSpec:
         if any(type(value) is not int or value<=0 for value in
                (self.window_l2_blocks,self.translation_concurrency,self.review_concurrency)):
             raise ValueError('invalid window translation settings')
+        if type(self.provisional_lookahead) is not int or self.provisional_lookahead<0:
+            raise ValueError('provisional_lookahead must be a non-negative integer')
         if self.reference_profile not in {'legacy', 'stable-v1'} or self.mapping_profile not in {'audit-v2', 'coarse-v1'}:
             raise ValueError('unknown reference or mapping protocol')
         if self.strategy not in {'R','U','H'} or self.mode not in {'working','accepted_only'}:
@@ -127,6 +130,7 @@ class SequenceSpec:
         value.setdefault('window_l2_blocks',3)
         value.setdefault('translation_concurrency',3)
         value.setdefault('review_concurrency',4)
+        value.setdefault('provisional_lookahead',1)
         value.setdefault('output_profile','plain-v1')
         value['capacity']=ModelCapacity(**value['capacity'])
         value['roles']={k:RoleBudget(**v) for k,v in value['roles'].items()}

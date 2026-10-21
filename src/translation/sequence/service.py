@@ -377,6 +377,31 @@ class SequenceEngine:
             prepared_id, expected_head=prepared['parent'],
             idempotency_key=self.repo.run_id + ':' + source_id, fault=fault)
 
+    def commit_with_revision(self, source_id, *, fault=None):
+        """Review/revise a staged draft and commit it without re-planning context."""
+        chapter = next(c for c in self.repo.chapters() if c['source_id'] == source_id)
+        version_id = chapter.get('version_id')
+        if not version_id or chapter['state'] == 'committed':
+            raise NarrativeError('invalid_record', 'chapter has no staged draft')
+        view = self.view(source_id)
+        version = read_version(view, version_id)
+        context = self.repo.store.get(version['context_id'], 'review-context')
+        result, session = self._review(view, context, version_id)
+        while (result['confirmed'] and
+               read_version(view, version_id)['round'] <
+               self.repo.revision_limit(source_id, self.spec.max_revisions)):
+            proposal = propose_revision(session, version_id, result['report_id'],
+                                        result['adjudication_id'])
+            version_id = apply_revision(view, version_id, proposal)
+            self.repo.stage(source_id, 'generated', version_id=version_id)
+            result, session = self._review(view, context, version_id)
+        prepared_id = self._prepare(view, context, result)
+        self.repo.stage(source_id, 'commit_prepared', prepared_id=prepared_id)
+        prepared = self.repo.store.get(prepared_id)
+        return self.repo.commit_chapter(
+            prepared_id, expected_head=prepared['parent'],
+            idempotency_key=self.repo.run_id + ':' + source_id, fault=fault)
+
     def advance_sequence(self,*,stop_after=None):
         completed=[]
         while stop_after is None or len(completed)<stop_after:

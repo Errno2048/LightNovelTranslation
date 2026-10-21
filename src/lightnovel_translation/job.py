@@ -249,6 +249,20 @@ class TranslationJob:
                           review_concurrency=review_concurrency,
                           materialize=materialize, reuse_staged=reuse_staged)
 
+    def translate_pipeline(self, *, windows: int = 3, size: int = 30,
+                           concurrency: int | None = None,
+                           review_concurrency: int | None = None,
+                           lookahead: int | None = None,
+                           materialize: bool = True) -> dict[str, Any]:
+        """Translate windows speculatively while earlier windows are reviewed."""
+        self._check()
+        self.project._require_generation()
+        from translation.sequence.pipeline import run_pipeline
+        return run_pipeline(self, windows=windows, size=size,
+                            translation_concurrency=concurrency,
+                            review_concurrency=review_concurrency,
+                            lookahead=lookahead, materialize=materialize)
+
     def thread_catalog(self) -> dict[str, Any]:
         """Read the compact unresolved-thread catalog for the current target."""
         from translation.sequence.threads import read_thread_catalog

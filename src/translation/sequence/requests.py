@@ -91,7 +91,7 @@ class SequenceCaller:
             elif last_error not in {'network','timeout','server','rate_limit'}: break
         raise NarrativeError(last_error or 'request_failed','bounded sequence task failed; raw attempts retained')
 
-    def call_many(self, jobs, *, workers=2):
+    def call_many(self, jobs, *, workers=2, retry_failed=False):
         """Reserve/settle serially, run independent provider calls concurrently."""
         prepared=[]
         for job in jobs:
@@ -108,7 +108,7 @@ class SequenceCaller:
             request_id=self.store.put('sequence-request',request_data)
             request_data['id']=request_id
             seq=self.store.reserve(request_data['id'],kind,report['safe_input_tokens'],output,
-                                   sequence_limits(self.spec))
+                                   sequence_limits(self.spec),retry_failed=retry_failed)
             self.store.put('sequence-reservation',{'request_id':request_id,
                 'ledger_identity':request_data['id'],'seq':seq})
             prepared.append({'job':job,'task':task,'kind':kind,'role':role,'messages':messages,

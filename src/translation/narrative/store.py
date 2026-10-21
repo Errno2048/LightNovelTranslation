@@ -237,6 +237,14 @@ class NarrativeStore:
                 self.db.execute("UPDATE attempts SET status=?,payload=? WHERE seq=?",
                                 (status, json.dumps(result, ensure_ascii=False, sort_keys=True), seq))
 
+    def mark_interrupted(self):
+        """Mark orphaned running reservations after a crash; reservations stay charged."""
+        with self.lock:
+            with self.db:
+                cursor = self.db.execute(
+                    "UPDATE attempts SET status='unknown_remote_result' WHERE status='running'")
+                return cursor.rowcount
+
     def attempts(self):
         with self._reader() as conn:
             rows = conn.execute("SELECT * FROM attempts ORDER BY seq").fetchall()

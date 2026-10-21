@@ -136,7 +136,8 @@ def _materialize_parent_rollup(repo, view, caller, root, children, fallback_reas
     from .context import _parent_overview
     from .hierarchy import _save, usable
     ids = root['ordered_source_ids']
-    usable_children = [node for node in children if usable(node)
+    usable_children = [node for node in children if node.get('summary')
+                       and node.get('state') in {'extracted','partial','summary_only'}
                        and set(node['source_ids']) <= set(ids)]
     covered = [cid for node in usable_children for cid in node['source_ids']]
     if covered != ids:
@@ -144,11 +145,11 @@ def _materialize_parent_rollup(repo, view, caller, root, children, fallback_reas
             'L1 capacity fallback lacks usable L2 coverage: ' + root['node_id'])
     summary, summary_id = _parent_overview(repo, caller, usable_children, root['node_id'])
     payload = {'summary': summary, 'summary_revision': summary_id,
-        'records': [record for node in usable_children for record in node['records']],
+        'records': [record for node in usable_children for record in node.get('records', [])],
         'quarantined': [record for node in usable_children for record in node.get('quarantined', [])],
         'references': {key: value for node in usable_children
                        for key, value in node.get('references', {}).items()},
-        'state': 'partial' if any(node['state'] == 'partial' for node in usable_children) else 'extracted',
+        'state': 'partial' if any(node['state'] in {'partial','summary_only'} for node in usable_children) else 'extracted',
         'failure_reason': None, 'open_prefix': root['state'] == 'open'}
     return _save(repo, view, root, ids, payload, method='child_summary_rollup',
                  fallback_reason=fallback_reason,
@@ -194,6 +195,14 @@ def materialize_nodes(repo,spec,view,provider,*,force_open=False):
                 candidates=[(i,n) for i,n in repo.store.objects('sequence-node') if n['node_id']==child_id
                             and n['pair_hash']==pair_hash and n['level']==2
                             and n.get('reference_profile', 'legacy') == spec.reference_profile]
+                full=[row for row in candidates
+                      if row[1].get('summary') and row[1].get('state') in {'extracted','partial'}]
+                if full:
+                    candidates=full
+                else:
+                    summary_only=[row for row in candidates
+                                  if row[1].get('summary') and row[1].get('state')=='summary_only']
+                    candidates=summary_only
                 if candidates:
                     ident,node=candidates[0]; node_is_valid(repo,node)
                 else:

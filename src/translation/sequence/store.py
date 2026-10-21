@@ -39,7 +39,8 @@ class SequenceRepository:
     def run_id(self):
         value=getattr(self,'_run_id_cache',None)
         if value is None:
-            row=self.db.execute('SELECT run_id FROM sequence_head WHERE singleton=1').fetchone()
+            with self.store._reader() as conn:
+                row=conn.execute('SELECT run_id FROM sequence_head WHERE singleton=1').fetchone()
             if not row: raise NarrativeError('invalid_record','sequence has not been created')
             value=row[0]; self._run_id_cache=value
         return value
@@ -51,12 +52,15 @@ class SequenceRepository:
         return self._manifest
 
     def heads(self):
-        row=self.db.execute('SELECT head,checkpoint,workset,epoch FROM sequence_head WHERE singleton=1').fetchone()
+        with self.store._reader() as conn:
+            row=conn.execute('SELECT head,checkpoint,workset,epoch FROM sequence_head WHERE singleton=1').fetchone()
         return dict(zip(('head','checkpoint','workset','epoch'),row))
 
     def chapters(self):
+        with self.store._reader() as conn:
+            rows=conn.execute('SELECT * FROM sequence_chapters ORDER BY position').fetchall()
         return [{'source_id':r[0],'position':r[1],'state':r[2],**json.loads(r[3])}
-                for r in self.db.execute('SELECT * FROM sequence_chapters ORDER BY position')]
+                for r in rows]
 
     def revision_limit(self, source_id, default):
         chapter = next(c for c in self.chapters() if c['source_id'] == source_id)
@@ -71,22 +75,24 @@ class SequenceRepository:
         return limit
 
     def stage(self,source_id,state,**payload):
-        row=self.db.execute('SELECT state,payload FROM sequence_chapters WHERE source_id=?',(source_id,)).fetchone()
-        if not row: raise NarrativeError('invalid_record','unknown sequence target')
-        if row[0]=='committed':
-            raise NarrativeError('conflict','cannot mutate committed chapter stage')
-        value={**json.loads(row[1]),**payload}
-        with self.db:
-            self.db.execute('UPDATE sequence_chapters SET state=?,payload=? WHERE source_id=?',
-                (state,json.dumps(value,ensure_ascii=False,sort_keys=True),source_id))
+        with self.store.lock:
+            row=self.db.execute('SELECT state,payload FROM sequence_chapters WHERE source_id=?',(source_id,)).fetchone()
+            if not row: raise NarrativeError('invalid_record','unknown sequence target')
+            if row[0]=='committed':
+                raise NarrativeError('conflict','cannot mutate committed chapter stage')
+            value={**json.loads(row[1]),**payload}
+            with self.db:
+                self.db.execute('UPDATE sequence_chapters SET state=?,payload=? WHERE source_id=?',
+                    (state,json.dumps(value,ensure_ascii=False,sort_keys=True),source_id))
 
     def commits(self):
         cached = getattr(self, '_commits_cache', None)
         if cached is None:
-            cached = [(r[0], self.store.get(r[0], 'chapter-commit'))
-                      for r in self.db.execute(
-                          'SELECT c.id FROM sequence_commits c JOIN sequence_chapters s '
-                          'ON c.source_id=s.source_id ORDER BY s.position')]
+            with self.store._reader() as conn:
+                rows=conn.execute(
+                    'SELECT c.id FROM sequence_commits c JOIN sequence_chapters s '
+                    'ON c.source_id=s.source_id ORDER BY s.position').fetchall()
+            cached = [(r[0], self.store.get(r[0], 'chapter-commit')) for r in rows]
             self._commits_cache = cached
         return cached
 
@@ -108,14 +114,22 @@ class SequenceRepository:
             if commit!=inherited[commit_id]: raise NarrativeError('stale_summary','inherited commit changed')
             cache[commit_id]=commit
             return commit
-        if commit['run_id']!=self.run_id or not self.db.execute('SELECT 1 FROM sequence_commits WHERE id=?',(commit_id,)).fetchone():
+        with self.store._reader() as conn:
+            committed=conn.execute('SELECT 1 FROM sequence_commits WHERE id=?',(commit_id,)).fetchone()
+            invalidated=conn.execute('SELECT 1 FROM sequence_invalidations WHERE object_id=?',(commit_id,)).fetchone()
+        if commit['run_id']!=self.run_id or not committed:
             raise NarrativeError('visibility_denied','foreign branch commit')
-        if self.db.execute('SELECT 1 FROM sequence_invalidations WHERE object_id=?',(commit_id,)).fetchone():
+        if invalidated:
             raise NarrativeError('stale_summary','commit requires re-review')
         cache[commit_id]=commit
         return commit
 
     def commit_chapter(self,prepared_id,*,expected_head,idempotency_key,fault=None):
+        with self.store.lock:
+            return self._commit_chapter_locked(prepared_id,expected_head=expected_head,
+                idempotency_key=idempotency_key,fault=fault)
+
+    def _commit_chapter_locked(self,prepared_id,*,expected_head,idempotency_key,fault=None):
         prepared=self.store.get(prepared_id,'chapter-prepared')
         if prepared['run_id']!=self.run_id:
             raise NarrativeError('visibility_denied','prepared commit belongs to another branch')
@@ -169,33 +183,36 @@ class SequenceRepository:
         return commit_id
 
     def switch_checkpoint(self,checkpoint_id,expected_head,*,fault=None):
-        checkpoint=self.store.get(checkpoint_id,'sequence-checkpoint')
-        if checkpoint['head']!=expected_head or checkpoint['run_id']!=self.run_id:
-            raise NarrativeError('conflict','checkpoint binding differs')
-        with self.db:
-            if self.heads()['head']!=expected_head:
-                raise NarrativeError('conflict','head changed before checkpoint switch')
-            if fault: fault('before_checkpoint_switch')
-            self.db.execute('UPDATE sequence_head SET checkpoint=?,epoch=epoch+1 WHERE singleton=1',(checkpoint_id,))
+        with self.store.lock:
+            checkpoint=self.store.get(checkpoint_id,'sequence-checkpoint')
+            if checkpoint['head']!=expected_head or checkpoint['run_id']!=self.run_id:
+                raise NarrativeError('conflict','checkpoint binding differs')
+            with self.db:
+                if self.heads()['head']!=expected_head:
+                    raise NarrativeError('conflict','head changed before checkpoint switch')
+                if fault: fault('before_checkpoint_switch')
+                self.db.execute('UPDATE sequence_head SET checkpoint=?,epoch=epoch+1 WHERE singleton=1',(checkpoint_id,))
 
     def invalidate_from(self,source_id,reason):
-        commits=self.commits(); found=False; stale=[]
-        for ident,c in commits:
-            found |= c['source_id']==source_id
-            if found: stale.append(ident)
-        if not found: raise NarrativeError('invalid_record','cannot revise uncommitted chapter')
-        # Node/checkpoint dependency closures contain exact commit references.
-        for kind in ('sequence-node','sequence-checkpoint','sequence-workset','sequence-parent-summary'):
-            for ident,value in self.store.objects(kind):
-                if set(value.get('commit_ids',[]))&set(stale) or value.get('commit_id') in stale:
-                    stale.append(ident)
-        with self.db:
-            self.db.executemany('INSERT OR REPLACE INTO sequence_invalidations VALUES(?,?)',[(x,reason) for x in stale])
-        self._latest_nodes_cache = None
-        self._latest_incremental_nodes_cache = None
-        self._validated_commits = {}
-        self._generated_documents = {}
-        return stale
+        with self.store.lock:
+            commits=self.commits(); found=False; stale=[]
+            for ident,c in commits:
+                found |= c['source_id']==source_id
+                if found: stale.append(ident)
+            if not found: raise NarrativeError('invalid_record','cannot revise uncommitted chapter')
+            # Node/checkpoint dependency closures contain exact commit references.
+            for kind in ('sequence-node','sequence-checkpoint','sequence-workset','sequence-parent-summary'):
+                for ident,value in self.store.objects(kind):
+                    if set(value.get('commit_ids',[]))&set(stale) or value.get('commit_id') in stale:
+                        stale.append(ident)
+            with self.db:
+                self.db.executemany('INSERT OR REPLACE INTO sequence_invalidations VALUES(?,?)',[(x,reason) for x in stale])
+            self._latest_nodes_cache = None
+            self._latest_incremental_nodes_cache = None
+            self._validated_commits = {}
+            self._generated_documents = {}
+            self._commits_cache = None
+            return stale
 
 
 def create_sequence(path,spec,frozen_inputs,*,branch_name,provider_identity,counter_identity):
