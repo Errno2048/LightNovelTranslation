@@ -15,6 +15,7 @@ from .pointers import (PointerAdvance, PointerEvent, PointerSet, block_identity,
                        block_key, contiguous_advance)
 from .scheduler import Task, TaskStore, fair_select, run_once
 from .snapshot import IndexSnapshot
+from .workflow import FusedWorkflow, GlossaryTerm, glossary_evidence
 
 __all__ = [
     "Artifact", "ArtifactKind", "BlockStatus", "ChapterStatus", "InputRef",
@@ -23,6 +24,7 @@ __all__ = [
     "LevelConfig", "PointerAdvance", "PointerEvent", "PointerSet",
     "IndexSnapshot", "block_identity", "block_key", "contiguous_advance",
     "Task", "TaskStore", "fair_select", "run_once",
+    "FusedWorkflow", "GlossaryTerm", "glossary_evidence",
     "DEFAULT_ESTIMATE_FACTOR", "MaterializationDecision", "PlannedBlock",
     "ReferenceIndexPlan", "SingleChapterSplitRequired",
     "choose_materialization", "direct_estimate", "estimate_chapter_tokens",

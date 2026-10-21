@@ -1,6 +1,6 @@
 # LightNovelTranslation
 
-日式轻小说的输入标准化、分层索引、续译定位、连续翻译与审校工具。公共 API 为 `lightnovel_translation`，内部 `translation` 引擎随包安装。要求 Python >= 3.11。
+日式轻小说的输入标准化、lazy 分层索引、证据绑定上下文与日译中翻译工具。main 分支使用新的 `translation.index` 架构；旧 `sequence` 引擎归档在 `legacy-sequence` 分支。公共 API 为 `lightnovel_translation`。要求 Python >= 3.11。
 
 ## 安装与配置
 
@@ -14,31 +14,39 @@ python -m lightnovel_translation config path
 
 配置模板只有一份：[config.example.toml](skills/lightnovel-translation/assets/config.example.toml)。初始化配置和导出技能均使用它。
 
-## Python API
-
-参考模式选择、索引准备和翻译是三个独立步骤。默认先检查/准备索引；没有跨版本检索需求时可以跳过独立版本索引，但若 `plan_next()` 返回 `index_required`，必须先 `prepare_history()`，重新规划为 `ready` 后才能运行翻译。
+## Python API（新分层索引）
 
 ```python
 from lightnovel_translation import TranslationProject
+from translation.index import FusedWorkflow, GlossaryTerm, LevelConfig
 
 with TranslationProject("workspaces/my-novel") as project:
-    source = project.import_book("novel.epub", edition_id="web-ja", language="ja")
-    with project.create_job("opening", source=source,
-                            chapters=source.chapters()[:3],
-                            mode="source_only") as job:
-        plan = job.plan_next()
-        if plan["state"] == "index_required":
-            prepared = job.prepare_history()
-            if not prepared["historical_index"]["ready"]:
-                raise RuntimeError("history index is incomplete")
-            plan = job.plan_next()
-        if plan["state"] != "ready":
-            raise RuntimeError(f"translation preflight is not ready: {plan['state']}")
-        result = job.run(max_chapters=1)
-        job.export(include_io=True)
+    source = project.import_book("web-ja.epub", edition_id="web-ja", language="ja")
+    reference = project.import_book("web-zh.epub", edition_id="web-zh", language="zh")
+    flow = FusedWorkflow(project, "web-ja", "web-zh",
+                         levels=LevelConfig((10, 10), (3, 1)),
+                         full_chapters=10)
+
+    plan = flow.reference_plan()                 # 只规划 not_created 边界
+    docs = flow.documents(start=0, end=112)
+    summary, _ = flow.summarize_reference(start=0, end=100)
+    snapshot = flow.make_snapshot(
+        summary, summary_start=0, summary_end=100,
+        full_start=100, full_end=110, documents=docs)
+
+    result, report, context = flow.translate(
+        snapshot=snapshot, documents=docs,
+        target_order=110, batch_orders=[110, 111],
+        glossary=[GlossaryTerm("イオ", "依尤", "person")],
+        unresolved=["前章未决问题"],
+        threads={"active": [], "resolved": [], "dormant_relevant": []},
+        output_tokens=16384)
+    print(result.text[:1000])
 ```
 
-完整流程见[操作手册](skills/lightnovel-translation/references/workflows.md)、[诊断与恢复](skills/lightnovel-translation/references/diagnostics.md)及[库使用说明](docs/usage.md)。需要理解配置、数据流、模块边界或定位实现时，按流程查阅[工作原理手册目录](skills/lightnovel-translation/references/manual/index.md)，各模块附对应源码文件和函数。跨版本中文正文可作为文风与术语参考，剧情关联需显式构建两侧索引。通过 `job.reference_report()` 检查实际参考，预算默认按配置容量调整。工程完成不表示译文已经通过人工质量验收。
+新流程：lazy 参考索引 → 直出高层摘要 → ContextPlan + workset/实体/线程/定向证据 → `source_message` 输出协议 → 实际翻译。目标是保留旧实现的证据协议，同时用新快照/指针/惰性物化降低历史索引成本。
+
+**当前自动化边界**：main 已实现索引规划、上下文装配和真实翻译；章节审校/裁决/提交/导出尚未接入新闭环，需要手动接管，或在 `legacy-sequence` 分支使用旧 `create_job/job.run` 管线。完整说明见[新架构技能文档](skills/lightnovel-translation/references/new-architecture.md)、[库使用说明](docs/usage.md)和[架构设计](docs/refactor-architecture-design.md)。
 
 ## 获取日文 Web 原作
 
@@ -69,14 +77,16 @@ Claude Code 工作区可导出到 `.claude/skills/lightnovel-translation`。导�
 
 ```text
 src/
-  lightnovel_translation/   公共 Python API、CLI
-  translation/             内部翻译引擎
+  lightnovel_translation/   项目/配置/导入/技能导出外壳与 CLI
+  translation/index/        新分层索引、ContextPlan、lazy 规划、TaskStore/指针、FusedWorkflow
+  translation/              共享存储、预算、provider、ingestion、edition/review 基础
 skills/lightnovel-translation/
   SKILL.md                 Agent 技能入口
-  agents/openai.yaml       可选 UI 元信息
-  references/              API、操作流程、诊断、输入修复及 manual/ 工作原理手册
+  references/new-architecture.md  新工作流与手动接管
+  references/              旧 API/手册（legacy）与输入修复
   assets/                  无凭据的配置模板
 skills/syosetu-fetch/       原作反查、检索与 EPUB 采集技能
+docs/refactor-architecture-design.md  新架构完整设计
 docs/usage.md              库使用说明
 examples/library_offline.py
 tests/translation/

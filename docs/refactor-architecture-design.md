@@ -939,3 +939,29 @@ Token 预算应由旧 `plan_request` 统一计算；workset/实体/线程/定向
 3. **token 估算仍需校准**：`plan_request` 的预算结构可复用，但 byte counter 的 1.15 系数过于保守；应接真实 tokenizer 或用实际 usage 校准。
 4. 本次实体/线程/未决仍是手工候选；生产环境应复用旧 entity catalog、thread catalog 和 cross_edition 的 `prepare_references/associate/match_entities`。
 5. 尚未融合章节审校、provisional rebuild、review/commit；下一步应把 ContextAssembler 接入旧 review 链路，再跑 90 章窗口。
+
+## 21. main 分支清理与当前实现状态
+
+已执行：
+
+- 旧代码最后提交 `92a2645` 归档到 `legacy-sequence` 分支并推送到 origin。
+- main 删除旧 `translation/sequence` 执行引擎、旧 `lightnovel_translation/job.py`、`index.py`、`continuation.py`，以及对应旧测试。
+- 共享能力迁移：
+  - `sequence/schemas.py` → `translation/config_spec.py`
+  - `sequence/output.py` → `translation/review/output.py`
+  - `sequence/targeted.py` → `translation/evidence/targeted.py`
+  - `source_message`/`full_pair_message` → `translation/index/prompts.py`
+- 新增 `translation/index/workflow.py`，提供 `FusedWorkflow`：lazy 参考规划、高层摘要、快照、ContextPlan + workset/实体/线程/定向证据装配、`plan_request` 预算和真实翻译。
+- 新增离线示例 `examples/library_offline.py`，验证新 API 不依赖模型或本地语料。
+- 新文档：
+  - `docs/usage.md`：新工作流与当前自动化边界
+  - `skills/lightnovel-translation/references/new-architecture.md`：agent 具体工作流、手动接管项
+  - `skills/lightnovel-translation/SKILL.md`：main 工作流入口
+  - 旧 `api.md`/`workflows.md`/`manual/`/旧设计文档已标注 legacy
+
+当前 main 的自动化边界：
+
+- 已实现：导入、lazy 参考索引规划、direct/rollup 摘要、ContextPlan、workset/实体/线程/定向证据装配、预算、TaskStore/指针、真实翻译、指标。
+- 需手动接管：章节审校/裁决/提交、最终导出、实体/线程目录生产、单章拆分译文对齐。
+- 需要旧完整自动管线时使用 `legacy-sequence` 分支。
+- 验证：剩余共享测试与新索引测试共 94 项通过；离线示例输出摘要 + 全文 + target 段并完成两次 provider 调用。

@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 from translation.budget import ModelCapacity, RoleBudget
 from translation.config import ModelConfig as _EngineModelConfig
 from translation.editions.index import EditionIndexSpec
-from translation.sequence.schemas import SequenceSpec, default_roles
+from translation.config_spec import SequenceSpec, default_roles
 
 from .errors import ConfigurationError
 from .acquisition_config import SyosetuConfig

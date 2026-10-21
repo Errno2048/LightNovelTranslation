@@ -1,4 +1,6 @@
-# 公共 API 与可恢复运行
+# 公共 API 与可恢复运行（Legacy）
+
+> **Legacy**：旧 `sequence`/`create_job`/`job.run` API 已从 main 移除，完整实现保留在 `legacy-sequence` 分支。main 请阅读 [new-architecture.md](new-architecture.md)。
 
 完整操作步骤见 [workflows.md](workflows.md)，预算、参考缺失和接管见 [diagnostics.md](diagnostics.md)。本页描述 API 约定。
 

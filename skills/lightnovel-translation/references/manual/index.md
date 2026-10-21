@@ -1,4 +1,6 @@
-# 工作原理手册：按流程查阅
+# 工作原理手册：按流程查阅（Legacy）
+
+> **Legacy**：以下页面描述旧 `sequence` 引擎。main 新架构请阅读 [new-architecture.md](../new-architecture.md) 和仓库 `docs/refactor-architecture-design.md`；旧完整实现位于 `legacy-sequence` 分支。
 
 本手册说明当前 `lightnovel_translation` 的实际运行机制。执行调用先查 [操作流程](../workflows.md)和 [API](../api.md)；需要解释行为、判断故障所在层级或修改模块时，再按下表读取对应页。无需一次读完整本手册。
 

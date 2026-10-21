@@ -4,7 +4,7 @@ from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
 import re
-from typing import Any, Iterable, TYPE_CHECKING
+from typing import Any, Iterable
 
 from translation.editions.archive import EditionArchive
 from translation.ingestion import InputSpec, normalize_input
@@ -14,11 +14,8 @@ from translation.storage import digest, read_json, write_json
 
 from .config import TranslationConfig
 from .errors import ConfigurationError, TranslationError, operation
-from .models import ChapterInfo, RunResult
+from .models import ChapterInfo
 
-if TYPE_CHECKING:
-    from .index import Index
-    from .job import TranslationJob
 
 
 def safe_name(value: str) -> str:
@@ -93,7 +90,6 @@ class TranslationProject:
         self._provider = _InjectedProvider(provider, provider_id) if provider is not None else None
         self._owns_provider = provider is None
         self._closed = False
-        self._jobs: list[TranslationJob] = []
         self._archive_cache = {}
         self._combined_archive_cache = {}
         self.counter = counter or TokenCounter(self.config.tokenizer_path)
@@ -239,48 +235,9 @@ class TranslationProject:
         return {'valid':True, 'edition_ids':ids, 'fingerprint':archive.fingerprint,
                 'validation':'full' if force else 'stat_cached'}
 
-    @operation
-    def index(self, editions: Iterable[str | Edition] | None = None) -> Index:
-        """Plan an index locally. Call Index.build() separately to pay for generation."""
-        from .index import Index
-        ids = [self._edition_id(e) for e in editions] if editions is not None else list(self._manifest()["editions"])
-        if not ids or len(set(ids)) != len(ids):
-            raise ValueError("index needs unique edition IDs")
-        return Index(self, ids)
-
-    @operation
-    def create_job(self, name: str, *, source: str | Edition,
-                   chapters: Iterable[str | ChapterInfo] | None = None, mode: str = "auto",
-                   references: Iterable[str | Edition] = (), index: Index | None = None,
-                   parallel_pairs: dict[str, list[str]] | None = None,
-                   associations: Iterable[dict] = (), entity_matches: Iterable[dict] = (),
-                   resolve_terminology: bool = False, packet_token_budget: int | None = None,
-                   style_reference_chapters: Iterable[str | ChapterInfo] = ()) -> TranslationJob:
-        """Freeze a consecutive translation window; only terminology resolution may call LLMs."""
-        from .job import create_job
-        return create_job(self, safe_name(name), source=source, chapters=chapters, mode=mode,
-                          references=references, index=index, parallel_pairs=parallel_pairs,
-                          associations=associations, entity_matches=entity_matches,
-                          resolve_terminology=resolve_terminology, packet_token_budget=packet_token_budget,
-                          style_reference_chapters=style_reference_chapters)
-
-    @operation
-    def open_job(self, name: str) -> TranslationJob:
-        """Open frozen job inputs; reopening never rebuilds references or indexes."""
-        from .job import TranslationJob
-        return TranslationJob(self, safe_name(name))
-
-    def translate(self, source: str | Edition, *, name: str, max_chapters: int | None = None,
-                  **options) -> RunResult:
-        """Create/reuse a job, run it and export committed results."""
-        with self.create_job(name, source=source, **options) as job:
-            return job.run(max_chapters=max_chapters)
-
     def close(self) -> None:
         if self._closed:
             return
-        for job in tuple(self._jobs):
-            job.close()
         if self._owns_provider and isinstance(self._provider, HTTPProvider):
             self._provider.client.close()
         self._closed = True

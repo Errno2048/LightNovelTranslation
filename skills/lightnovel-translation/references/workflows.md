@@ -1,4 +1,6 @@
-# 从输入到连续翻译的操作手册
+# 从输入到连续翻译的操作手册（Legacy）
+
+> **Legacy**：本页描述旧 `sequence` 工作流，main 已不再提供 `create_job/job.run`。新工作流见 [new-architecture.md](new-architecture.md)；旧实现位于 `legacy-sequence` 分支。
 
 本页面向调用已安装库的 agent。示例使用稳定章 ID / `ChapterInfo`，不要求理解内部引擎。先选实际安装包的 Python 解释器；其余操作保持同一解释器、同一工作区。凭据处理见 SKILL.md。
 

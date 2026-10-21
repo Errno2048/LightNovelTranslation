@@ -1,4 +1,6 @@
-# 诊断、预算与可追溯恢复
+# 诊断、预算与可追溯恢复（Legacy）
+
+> **Legacy**：本页的 job/index 诊断接口属于旧 `sequence` 引擎，main 已移除。新工作流见 [new-architecture.md](new-architecture.md)；旧实现位于 `legacy-sequence` 分支。
 
 查阅顺序：`status()` → `reference_report()` / `draft()` → `plan_next()` → 当前章 `explain()`。这些接口不调用模型，`plan_next` 可能保存本地 checkpoint。只有这些产物不足以解释错误时再定位源码。
 

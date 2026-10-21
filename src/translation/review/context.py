@@ -95,7 +95,7 @@ def compile_review_context(view, version_id, *, profile='hierarchical', near_sou
     blocks, catalog = [], []
     targeted=base.get('targeted_evidence',{})
     if targeted.get('payload'):
-        from ..sequence.targeted import validate_history_rows
+        from ..evidence.targeted import validate_history_rows
         registered=validate_history_rows(view,targeted)
         known={r['alias']:r for r in rows}
         for row in registered:

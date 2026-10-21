@@ -1,5 +1,5 @@
 """Source-bound translation output. Structure is a declaration, not a verdict."""
-from ..review.protocol import parse_records
+from .protocol import parse_records
 
 
 PROFILE = 'source-records-v1'

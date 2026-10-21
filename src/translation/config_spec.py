@@ -1,7 +1,7 @@
 """P7 branch and session contracts; working text never implies acceptance."""
 from dataclasses import dataclass, field
 
-from ..budget import ModelCapacity, RoleBudget
+from .budget import ModelCapacity, RoleBudget
 
 
 def default_roles():

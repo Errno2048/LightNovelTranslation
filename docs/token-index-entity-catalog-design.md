@@ -1,5 +1,7 @@
 # Token 分块、实体合并与核心目录
 
+> **Legacy 文档**：本文描述旧 `sequence` 索引。main 的新架构见 [refactor-architecture-design.md](refactor-architecture-design.md)；旧实现位于 `legacy-sequence` 分支。
+
 本设计用于新建索引和任务。旧任务保留冻结的配置、节点边界、请求和响应；不在恢复时改变其语义。
 
 ## 1. 目标和边界

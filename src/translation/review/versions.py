@@ -138,7 +138,7 @@ def create_version(view, context, text, *, finish_reason="stop", parent=None, re
 
 def validate_output_binding(view, value, context):
     """A record ID is an auditable declaration, never semantic proof."""
-    from ..sequence.output import parse_output, PROFILE
+    from .output import parse_output, PROFILE
     binding = value['output_binding']
     if (binding.get('profile') != PROFILE or context.get('output_profile') != PROFILE or
             binding.get('authority') != 'declared_by_translation_output' or

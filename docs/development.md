@@ -4,7 +4,9 @@
 
 本仓库采用 [Agent Skills 开放规范](https://agentskills.io/specification)（2026-10-19 查阅）与 [Anthropic 官方技能仓库](https://github.com/anthropics/skills)的技能目录形式。规范规定技能目录含带 `name` / `description` YAML 元信息的 `SKILL.md`，可选 `references/`、`scripts/`、`assets/`。本技能没有专用脚本，不创建空的 `scripts/`；仓库的分发验证脚本属于开发工具。
 
-Python 代码采用 [Python Packaging User Guide 的 src layout](https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/)。`src/lightnovel_translation` 是公共接口，`src/translation` 是现有运行引擎；导入名与 CLI 保持不变。
+Python 代码采用 [Python Packaging User Guide 的 src layout](https://packaging.python.org/en/latest/discussions/src-layout-vs-flat-layout/)。`src/lightnovel_translation` 保留项目/配置/导入/技能导出等公共外壳；新的分层索引引擎位于 `src/translation/index`。旧 `src/translation/sequence` 引擎和旧 `create_job/job.run` API 已归档到 git 分支 `legacy-sequence`，main 不再包含它们。
+
+新的权威设计文档是 [refactor-architecture-design.md](refactor-architecture-design.md)；用户工作流见 [usage.md](usage.md) 和技能 [new-architecture.md](../skills/lightnovel-translation/references/new-architecture.md)。
 
 ## 维护与验证
 
@@ -16,6 +18,6 @@ Python 代码采用 [Python Packaging User Guide 的 src layout](https://packagi
 
 工作区、小说、请求日志、旧构建和临时模型验证脚本保存在仓库外。临时目录应传给示例和验证命令；`.venv`、构建目录及测试缓存可在本地重建，均受 Git 忽略规则约束。
 
-连续翻译历史索引的已知缺陷、直接 L1 优先及仅在容量不足时回退到 L2 汇总的设计，记录在[连续翻译历史索引修复规划](sequence-index-repair-plan.md)。实现前，不要把当前 parallel_pairs 全文回退行为视为已经完成远距 L1 / 近距 L2 滑动窗口。
+旧版 `sequence` 引擎的历史设计、索引修复和实体目录文档（`sequence-index-repair-plan.md`、`token-index-entity-catalog-design.md`）仅作 legacy 参考；它们对应的实现位于 `legacy-sequence` 分支。
 
-公开行为变更同时维护 README、使用说明和技能引用文档。
+main 的当前自动化边界：新索引、lazy 参考规划、ContextPlan、TaskStore/指针和实际翻译已实现；章节审校/裁决/提交/导出尚未接入新闭环，需要手动接管或在 `legacy-sequence` 分支运行旧管线。公开行为变更同时维护 README、使用说明和新架构技能文档。
