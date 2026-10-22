@@ -1234,7 +1234,7 @@ class TranslationRunner:
     def contiguous_accepted_end(self) -> int:
         accepted = set(self.store.accepted_orders())
         order = self.continuation_start
-        while True:
+        while order < self.main_end:
             source = self.source_by_order.get(order)
             if source is None or _is_extra_title(source["raw_title"]):
                 order += 1
@@ -1243,6 +1243,7 @@ class TranslationRunner:
                 order += 1
                 continue
             return order
+        return self.main_end
 
     def update_target_summary(self, *, force: bool = False) -> str | None:
         end = self.contiguous_accepted_end() - self.summary_lag
