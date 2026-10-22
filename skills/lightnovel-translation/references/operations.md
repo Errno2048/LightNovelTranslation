@@ -356,8 +356,30 @@ from translation.index import verify_epub
 print(verify_epub("work/my-novel/final.epub"))
 ```
 
-  它会检查 `mimetype` 首项、container、OPF manifest/spine、每个 XHTML 是否可解析且非空，并返回章节数/总字符数。它不等于完整 EPUBCheck 或语义验收。
-- 本导出器只生成文本章节（标题 + 段落），不包含插图/封面；需要插图时应另写资源打包，不要伪造正文。
+  它会检查 `mimetype` 首项、container、OPF manifest/spine、每个 XHTML 是否可解析且非空、图片资源是否存在，以及声明的图片 media-type 是否与字节魔数一致，并返回章节数/总字符数/图片数。它不等于完整 EPUBCheck 或语义验收。
+
+### 图片资产
+
+图片通过 edition 资产索引接入，不进入翻译文本：
+
+```python
+from translation.index.assets import load_asset_index
+
+ja_assets = load_asset_index(project, "web-ja")
+zh_assets = load_asset_index(project, "web-zh-norm")
+reference_assets = {order: zh_assets.chapter_assets(order)
+                    for order in zh_assets.chapters}
+chapters = collect_epub_chapters(
+    runner=runner, reference_chapters=official_chapters, end=main_end,
+    reference_assets=reference_assets)
+```
+
+- `load_asset_index` 从源 EPUB 和导入语料的 `source_ranges` 建立块级/行内图片位置，按 SHA256 去重，缓存到 `assets/<edition_id>.json`。图片 media-type 按字节魔数嗅探，避免源 EPUB 把 JPEG 标成 `.png`。
+- **块级图片**作为 sidecar 记录在 `assets.block`（`after_paragraph`/`before_paragraph`），不进入 prompt；导出时插入。
+- **行内图片**在翻译时转成 `[[IMG:<asset_id>]]` 占位符，`parse_translation` 用规则校验每个占位符恰好出现一次且顺序不变；审校模型不需要主动发现图片问题。目标偏移记录在 `assets.inline`。
+- `build_epub(..., assets=..., cover_asset=...)` 复制图片、生成 manifest、插入 `<img>` 并写入封面。`assets` 是 `{asset_id: {"data": bytes, "media_type": str, "alt": str}}`。
+- 参考章图片来自参考 edition，续译章图片来自源 edition；不要在同一章混用两个版本的图片。封面/无文本图片页是全书级或最近章节的块级资产。
+- 在图片支持之前已 accepted 的续译章，若源文含**行内**图片，无法从旧译文恢复占位符位置，需要重译；块级图片可以在导出时从源 edition 合并。
 
 ## 7. Provider 与模型故障
 

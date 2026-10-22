@@ -6,7 +6,7 @@ reintroducing the old ``translation.sequence`` engine.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 import html
@@ -27,6 +27,7 @@ from ..review.protocol import FIELDS, parse_records
 from ..schemas import GenerationRequest
 from ..storage import digest
 from .artifacts import Artifact, InputRef
+from .assets import AssetIndex, load_asset_index, sniff_media_type
 from .context_plan import ContextDocument
 from .prompts import source_records_rules
 from .snapshot import IndexSnapshot
@@ -54,6 +55,7 @@ class DraftChapter:
     paragraphs: tuple[str, ...]
     version: int
     review: Mapping
+    assets: Mapping = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,24 @@ class ReviewOutcome:
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+_IMAGE_MARKER = re.compile(r"\[\[IMG:([A-Za-z0-9_.:-]+)\]\]")
+
+
+def _strip_markers(value: str) -> tuple[str, list[tuple[str, int]]]:
+    parts: list[str] = []
+    positions: list[tuple[str, int]] = []
+    cursor = 0
+    offset = 0
+    for match in _IMAGE_MARKER.finditer(value):
+        chunk = value[cursor:match.start()]
+        parts.append(chunk)
+        offset += len(chunk)
+        positions.append((match.group(1), offset))
+        cursor = match.end()
+    parts.append(value[cursor:])
+    return "".join(parts), positions
 
 
 def _clean_ref(value: str) -> str:
@@ -107,6 +127,7 @@ class TranslationStore:
                 text TEXT NOT NULL,
                 status TEXT NOT NULL,
                 review TEXT NOT NULL DEFAULT '{}',
+                assets TEXT NOT NULL DEFAULT '{}',
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS versions (
@@ -119,6 +140,7 @@ class TranslationStore:
                 text TEXT NOT NULL,
                 status TEXT NOT NULL,
                 review TEXT NOT NULL DEFAULT '{}',
+                assets TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL,
                 UNIQUE(edition_order, version)
             );
@@ -146,6 +168,11 @@ class TranslationStore:
             );
             """
         )
+        for table in ("chapters", "versions"):
+            columns = {row[1] for row in self.db.execute(f"PRAGMA table_info({table})")}
+            if "assets" not in columns:
+                self.db.execute(
+                    f"ALTER TABLE {table} ADD COLUMN assets TEXT NOT NULL DEFAULT '{{}}'")
         self.db.commit()
 
     def close(self):
@@ -166,7 +193,14 @@ class TranslationStore:
     def chapter(self, order: int) -> dict | None:
         row = self.db.execute("SELECT * FROM chapters WHERE edition_order=?",
                               (order,)).fetchone()
-        return dict(row) if row else None
+        if not row:
+            return None
+        value = dict(row)
+        try:
+            value["assets"] = json.loads(value.get("assets") or "{}")
+        except ValueError:
+            value["assets"] = {}
+        return value
 
     def model_totals(self) -> dict:
         """Persistent model-attempt totals used for optional workflow limits."""
@@ -182,29 +216,33 @@ class TranslationStore:
 
     def put_draft(self, *, order: int, source_id: str, source_hash: str,
                   ja_title: str, title_zh: str, text: str,
-                  status: str = "draft", review: Mapping | None = None) -> int:
+                  status: str = "draft", review: Mapping | None = None,
+                  assets: Mapping | None = None) -> int:
         current = self.chapter(order)
         version = (current["version"] + 1) if current else 1
         review_text = json.dumps(review or {}, ensure_ascii=False)
+        if assets is None:
+            assets = (current or {}).get("assets") or {}
+        assets_text = json.dumps(assets, ensure_ascii=False)
         with self.db:
             self.db.execute(
                 "INSERT INTO versions(edition_order, version, source_hash, ja_title,"
-                " title_zh, text, status, review, created_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?)",
+                " title_zh, text, status, review, assets, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (order, version, source_hash, ja_title, title_zh, text,
-                 status, review_text, _now()))
+                 status, review_text, assets_text, _now()))
             self.db.execute(
                 "INSERT INTO chapters(edition_order, source_id, source_hash, ja_title,"
-                " version, title_zh, text, status, review, updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?)"
+                " version, title_zh, text, status, review, assets, updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(edition_order) DO UPDATE SET"
                 " source_id=excluded.source_id, source_hash=excluded.source_hash,"
                 " ja_title=excluded.ja_title, version=excluded.version,"
                 " title_zh=excluded.title_zh, text=excluded.text,"
                 " status=excluded.status, review=excluded.review,"
-                " updated_at=excluded.updated_at",
+                " assets=excluded.assets, updated_at=excluded.updated_at",
                 (order, source_id, source_hash, ja_title, version, title_zh,
-                 text, status, review_text, _now()))
+                 text, status, review_text, assets_text, _now()))
         return version
 
     def set_status(self, order: int, status: str, review: Mapping | None = None):
@@ -318,6 +356,12 @@ class TranslationRunner:
                                 if reference_chunk is None else reference_chunk)
         self.source_by_order = {doc["edition_order"]: doc
                                 for doc in flow._source_docs}
+        source_edition = getattr(flow, "source_edition", "")
+        try:
+            self.asset_index = (load_asset_index(project, source_edition)
+                                if source_edition else AssetIndex.empty(""))
+        except Exception:
+            self.asset_index = AssetIndex.empty(source_edition)
         self.reference_texts = dict(reference_texts or {
             order: doc["text"]
             for order, doc in flow._reference_by_source_order.items()})
@@ -334,6 +378,29 @@ class TranslationRunner:
 
     def source_rows(self, order: int) -> list[dict]:
         return list(self.source(order).get("rows") or [])
+
+    def prompt_rows(self, order: int) -> list[dict]:
+        rows = [dict(row) for row in self.source_rows(order)]
+        inline = self.asset_index.chapter_assets(order).get("inline") or []
+        by_paragraph: dict[int, list[dict]] = {}
+        for item in inline:
+            by_paragraph.setdefault(int(item.get("paragraph", 0)), []).append(item)
+        for row in rows:
+            placements = by_paragraph.get(int(row.get("ordinal", 0)))
+            if not placements:
+                continue
+            text = row.get("text", "")
+            for item in sorted(placements, key=lambda value: int(value.get("offset", 0)),
+                               reverse=True):
+                offset = max(0, min(int(item.get("offset", 0)), len(text)))
+                text = text[:offset] + f"[[IMG:{item['asset_id']}]]" + text[offset:]
+            row["text"] = text
+        return rows
+
+    def expected_markers(self, rows: Iterable[Mapping]) -> dict[str, list[str]]:
+        return {f"S{index:03d}": [match.group(1) for match in
+                                  _IMAGE_MARKER.finditer(str(row.get("text", "")))]
+                for index, row in enumerate(rows, 1)}
 
     def _check_limits(self):
         limits = self.project.config.limits
@@ -542,6 +609,8 @@ class TranslationRunner:
                          usage_sink: list | None = None) -> DraftChapter:
         source = self.source(order)
         rows = self.source_rows(order)
+        prompt_rows = self.prompt_rows(order)
+        expected_markers = self.expected_markers(prompt_rows)
         docs = (documents if documents is not None
                 else self.documents(order + 1, provisional=provisional))
         provisional_orders = tuple((provisional or {}).keys())
@@ -561,7 +630,7 @@ class TranslationRunner:
             batch_orders=batch, glossary=terms,
             unresolved=unresolved, threads=None,
             output_tokens=self.translation_tokens,
-            output_profile="source-records", source_rows=rows,
+            output_profile="source-records", source_rows=prompt_rows,
             provisional_orders=provisional_orders)
         if not report["fits"]:
             raise PipelineError("context_budget", "translation request exceeds capacity",
@@ -573,7 +642,8 @@ class TranslationRunner:
                                     f"translate_{order}",
                                     log_event=log_event, usage_sink=usage_sink)
             raw = result.text
-            parsed = self.parse_translation(raw, aliases)
+            parsed = self.parse_translation(raw, aliases,
+                                            expected_markers=expected_markers)
             if not parsed["errors"]:
                 break
             messages = messages[:-1] + [
@@ -587,12 +657,22 @@ class TranslationRunner:
                                 "translation output is incomplete",
                                 details={"order": order, "errors": parsed["errors"],
                                          "text": raw[-4000:]})
+        source_assets = self.asset_index.chapter_assets(order)
+        assets = {
+            "source_edition": getattr(self.flow, "source_edition", ""),
+            "inline": parsed["inline_assets"],
+            "block": source_assets.get("block", []),
+        }
+        asset_ids = {item["asset_id"] for item in assets["inline"]}
+        asset_ids.update(item["asset_id"] for item in assets["block"])
+        assets["asset_ids"] = sorted(asset_ids)
         return DraftChapter(order=order, source_id=source["entry_id"],
                             source_hash=source["text_hash"],
                             ja_title=source["raw_title"],
                             title_zh=parsed["title"], text=parsed["text"],
                             paragraphs=tuple(parsed["paragraphs"]),
-                            version=0, review={"protocol": parsed["profile"]})
+                            version=0, review={"protocol": parsed["profile"]},
+                            assets=assets)
 
     def translate_order(self, order: int) -> DraftChapter:
         draft = self._translate_draft(order, log_event=True)
@@ -600,12 +680,13 @@ class TranslationRunner:
             order=order, source_id=draft.source_id,
             source_hash=draft.source_hash, ja_title=draft.ja_title,
             title_zh=draft.title_zh, text=draft.text,
-            status="draft", review=draft.review)
+            status="draft", review=draft.review, assets=draft.assets)
         self.store.event("translate", order=order, version=version,
                          usage=None, paragraphs=len(draft.paragraphs))
         return replace(draft, version=version)
 
-    def parse_translation(self, text: str, aliases: Sequence[str]) -> dict:
+    def parse_translation(self, text: str, aliases: Sequence[str], *,
+                          expected_markers: Mapping[str, Sequence[str]] | None = None) -> dict:
         parsed = parse_records(
             text, {"TITLE", "TRANSLATION"},
             field_schema={"TITLE": {"text"}, "TRANSLATION": {"text"}},
@@ -631,15 +712,30 @@ class TranslationRunner:
             if not missing and not unknown:
                 errors.append("source_ids_must_be_an_ordered_partition")
         paragraphs = []
-        for row in translations:
+        inline_assets = []
+        expected_map = expected_markers or {}
+        for index, row in enumerate(translations):
             body = row["fields"].get("text", "").strip()
             if not body:
                 errors.append("empty_translation:" + row["id"])
-            paragraphs.append(" ".join(line.strip() for line in body.splitlines()
-                                       if line.strip()))
+            normalized = " ".join(line.strip() for line in body.splitlines()
+                                  if line.strip())
+            markers = [match.group(1) for match in _IMAGE_MARKER.finditer(normalized)]
+            expected = list(expected_map.get(row["id"], []))
+            if expected_markers is not None and markers != expected:
+                errors.append(
+                    "image_markers_mismatch:" + row["id"] +
+                    ":expected=" + ",".join(expected) +
+                    ":got=" + ",".join(markers))
+            clean, positions = _strip_markers(normalized)
+            paragraphs.append(clean)
+            for asset_id, offset in positions:
+                inline_assets.append({"paragraph": index, "offset": offset,
+                                      "asset_id": asset_id})
         return {"profile": "source-records", "errors": errors,
                 "title": title, "paragraphs": paragraphs,
                 "text": "\n\n".join(paragraphs),
+                "inline_assets": inline_assets,
                 "semantic_status": "not_verified"}
 
     # -- review -------------------------------------------------------------
@@ -846,11 +942,24 @@ class TranslationRunner:
                      if decisions.get(finding["id"], {}).get("decision") == "confirmed"]
         if not confirmed:
             return draft
-        rows = self.source_rows(draft.order)
+        rows = self.prompt_rows(draft.order)
+        expected_markers = self.expected_markers(rows)
         source = [{"ref": f"S{index:03d}", "text": row["text"]}
                   for index, row in enumerate(rows, 1)]
+        target_paragraphs = list(draft.paragraphs)
+        inline = (draft.assets or {}).get("inline") or []
+        by_paragraph: dict[int, list[dict]] = {}
+        for item in inline:
+            by_paragraph.setdefault(int(item.get("paragraph", 0)), []).append(item)
+        for paragraph_index, text in enumerate(target_paragraphs):
+            for item in sorted(by_paragraph.get(paragraph_index, []),
+                               key=lambda value: int(value.get("offset", 0)),
+                               reverse=True):
+                offset = max(0, min(int(item.get("offset", 0)), len(text)))
+                text = text[:offset] + f"[[IMG:{item['asset_id']}]]" + text[offset:]
+            target_paragraphs[paragraph_index] = text
         target = [{"ref": f"T{index:03d}", "text": text}
-                  for index, text in enumerate(draft.paragraphs, 1)]
+                  for index, text in enumerate(target_paragraphs, 1)]
         evidence = {
             "chapter": {"order": draft.order, "ja_title": draft.ja_title},
             "source": source,
@@ -879,7 +988,8 @@ class TranslationRunner:
                                     f"revise_{draft.order}",
                                     log_event=log_event, usage_sink=usage_sink)
             raw = result.text
-            parsed = self.parse_translation(raw, aliases)
+            parsed = self.parse_translation(raw, aliases,
+                                            expected_markers=expected_markers)
             if not parsed["errors"]:
                 break
             messages = messages[:-1] + [
@@ -891,13 +1001,22 @@ class TranslationRunner:
             raise ChapterBlocked("revision_protocol", "revision output is incomplete",
                                  details={"order": draft.order,
                                           "errors": parsed["errors"] if parsed else []})
+        assets = dict(draft.assets or {})
+        assets["source_edition"] = getattr(self.flow, "source_edition", "")
+        assets["inline"] = parsed["inline_assets"]
+        if not assets.get("block"):
+            assets["block"] = self.asset_index.chapter_assets(draft.order).get("block", [])
+        asset_ids = {item["asset_id"] for item in assets["inline"]}
+        asset_ids.update(item["asset_id"] for item in assets["block"])
+        assets["asset_ids"] = sorted(asset_ids)
         return DraftChapter(order=draft.order, source_id=draft.source_id,
                             source_hash=draft.source_hash, ja_title=draft.ja_title,
                             title_zh=parsed["title"], text=parsed["text"],
                             paragraphs=tuple(parsed["paragraphs"]),
                             version=0,
                             review={"protocol": parsed["profile"],
-                                    "revision_from": draft.version})
+                                    "revision_from": draft.version},
+                            assets=assets)
 
     def revise(self, draft: DraftChapter, review: ReviewOutcome,
                decisions: Mapping[str, Mapping]) -> DraftChapter:
@@ -908,7 +1027,7 @@ class TranslationRunner:
             order=revised.order, source_id=revised.source_id,
             source_hash=revised.source_hash, ja_title=revised.ja_title,
             title_zh=revised.title_zh, text=revised.text,
-            status="draft", review=revised.review)
+            status="draft", review=revised.review, assets=revised.assets)
         self.store.event("revise", order=revised.order, version=version,
                          confirmed=[finding["id"] for finding in confirmed])
         return replace(revised, version=version)
@@ -1146,7 +1265,7 @@ class TranslationRunner:
                         order=order, source_id=draft.source_id,
                         source_hash=draft.source_hash, ja_title=draft.ja_title,
                         title_zh=draft.title_zh, text=draft.text,
-                        status="draft", review=draft.review)
+                        status="draft", review=draft.review, assets=draft.assets)
                     draft = replace(draft, version=version)
                     self.store.event("translate", order=order, version=version,
                                      paragraphs=len(draft.paragraphs))
@@ -1197,7 +1316,7 @@ class TranslationRunner:
                                 ja_title=final.ja_title,
                                 title_zh=final.title_zh,
                                 text=final.text, status="accepted",
-                                review=review_data)
+                                review=review_data, assets=final.assets)
                         self.store.event("accept", order=final.order,
                                          version=version, rounds=result["rounds"],
                                          findings=len(result["review"].findings))
@@ -1215,7 +1334,7 @@ class TranslationRunner:
                             source_hash=final.source_hash,
                             ja_title=final.ja_title, title_zh=final.title_zh,
                             text=final.text, status="blocked",
-                            review=review_data)
+                            review=review_data, assets=final.assets)
                         self.store.event("blocked", order=final.order,
                                          reason=status)
                         blocked = (final.order, status)
@@ -1529,22 +1648,119 @@ def align_reference_by_titles(runner: TranslationRunner,
 
 
 # -- EPUB output -----------------------------------------------------------
+_ASSET_EXTENSIONS = {"image/jpeg": "jpg", "image/png": "png", "image/gif": "gif",
+                     "image/webp": "webp", "image/svg+xml": "svg"}
+
+
+def _asset_filename(asset_id: str, media_type: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", asset_id).strip("-") or "asset"
+    return safe + "." + _ASSET_EXTENSIONS.get(media_type, "bin")
+
+
+def _render_image(href: str, alt: str) -> str:
+    return (f'<img src="{html.escape(href, quote=True)}"'
+            f' alt="{html.escape(alt or "", quote=True)}"/>')
+
+
+def _render_paragraph(text: str, placements: Sequence[Mapping],
+                      asset_files: Mapping[str, Mapping]) -> str:
+    if not placements:
+        return f"<p>{html.escape(text)}</p>"
+    pieces: list[str] = []
+    cursor = 0
+    for item in sorted(placements, key=lambda value: int(value.get("offset", 0))):
+        offset = max(0, min(int(item.get("offset", 0)), len(text)))
+        if offset < cursor:
+            offset = cursor
+        pieces.append(html.escape(text[cursor:offset]))
+        asset = asset_files[item["asset_id"]]
+        pieces.append(_render_image("../images/" + asset["filename"],
+                                    asset.get("alt", "")))
+        cursor = offset
+    pieces.append(html.escape(text[cursor:]))
+    return "<p>" + "".join(pieces) + "</p>"
+
+
+def _render_block_image(asset_id: str, asset_files: Mapping[str, Mapping]) -> str:
+    asset = asset_files[asset_id]
+    return ('<p class="image">' +
+            _render_image("../images/" + asset["filename"], asset.get("alt", "")) +
+            "</p>")
+
+
 def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
-               language: str = "zh-CN") -> Path:
-    """Write a minimal valid EPUB 3 from ordered ``{title, paragraphs}`` rows."""
+               language: str = "zh-CN",
+               assets: Mapping[str, Mapping] | None = None,
+               cover_asset: str | None = None) -> Path:
+    """Write an EPUB 3 from ordered chapter rows, optionally with image assets.
+
+    ``assets`` maps asset_id to ``{data: bytes, media_type: str, alt: str}``.
+    Chapter assets use ``inline`` (paragraph/offset) and ``block``
+    (before_paragraph/after_paragraph) placements.
+    """
     output = Path(output)
     if output.exists():
         raise FileExistsError(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     identifier = "urn:uuid:" + str(uuid.uuid5(uuid.NAMESPACE_URL, title))
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    asset_source = dict(assets or {})
+    used_assets = {item["asset_id"] for chapter in chapters
+                   for item in ((chapter.get("assets") or {}).get("inline") or [])}
+    used_assets.update(item["asset_id"] for chapter in chapters
+                       for item in ((chapter.get("assets") or {}).get("block") or []))
+    if cover_asset:
+        used_assets.add(cover_asset)
+    missing = sorted(asset_id for asset_id in used_assets if asset_id not in asset_source)
+    if missing:
+        raise ValueError("missing asset data: " + ", ".join(missing))
+    asset_files: dict[str, dict] = {}
+    asset_manifest: list[str] = []
+    binary_files: dict[str, bytes] = {}
+    for asset_id in sorted(used_assets):
+        info = asset_source[asset_id]
+        media_type = info.get("media_type") or "application/octet-stream"
+        filename = _asset_filename(asset_id, media_type)
+        asset_files[asset_id] = {"filename": filename, "alt": info.get("alt", "")}
+        binary_files["OEBPS/images/" + filename] = info["data"]
+        manifest_id = "cover-image" if asset_id == cover_asset else "asset-" + re.sub(
+            r"[^A-Za-z0-9_.-]+", "-", asset_id)
+        properties = ' properties="cover-image"' if asset_id == cover_asset else ""
+        asset_manifest.append(
+            f'<item id="{manifest_id}" href="images/{filename}" '
+            f'media-type="{media_type}"{properties}/>')
+
     manifest, spine, nav = [], [], []
-    files = {}
+    files: dict[str, str | bytes] = {}
     for index, chapter in enumerate(chapters, 1):
         name = f"chapter-{index:04d}.xhtml"
         chapter_title = html.escape(chapter["title"] or f"第{index}章")
-        body = "\n".join(f"<p>{html.escape(text)}</p>"
-                         for text in chapter["paragraphs"] if text.strip())
+        chapter_assets = chapter.get("assets") or {}
+        inline_by_paragraph: dict[int, list[Mapping]] = {}
+        for item in chapter_assets.get("inline") or []:
+            inline_by_paragraph.setdefault(int(item.get("paragraph", 0)), []).append(item)
+        before: dict[int, list[str]] = {}
+        after: dict[int, list[str]] = {}
+        for item in chapter_assets.get("block") or []:
+            rendered = _render_block_image(item["asset_id"], asset_files)
+            if "before_paragraph" in item:
+                before.setdefault(int(item["before_paragraph"]), []).append(rendered)
+            else:
+                after.setdefault(int(item.get("after_paragraph", -1)), []).append(rendered)
+        parts: list[str] = list(after.get(-1, []))
+        paragraph_index = 0
+        for text in chapter["paragraphs"]:
+            if not text.strip():
+                continue
+            parts.extend(before.get(paragraph_index, []))
+            parts.append(_render_paragraph(text,
+                                           inline_by_paragraph.get(paragraph_index, []),
+                                           asset_files))
+            parts.extend(after.get(paragraph_index, []))
+            paragraph_index += 1
+        for extra in sorted(index for index in after if index >= paragraph_index):
+            parts.extend(after[extra])
+        body = "\n".join(parts)
         files[f"OEBPS/text/{name}"] = f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{language}">
@@ -1556,16 +1772,21 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
         manifest.append(f'<item id="c{index:04d}" href="text/{name}" media-type="application/xhtml+xml"/>')
         spine.append(f'<itemref idref="c{index:04d}"/>')
         nav.append(f'<li><a href="text/{name}">{chapter_title}</a></li>')
+    toc_title = "目錄" if language.lower().replace("_", "-") in {"zh-tw", "zh-hant"} else "目录"
     files["OEBPS/nav.xhtml"] = f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{language}">
-<head><meta charset="utf-8"/><title>目录</title></head>
-<body><nav epub:type="toc" id="toc"><h1>目录</h1><ol>
+<head><meta charset="utf-8"/><title>{toc_title}</title></head>
+<body><nav epub:type="toc" id="toc"><h1>{toc_title}</h1><ol>
 {''.join(nav)}
 </ol></nav></body></html>"""
     files["OEBPS/style.css"] = ("body{font-family:serif;line-height:1.8;margin:1.2em;}"
                                 "h1{font-size:1.4em;margin:1.2em 0;}"
-                                "p{text-indent:2em;margin:0.35em 0;}")
+                                "p{text-indent:2em;margin:0.35em 0;}"
+                                "p.image{text-align:center;text-indent:0;}"
+                                "p.image img{max-width:100%;height:auto;}")
+    cover_meta = ('<meta name="cover" content="cover-image"/>'
+                  if cover_asset else "")
     files["OEBPS/content.opf"] = f"""<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
 <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
@@ -1573,10 +1794,12 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
 <dc:title>{html.escape(title)}</dc:title>
 <dc:language>{language}</dc:language>
 <meta property="dcterms:modified">{modified}</meta>
+{cover_meta}
 </metadata>
 <manifest>
 <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
 <item id="css" href="style.css" media-type="text/css"/>
+{''.join(asset_manifest)}
 {''.join(manifest)}
 </manifest>
 <spine>
@@ -1592,6 +1815,8 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
                          compress_type=zipfile.ZIP_STORED)
         for name in sorted(files):
             archive.writestr(name, files[name], compress_type=zipfile.ZIP_DEFLATED)
+        for name, data in sorted(binary_files.items()):
+            archive.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
     return output
 
 
@@ -1614,14 +1839,16 @@ def verify_epub(path: str | Path) -> dict:
         ns = {"opf": "http://www.idpf.org/2007/opf",
               "dc": "http://purl.org/dc/elements/1.1/"}
         title = opf.find(".//dc:title", ns)
-        manifest = {item.attrib["id"]: item.attrib["href"]
-                    for item in opf.findall(".//opf:manifest/opf:item", ns)}
+        items = {item.attrib["id"]: item.attrib
+                 for item in opf.findall(".//opf:manifest/opf:item", ns)}
+        manifest = {key: item["href"] for key, item in items.items()}
         spine = [item.attrib["idref"]
                  for item in opf.findall(".//opf:spine/opf:itemref", ns)]
         if not spine or any(item not in manifest for item in spine):
             raise ValueError("invalid manifest/spine")
         base = opf_path.rsplit("/", 1)[0]
         total_chars, empty = 0, []
+        image_files, missing_images, image_mismatches = [], [], []
         for item in spine:
             href = manifest[item]
             if not href.endswith((".xhtml", ".html")):
@@ -1632,20 +1859,43 @@ def verify_epub(path: str | Path) -> dict:
             total_chars += len(text)
             if len(text) < 20:
                 empty.append(name)
+        for key, item in items.items():
+            if not (item.get("media-type") or "").startswith("image/"):
+                continue
+            name = f"{base}/{item['href']}" if base else item["href"]
+            image_files.append(name)
+            if name not in names or not archive.read(name):
+                missing_images.append(name)
+                continue
+            detected = sniff_media_type(archive.read(name), name)
+            if detected != item.get("media-type"):
+                image_mismatches.append({"file": name,
+                                         "declared": item.get("media-type"),
+                                         "detected": detected})
         return {"title": title.text if title is not None else None,
                 "zip_entries": len(names), "spine_items": len(spine),
                 "chapter_files": sum(1 for item in spine
                                      if manifest[item].endswith((".xhtml", ".html"))),
                 "total_chars": total_chars, "empty_files": empty,
+                "image_count": len(image_files), "image_files": image_files,
+                "missing_images": missing_images,
+                "image_mismatches": image_mismatches,
                 "size": path.stat().st_size}
 
 
 def collect_epub_chapters(*, runner: TranslationRunner,
                           reference_chapters: Sequence[dict],
-                          end: int | None = None) -> list[dict]:
+                          end: int | None = None,
+                          reference_assets: Mapping[int, Mapping] | None = None) -> list[dict]:
     """Collect the main line in reading order, preferring accepted target text."""
     end = runner.main_end if end is None else end
-    chapters = [dict(row) for row in reference_chapters]
+    reference_assets = reference_assets or {}
+    chapters = []
+    for row in reference_chapters:
+        chapter = dict(row)
+        chapter.setdefault("assets", reference_assets.get(chapter.get("order")) or
+                           {"inline": [], "block": []})
+        chapters.append(chapter)
     for order in range(runner.continuation_start, end):
         source = runner.source_by_order.get(order)
         if source is None or _is_extra_title(source["raw_title"]):
@@ -1656,5 +1906,6 @@ def collect_epub_chapters(*, runner: TranslationRunner,
                                 f"chapter {order} is not accepted")
         chapters.append({"title": row["title_zh"],
                          "paragraphs": row["text"].split("\n\n"),
-                         "order": order, "source": "target"})
+                         "order": order, "source": "target",
+                         "assets": row.get("assets") or {"inline": [], "block": []}})
     return chapters
