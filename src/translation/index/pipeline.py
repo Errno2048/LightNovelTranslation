@@ -259,32 +259,43 @@ class TranslationStore:
 
 
 class TranslationRunner:
-    """Translate one chapter at a time, review it, and commit only accepted text."""
+    """Translate, review, and commit chapters with resumable SQLite state."""
 
     def __init__(self, project, flow: TranslationWorkflow, store: TranslationStore, *,
                  continuation_start: int, main_end: int,
                  glossary: Iterable[GlossaryTerm] = (),
                  reference_texts: Mapping[int, str] | None = None,
-                 history_chapters: int = 3, summary_every: int = 5,
-                 summary_lag: int | None = 0,
-                 max_revisions: int = 2, translation_tokens: int = 65536,
-                 review_tokens: int = 65536, adjudication_tokens: int = 32768,
-                 reference_chunk: int = 8):
+                 history_chapters: int | None = None,
+                 summary_every: int | None = None,
+                 summary_lag: int | None = None,
+                 max_revisions: int | None = None,
+                 translation_tokens: int | None = None,
+                 review_tokens: int | None = None,
+                 adjudication_tokens: int | None = None,
+                 reference_chunk: int | None = None):
         self.project = project
         self.flow = flow
         self.store = store
         self.continuation_start = continuation_start
         self.main_end = main_end
         self.glossary = list(glossary)
-        self.history_chapters = history_chapters
-        self.summary_every = summary_every
-        self.summary_lag = (flow.full_chapters if summary_lag is None
-                            else summary_lag)
-        self.max_revisions = max_revisions
-        self.translation_tokens = translation_tokens
-        self.review_tokens = review_tokens
-        self.adjudication_tokens = adjudication_tokens
-        self.reference_chunk = reference_chunk
+        workflow = project.config.workflow
+        self.history_chapters = (workflow.history_chapters
+                                 if history_chapters is None else history_chapters)
+        self.summary_every = (workflow.summary_every
+                              if summary_every is None else summary_every)
+        self.summary_lag = (workflow.summary_lag
+                            if summary_lag is None else summary_lag)
+        self.max_revisions = (workflow.max_revisions
+                              if max_revisions is None else max_revisions)
+        self.translation_tokens = (workflow.translation_tokens
+                                   if translation_tokens is None else translation_tokens)
+        self.review_tokens = (workflow.review_tokens
+                              if review_tokens is None else review_tokens)
+        self.adjudication_tokens = (workflow.adjudication_tokens
+                                    if adjudication_tokens is None else adjudication_tokens)
+        self.reference_chunk = (workflow.reference_chunk
+                                if reference_chunk is None else reference_chunk)
         self.source_by_order = {doc["edition_order"]: doc
                                 for doc in flow._source_docs}
         self.reference_texts = dict(reference_texts or {
@@ -975,9 +986,9 @@ class TranslationRunner:
         }
 
     def run_concurrent(self, start: int | None = None, end: int | None = None,
-                       *, translation_concurrency: int = 1,
-                       review_concurrency: int = 4, batch_size: int = 30,
-                       lookahead: int = 1,
+                       *, translation_concurrency: int | None = None,
+                       review_concurrency: int | None = None,
+                       batch_size: int | None = None,
                        update_summaries: bool = True) -> dict:
         """Translate a batch with source-only intra-batch context, in parallel.
 
@@ -988,6 +999,13 @@ class TranslationRunner:
         Reviews/adjudication/revisions then run concurrently; acceptance is
         written in order by the main thread.
         """
+        workflow = self.project.config.workflow
+        translation_concurrency = (workflow.translation_concurrency
+                                   if translation_concurrency is None
+                                   else translation_concurrency)
+        review_concurrency = (workflow.review_concurrency
+                              if review_concurrency is None else review_concurrency)
+        batch_size = workflow.batch_size if batch_size is None else batch_size
         if translation_concurrency < 1 or review_concurrency < 1 or batch_size < 1:
             raise ValueError("concurrency and batch_size must be positive")
         start = self.continuation_start if start is None else start

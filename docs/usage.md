@@ -29,6 +29,8 @@ python -m lightnovel_translation config check
 
 用户在本地填写 `[model]` 的 `model`、`base_url`、`api_key`，以及实际 `[capacity]` 和角色输出预算。Agent 不读取、打印、复制或上传凭据文件；`config check` 只返回路径、就绪状态和缺失字段名。
 
+新工作流的批次大小、并发数、上下文窗口、摘要节奏和各阶段输出预算在 `[workflow]` 节；模板已给出新默认值。旧的 `[sequence]` 节只在没有 `[workflow]` 时提供兼容迁移（`translation_concurrency`、`review_concurrency`），其余参数使用新的 workflow 默认值。
+
 `TranslationProject(workspace)` 自动加载用户配置；显式传入 `TranslationConfig()` 可做无模型本地工作；`config="custom.toml"` 使用指定文件。
 
 ## 导入语料
@@ -53,7 +55,6 @@ from translation.index import TranslationWorkflow, GlossaryTerm, LevelConfig
 flow = TranslationWorkflow(
     project, "web-ja", "web-zh",
     levels=LevelConfig((10, 10), (3, 1)),
-    full_chapters=10,
 )
 plan = flow.reference_plan()
 print(len(plan.blocks), len(plan.by_level(1)), len(plan.by_level(2)))
@@ -127,10 +128,7 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner = TranslationRunner(
         project, flow, store, continuation_start=199, main_end=260,
         reference_texts=reference_by_source_order,
-        history_chapters=3, summary_every=5, summary_lag=0,
-        max_revisions=2,
-        translation_tokens=65536, review_tokens=65536,
-        adjudication_tokens=32768)
+        )
     runner.ensure_reference_summary()   # 官方参考的滚动摘要
     runner.ensure_glossary()            # 日中双语对照术语
     for order in range(199, 260):
@@ -146,20 +144,13 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
 - `TranslationStore` 保存不可变版本、accepted 文本、滚动摘要、术语和事件；重启后从同一 SQLite 继续。
 - 官方文库与 Web 的章号可能因拆章/合章/插图页不同，`reference_texts` 必须来自人工核对锚点或模型对齐，不能按序号硬配。
 
-长任务可使用窗口化并发：
+长任务可使用批次并发：
 
 ```python
-spec = project.config.sequence_spec()
-runner.run_concurrent(
-    start=199, end=260,
-    translation_concurrency=spec.translation_concurrency,  # 默认 3
-    review_concurrency=spec.review_concurrency,            # 默认 4
-    batch_size=30,                                         # 按容量选择
-    update_summaries=True,
-)
+runner.run_concurrent(start=199, end=260)
 ```
 
-批次内章节没有译文依赖：翻译第 i 章时使用“共享已接受前缀 + 批内前序章节的日文原文”，不使用同批其他章节译文。批次开始前会做一次专名预抽取，所有翻译 worker 共享术语表；`translation_concurrency` 个翻译请求并发执行。审校/裁决/修订按 `review_concurrency` 并发，同批已有译文只作为审校的 provisional 历史。主线程按顺序提交 accepted。`batch_size` 过大可能超出上下文，较小模型应减小批次。
+默认参数来自配置文件的 `[workflow]` 节（并发数、批次大小、上下文窗口、摘要节奏和输出预算）；需要临时覆盖时再显式传参。批次内章节没有译文依赖：翻译第 i 章时使用“共享已接受前缀 + 批内前序章节的日文原文”，不使用同批其他章节译文。批次开始前会做一次专名预抽取，所有翻译 worker 共享术语表；`translation_concurrency` 个翻译请求并发执行。审校/裁决/修订按 `review_concurrency` 并发，同批已有译文只作为审校的 provisional 历史。主线程按顺序提交 accepted。`batch_size` 过大可能超出上下文，较小模型应减小批次。
 
 ## 任务 DAG 与指针
 

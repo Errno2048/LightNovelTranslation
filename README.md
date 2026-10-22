@@ -24,8 +24,7 @@ with TranslationProject("workspaces/my-novel") as project:
     source = project.import_book("web-ja.epub", edition_id="web-ja", language="ja")
     reference = project.import_book("web-zh.epub", edition_id="web-zh", language="zh")
     flow = TranslationWorkflow(project, "web-ja", "web-zh",
-                         levels=LevelConfig((10, 10), (3, 1)),
-                         full_chapters=10)
+                         levels=LevelConfig((10, 10), (3, 1)))
 
     plan = flow.reference_plan()                 # 只规划 not_created 边界
     docs = flow.documents(start=0, end=112)

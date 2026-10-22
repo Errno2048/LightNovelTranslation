@@ -32,7 +32,6 @@ with TranslationProject("work/my-novel") as project:
     flow = TranslationWorkflow(
         project, "web-ja", "web-zh",
         levels=LevelConfig((10, 10), (3, 1)),
-        full_chapters=10,
     )
 ```
 
@@ -158,14 +157,10 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
         project, flow, store,
         continuation_start=199, main_end=260,
         reference_texts=reference_by_source_order,   # 官方参考 -> Web 话序
-        history_chapters=3, summary_every=5, summary_lag=0,
-        max_revisions=2,
-        translation_tokens=65536, review_tokens=65536,
-        adjudication_tokens=32768)
+        )
     runner.ensure_reference_summary()
     runner.ensure_glossary()
-    for order in range(199, 260):
-        runner.run_order(order)          # 每章一个可恢复事务
+    runner.run_concurrent(start=199, end=260)
     runner.update_target_summary(force=True)
     chapters = collect_epub_chapters(
         runner=runner, reference_chapters=official_chapters, end=260)
@@ -182,24 +177,19 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
 
 恢复时直接用同一 SQLite 重新构造 runner；accepted 章节会跳过。`blocked` 章节会重新进入草稿流程，或由 agent 检查 `review` 字段后局部接管。
 
-长任务使用 `run_concurrent` 窗口化执行：
+长任务使用 `run_concurrent` 批次执行：
 
 ```python
-spec = project.config.sequence_spec()
-runner.run_concurrent(
-    start=continuation, end=main_end,
-    translation_concurrency=spec.translation_concurrency,  # 默认 3
-    review_concurrency=spec.review_concurrency,            # 默认 4
-    batch_size=30,                                         # 按容量选择
-    update_summaries=True,
-)
+runner.run_concurrent(start=continuation, end=main_end)
 ```
+
+`translation_concurrency`、`review_concurrency`、`batch_size` 等默认值来自配置文件的 `[workflow]` 节；需要临时覆盖时再显式传参。`batch_size` 必须与模型上下文容量匹配。
 
 - 批次内章节**没有译文依赖**：翻译第 i 章时，上下文使用共享已接受前缀 + 批内前序章节的**日文原文**；不使用同批其他章节的译文。
 - 批次开始前做一次专名预抽取，生成所有 worker 共享的术语表；已有术语沿用原译名，新术语统一候选。`translation_concurrency` 控制并发翻译请求数。
 - 审校、裁决和修订在 `review_concurrency` 个线程中并发；审校历史可把同批已有译文作为 `provisional_target`，仅用于一致性检查。主线程按顺序写 accepted，SQLite 保持单写者。
 - 某章 blocked 时批次停止；已完成章节保留，修复后从同一 SQLite 续跑。
-- `batch_size` 决定批内前序原文的长度；1M 上下文可用数十章，较小模型应减小批次或增加高层摘要。`lookahead` 参数仅为旧调用兼容保留，不再驱动翻译上下文。
+- `batch_size` 决定批内前序原文的长度；1M 上下文可用数十章，较小模型应减小批次或增加高层摘要。
 
 ## 8. 当前自动化边界与手动接管
 

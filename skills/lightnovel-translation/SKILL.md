@@ -43,8 +43,7 @@ with TranslationProject("work/my-novel") as project:
     source = project.import_book("web-ja.epub", edition_id="web-ja", language="ja")
     reference = project.import_book("web-zh.epub", edition_id="web-zh", language="zh")
     flow = TranslationWorkflow(project, "web-ja", "web-zh",
-                         levels=LevelConfig((10, 10), (3, 1)),
-                         full_chapters=10)
+                               levels=LevelConfig((10, 10), (3, 1)))
 ```
 
 先核对阅读顺序、标题和起始位置；不能把标题数字直接当数组下标。参考译文只作术语/风格候选，日文是事实来源。
@@ -114,17 +113,10 @@ from translation.index import (TranslationRunner, TranslationStore,
 with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner = TranslationRunner(
         project, flow, store, continuation_start=199, main_end=260,
-        reference_texts=reference_by_source_order,
-        translation_tokens=65536, review_tokens=65536,
-        adjudication_tokens=32768)
+        reference_texts=reference_by_source_order)
     runner.ensure_reference_summary()
     runner.ensure_glossary()
-    spec = project.config.sequence_spec()
-    runner.run_concurrent(
-        start=199, end=260,
-        translation_concurrency=spec.translation_concurrency,
-        review_concurrency=spec.review_concurrency,
-        batch_size=30)
+    runner.run_concurrent(start=199, end=260)
     runner.update_target_summary(force=True)
     chapters = collect_epub_chapters(
         runner=runner, reference_chapters=official_chapters, end=260)

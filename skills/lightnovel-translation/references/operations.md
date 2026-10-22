@@ -100,7 +100,7 @@ runner.ensure_glossary()           # 双语对照抽词，按 chunk 记录 gloss
 - 摘要和术语都是可选的；失败不应阻止翻译，但会降低远距上下文质量。
 - 摘要/术语分块默认 16 章；输出预算至少 16,384，因为推理 token 也计入 `max_tokens`。
 - 术语表是候选，不是审定规范；冲突以日文和人工核对为准。
-- 目标摘要默认 `summary_every=5, summary_lag=0`。摘要与近期全文**允许有限重叠**，用于避免“摘要结束在全文窗口之前”造成空洞。
+- 目标摘要默认由 `[workflow]` 的 `summary_every` / `summary_lag` 控制（当前默认 5 / 0）。摘要与近期全文**允许有限重叠**，用于避免“摘要结束在全文窗口之前”造成空洞。
 - 不要把 `summary_lag` 设成 `full_chapters` 同时把 `summary_every` 设为 10：这会在两次摘要之间留下最多 5 章的覆盖空洞。
 - 续跑前先调用 `runner.update_target_summary()` 补齐摘要；它会跳过番外/缺失 order。若摘要停在某个番外话号附近，检查 `contiguous_accepted_end` 是否已修复为跳过 extra（本仓库已修复）。
 
@@ -114,38 +114,41 @@ runner.ensure_glossary()           # 双语对照抽词，按 chunk 记录 gloss
 | `reference_chunk` | 16 |
 | 翻译 / 审校 / 裁决 / 修订输出 | 65,536 / 65,536 / 32,768 / 65,536 |
 | 摘要 / 术语输出 | 16,384 / 16,384 |
-| 翻译批大小 | 1 章/请求 |
+| 翻译批大小 | 30 章/批；`translation_concurrency` 个请求并发 |
 
 ## 2. 并发运行参数
 
 ### 2.1 `run_concurrent` 的真实语义
 
 ```python
-spec = project.config.sequence_spec()
-runner.run_concurrent(
-    start=continuation, end=main_end,
-    translation_concurrency=spec.translation_concurrency,  # 例如 3
-    review_concurrency=spec.review_concurrency,            # 例如 4
-    batch_size=30,                                         # 按实际容量选择
-    update_summaries=True,
-)
+runner.run_concurrent(start=continuation, end=main_end)
 ```
+
+`translation_concurrency`、`review_concurrency`、`batch_size` 等默认值由配置文件的 `[workflow]` 节提供；临时覆盖时才显式传参。
 
 - 批次按 `batch_size` 切分。**同批次章节之间没有译文依赖**：翻译第 i 章时，上下文由“共享已接受前缀”加“批内前序章节的日文原文”组成；前序章节的译文不进入 prompt。
 - 翻译前执行一次批次专名预抽取：模型读取本批次日文原文与已有术语表，沿用已有译名并补充新专名；所有翻译 worker 使用同一份术语表。这样即使批内看不到彼此的译文，也能统一人名/地名/组织名。
 - `translation_concurrency` 控制批次内并发翻译请求数；`review_concurrency` 控制审校/裁决/修订并发。主线程按顺序写 accepted，SQLite 保持单写者。
 - 批内前序**译文**只在审校阶段作为 provisional 历史使用（所有译文已完成），用于检查跨章一致性；它们不参与翻译上下文。
 - 某章 blocked 时该批停止；已完成 accepted 的章节保留，其余 draft 不自动接受。修复后从同一 SQLite 续跑，未 accepted 的章节会重新进入批次翻译。
-- `lookahead` 参数保留用于旧调用兼容，但批次源文模式下不参与翻译上下文；不要再用它期待“前一章译文”链。
 - 顺序调试/单章复现用 `run_order(order)`；长任务用 `run_concurrent`。
 - `batch_size` 不是越大越好：第 30 章的 prompt 会包含前 29 章的日文原文。1M 上下文可支持数十章；较小模型应减小批次或依赖更高层摘要，否则会触发 `context_budget`。批内前序原文是完整源文，不包含同批译文。
 
-### 2.2 旧 `[sequence]` 参数
+### 2.2 配置项归属
 
-- `review_concurrency`、`provisional_lookahead`：`run_concurrent` 会读取。
-- `translation_concurrency`、`window_l2_blocks`、`workset_recent_chapters`：新 runner 未使用。
-- `max_requests` / `max_input_tokens` / `max_output_tokens`：新 runner 未强制总账；每次模型调用写入 `events` 的 `model` 记录。不要把旧 limits 当成费用护栏。
-- `sequence.max_revisions` 与 `TranslationRunner(max_revisions=...)` 是两套；以构造参数为准。
+新工作流的默认值在 `[workflow]`：
+
+| 配置 | 作用 |
+|---|---|
+| `translation_concurrency` / `review_concurrency` | 翻译 / 审校并发请求数 |
+| `batch_size` | 批次包含的章节数，必须与上下文容量匹配 |
+| `full_chapters` / `history_chapters` | 近期全文窗口 / 审校历史章数 |
+| `summary_every` / `summary_lag` / `reference_chunk` | 目标摘要节奏 / 参考摘要与术语分批 |
+| `max_revisions` | critical/major 修订上限 |
+| `translation_tokens` / `review_tokens` / `adjudication_tokens` | 各阶段输出预算 |
+| `summary_tokens` / `glossary_tokens` | 摘要 / 术语抽取输出预算 |
+
+旧 `[sequence]` 仅用于兼容：没有 `[workflow]` 时，`translation_concurrency`、`review_concurrency` 会从旧值迁移；其他旧字段（包括 `max_revisions`）不再驱动新 runner，使用 workflow 默认值。`max_requests` / `max_input_tokens` / `max_output_tokens` 也不会被新 runner 强制执行；每次模型调用写入 `events` 的 `model` 记录。不要把旧 limits 当成费用护栏。配置模板见 [config.example.toml](../assets/config.example.toml)。
 
 ### 2.3 输出预算与截断
 

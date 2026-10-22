@@ -19,68 +19,40 @@ thinking = "omit"
 
 [capacity]
 # Set the actual endpoint limits; these values do not detect the model's abilities.
-context_window_tokens = 131072
-max_output_tokens = 16384
+# The workflow defaults below assume a large-context model; lower batch_size and
+# output budgets together if your endpoint is smaller.
+context_window_tokens = 1048576
+max_output_tokens = 131072
 token_inflation_factor = 1.05
 safety_tokens = 2048
 
 [roles.translator]
-requested_output_tokens = 8192
+requested_output_tokens = 65536
 [roles.reviewer]
-requested_output_tokens = 8192
+requested_output_tokens = 65536
 [roles.adjudicator]
-requested_output_tokens = 8192
+requested_output_tokens = 32768
 [roles.indexer]
-requested_output_tokens = 16384
+requested_output_tokens = 32768
 [roles.compressor]
-requested_output_tokens = 8192
+requested_output_tokens = 16384
+[roles.revision]
+requested_output_tokens = 65536
 
-[index]
-parent_max_chapters = 100
-parent_min_chapters = 30
-expected_l2_count = 10
-l2_prepartition_min_chapters = 3
-parent_build_mode = "direct" # Strict one-pass L1; choose rollup explicitly if needed.
-child_max_chapters = 100 # Legacy hard cap; token balance determines normal L2 sizes.
-child_target_tokens = 64000
-child_min_content_tokens = 4000
-entity_catalog_threshold = 50
-core_entity_limit = 50
-
-[sequence]
-strategy = "H"
-mode = "working"
-n_chapter = 3
-n_child = 2
-compression_trigger = 0.85
-compression_target = 0.65
-max_revisions = 1
-translation_tools = true
-targeted_evidence = true
-workset_max_tokens = 128000
-workset_recent_chapters = 25
-thread_reconcile = true
-window_l2_blocks = 3
+[workflow]
+# Batch-source translation: chapters in a batch do not depend on each other's
+# translations. A batch-wide glossary keeps names consistent.
 translation_concurrency = 3
 review_concurrency = 4
-provisional_lookahead = 1
-output_profile = "source-records"
-
-[references]
-# Leave token budgets unset to derive them from capacity, output reserves and inflation.
-# packet_token_budget = 96000
-# terminology_input_tokens = 24000
-style_max_documents = 3
-style_excerpt_paragraphs = 48
-terminology_max_terms = 16
-# terminology_output_tokens = 16384 # Unset: use the indexer role's output allowance.
-terminology_max_documents = 12
-terminology_radius = 2
-discover_terms = true
-
-[limits]
-# Separate persistent limits for every index and every translation job. Zero is unlimited.
-max_requests = 0
-max_input_tokens = 0
-max_output_tokens = 0
-max_attempts = 3
+batch_size = 30 # Must fit the endpoint context with preceding batch sources.
+full_chapters = 5 # Recently accepted chapters included as full text.
+history_chapters = 3 # Recent accepted chapters included in review evidence.
+summary_every = 5 # Generate an incremental target summary every N chapters.
+summary_lag = 0 # 0 keeps summaries current; do not combine a large lag with a sparse cadence.
+reference_chunk = 16 # Chapters per reference summary/glossary request.
+max_revisions = 2 # Confirmed critical/major findings trigger at most this many rewrites.
+translation_tokens = 65536
+review_tokens = 65536
+adjudication_tokens = 32768
+summary_tokens = 16384
+glossary_tokens = 16384

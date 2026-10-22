@@ -35,11 +35,16 @@ class TranslationWorkflow:
     levels: LevelConfig = field(default_factory=lambda: LevelConfig((10, 10), (3, 1)))
     estimate_factor: float = 1.15
     prompt_overhead: int = 2048
-    full_chapters: int = 10
-    reference_summary_tokens: int = 4096
+    full_chapters: int | None = None
+    reference_summary_tokens: int | None = None
     reference_map: Mapping[int, int] | None = None
 
     def __post_init__(self):
+        workflow = self.project.config.workflow
+        if self.full_chapters is None:
+            self.full_chapters = workflow.full_chapters
+        if self.reference_summary_tokens is None:
+            self.reference_summary_tokens = workflow.summary_tokens
         self.archive = self.project._archive([self.source_edition, self.reference_edition])
         self._source_docs = self.archive.documents(self.source_edition)
         self._reference_docs = self.archive.documents(self.reference_edition)

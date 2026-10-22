@@ -84,9 +84,10 @@ def test_runner_accepts_a_clean_review(tmp_path: Path):
         with TranslationStore(tmp_path / "translation.sqlite") as store:
             runner = TranslationRunner(
                 project, flow, store, continuation_start=1, main_end=2,
-                reference_texts={0: "诺亚回到了村子。\n\n众人听他讲述旅途。"},
-                translation_tokens=256, review_tokens=256,
-                adjudication_tokens=256)
+                reference_texts={0: "诺亚回到了村子。\n\n众人听他讲述旅途。"})
+            assert runner.translation_tokens == project.config.workflow.translation_tokens
+            assert runner.review_tokens == project.config.workflow.review_tokens
+            assert runner.adjudication_tokens == project.config.workflow.adjudication_tokens
             result = runner.run_order(1)
             assert result["status"] == "accepted"
             assert store.translations()[1] == "诺亚回到了村子。\n\n众人听他讲述旅途。"

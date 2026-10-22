@@ -19,6 +19,40 @@ from .acquisition_config import SyosetuConfig
 
 
 @dataclass(frozen=True)
+class WorkflowConfig:
+    """Defaults for the resumable, batch-concurrent translation workflow."""
+    translation_concurrency: int = 3
+    review_concurrency: int = 4
+    batch_size: int = 30
+    full_chapters: int = 5
+    history_chapters: int = 3
+    summary_every: int = 5
+    summary_lag: int = 0
+    reference_chunk: int = 16
+    max_revisions: int = 2
+    translation_tokens: int = 65536
+    review_tokens: int = 65536
+    adjudication_tokens: int = 32768
+    summary_tokens: int = 16384
+    glossary_tokens: int = 16384
+
+    def __post_init__(self):
+        for name in ('translation_concurrency', 'review_concurrency',
+                     'batch_size', 'full_chapters', 'summary_every',
+                     'reference_chunk', 'translation_tokens', 'review_tokens',
+                     'adjudication_tokens', 'summary_tokens', 'glossary_tokens'):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ConfigurationError(f'workflow.{name} must be a positive integer')
+        if type(self.history_chapters) is not int or self.history_chapters < 0:
+            raise ConfigurationError('workflow.history_chapters must be a nonnegative integer')
+        if type(self.summary_lag) is not int or self.summary_lag < 0:
+            raise ConfigurationError('workflow.summary_lag must be a nonnegative integer')
+        if type(self.max_revisions) is not int or not 0 <= self.max_revisions <= 8:
+            raise ConfigurationError('workflow.max_revisions must be between 0 and 8')
+
+
+@dataclass(frozen=True)
 class ReferenceConfig:
     """Optional prose budgets; None derives a limit from the model capacity."""
     packet_token_budget: int | None = None
@@ -100,7 +134,7 @@ class TranslationConfig:
     Without a model the project supports local operations and provider injection.
     """
     model: ModelConfig | None = None
-    capacity: ModelCapacity = field(default_factory=lambda: ModelCapacity(131072, 16384))
+    capacity: ModelCapacity = field(default_factory=lambda: ModelCapacity(1048576, 131072))
     roles: dict[str, RoleBudget] = field(default_factory=dict)
     index: EditionIndexSpec = field(default_factory=EditionIndexSpec)
     sequence: dict[str, Any] = field(default_factory=dict)
@@ -108,12 +142,20 @@ class TranslationConfig:
     references: ReferenceConfig = field(default_factory=ReferenceConfig)
     tokenizer_path: Path | None = None
     syosetu: SyosetuConfig = field(default_factory=SyosetuConfig)
+    workflow: WorkflowConfig = field(default_factory=WorkflowConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.syosetu, SyosetuConfig):
             raise ConfigurationError('syosetu must be a SyosetuConfig instance')
         if not isinstance(self.references, ReferenceConfig):
             raise ConfigurationError('references must be a ReferenceConfig instance')
+        if not isinstance(self.workflow, WorkflowConfig):
+            raise ConfigurationError('workflow must be a WorkflowConfig instance')
+        for name in ('translation_tokens', 'review_tokens', 'adjudication_tokens',
+                     'summary_tokens', 'glossary_tokens'):
+            if getattr(self.workflow, name) > self.capacity.max_output_tokens:
+                raise ConfigurationError(
+                    f'workflow.{name} exceeds capacity.max_output_tokens')
         if self.model and self.model.retries != 0:
             raise ConfigurationError("model.retries must be 0; use limits.max_attempts for durable retries")
         if self.model and self.model.capacity and self.model.capacity != self.capacity:
@@ -175,6 +217,7 @@ class TranslationConfig:
                 "capacity": asdict(self.capacity),
                 "roles": {k: asdict(v) for k, v in self.role_budgets().items()},
                 "index": asdict(self.index), "sequence": asdict(self.sequence_spec()),
+                "workflow": asdict(self.workflow),
                 "limits": asdict(self.limits),
                 "references": asdict(self.references),
                 "syosetu": asdict(self.syosetu),
@@ -214,8 +257,8 @@ class TranslationConfig:
         if value.pop("schema_version", 1) != 1:
             raise ConfigurationError("unsupported configuration schema_version")
         try:
-            capacity = ModelCapacity(**value.get("capacity", {"context_window_tokens": 131072,
-                                                             "max_output_tokens": 16384}))
+            capacity = ModelCapacity(**value.get("capacity", {
+                "context_window_tokens": 1048576, "max_output_tokens": 131072}))
             raw_model = value.get("model")
             model = None
             if raw_model is not None:
@@ -238,10 +281,26 @@ class TranslationConfig:
                 if not tokenizer.is_absolute():
                     tokenizer = (base or Path.cwd()) / tokenizer
                 tokenizer = tokenizer.resolve()
+            raw_sequence = value.get("sequence", {})
+            raw_workflow = value.get("workflow")
+            if raw_workflow is None:
+                raw_workflow = {}
+            else:
+                raw_workflow = _known(raw_workflow,
+                                      {f.name for f in fields(WorkflowConfig)},
+                                      "workflow")
+            # Legacy sequence files still supply concurrency controls that
+            # existed before the dedicated workflow section. Other old fields
+            # do not override the new workflow defaults.
+            for key in ("translation_concurrency", "review_concurrency"):
+                if key not in raw_workflow and key in raw_sequence:
+                    raw_workflow[key] = raw_sequence[key]
+            workflow = WorkflowConfig(**raw_workflow)
             return cls(model=model, capacity=capacity,
                        roles={k: RoleBudget(**v) for k, v in value.get("roles", {}).items()},
                        index=EditionIndexSpec(**value.get("index", {})),
-                       sequence=value.get("sequence", {}), limits=Limits(**value.get("limits", {})),
+                       sequence=raw_sequence, workflow=workflow,
+                       limits=Limits(**value.get("limits", {})),
                        references=ReferenceConfig(**value.get('references', {})),
                        syosetu=SyosetuConfig.from_dict(value.get('syosetu', {})),
                        tokenizer_path=tokenizer)
