@@ -9,7 +9,7 @@ from .schemas import NarrativeError
 from .service import dependency
 
 PROMPT_VERSION = "narrative-bilingual-summary-v2"
-SCHEMA_VERSION = "bilingual-block-v2"
+SCHEMA_VERSION = "bilingual-block"
 KINDS = {"person", "organization", "place", "item", "ability", "species", "role", "other"}
 
 

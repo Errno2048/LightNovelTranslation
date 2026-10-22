@@ -46,7 +46,7 @@ PARAGRAPH_REFERENCE_TASK = ('\n【引用协议覆盖】source_ref和target_ref�
 def parse_review(version, text, extra_rows=(), *, parsed=None, chapter_cross_references=True, intermediate_end=True,
                  allow_label_only=False, review_profile='legacy', signal_candidates=None, derive_count=False,
                  count_policy='strict'):
-    if count_policy not in {'strict','records-v1'}:
+    if count_policy not in {'strict','records'}:
         raise ValueError('unknown review count policy')
     enhanced = review_profile in AUDIT_PROFILES
     allowed = {"FINDING", "UNRESOLVED", "SUMMARY"} | ({'SIGNAL'} if signal_candidates is not None else set())
@@ -95,7 +95,7 @@ def parse_review(version, text, extra_rows=(), *, parsed=None, chapter_cross_ref
         count_note='missing_zero_findings_derived_from_record_count'
     expected_count = 'no' if findings else 'yes'
     count_warning = None
-    if (count_policy=='records-v1' and len(summaries)==1 and parsed['complete']
+    if (count_policy=='records' and len(summaries)==1 and parsed['complete']
             and summary.get('zero_findings') in {'yes','no',None}):
         if summary.get('zero_findings') != expected_count:
             count_warning={'code':'finding_count_declaration_conflict' if 'zero_findings' in summary else 'missing_zero_findings',
@@ -105,7 +105,7 @@ def parse_review(version, text, extra_rows=(), *, parsed=None, chapter_cross_ref
     if summary.get("zero_findings") != expected_count: errors.append("finding_count_declaration_conflict")
     data = {"findings": findings, "unresolved": unresolved, "summary": summary, "errors": errors,
             "review_complete": not errors, "semantic_coverage_reviewed": not errors and summary.get("semantic_coverage_complete") == "yes"}
-    if count_policy=='records-v1':
+    if count_policy=='records':
         data.update(count_policy=count_policy,declared_summary=declared_summary,
                     protocol_warnings=[count_warning] if count_warning else [])
     if parsed.get('leading_prose'):
@@ -137,7 +137,7 @@ def review_translation(session, version_id, *, lookup_ids=(), prior_report_id=No
     rows, evidence = lookup_evidence(session.view, version_id, lookup_ids)
     enhanced = review_profile in AUDIT_PROFILES
     messages = text_messages(v, AUDIT_PROFILES[review_profile][0] if enhanced else REVIEW_TASK)
-    tolerant_protocol = review_profile in {'audit-v5','audit-v6'}
+    tolerant_protocol = review_profile == 'chapter-review'
     context = session.view.store.get(v["context_id"], "review-context")
     # Context is optional; source and draft remain explicit, tagged, first-class inputs.
     evidence_context = None
@@ -196,19 +196,19 @@ def review_translation(session, version_id, *, lookup_ids=(), prior_report_id=No
         rows += tool_rows
     parsed, repair_id = decode_records(session, version_id, raw, allowed,
                                        extra_fields=AUDIT_FIELDS if enhanced else None,
-                                       syntax_profile='p6-tolerant-v1' if tolerant_protocol else 'legacy',
+                                       syntax_profile='tolerant-records' if tolerant_protocol else 'legacy',
                                        allow_preamble=tolerant_protocol)
     mode = ("candidate_assisted" if candidate_observations else "followup" if prior_report_id
             else "lookup_assisted" if lookup_ids else "rule_assisted" if signals else "independent")
-    data = {"schema": "review-flat-v1", "parser_version": "review-flat-codec-v3", "version_id": version_id, "generation_id": raw["id"],
+    data = {"schema": "review-flat", "parser_version": "review-flat-codec", "version_id": version_id, "generation_id": raw["id"],
             "lookup_ids": list(lookup_ids), "prior_report_id": prior_report_id, "repair_id": repair_id,
             "mode": mode, "candidate_observations": list(candidate_observations),
             **parse_review(v, raw["generation"]["text"], rows, parsed=parsed, allow_label_only=reference_mode=='paragraph',review_profile=review_profile,signal_candidates=signal_candidates,derive_count=bool(checks_id),
-                           count_policy='records-v1' if review_profile=='audit-v6' else 'strict')}
-    if checks_id: data.update(checks_id=checks_id,signal_codec='count-normalization-v2')
+                           count_policy='records' if review_profile=='chapter-review' else 'strict')}
+    if checks_id: data.update(checks_id=checks_id,signal_codec='count-normalization')
     if enhanced:
         data.update(review_profile=review_profile,
-                    parser_version='review-flat-codec-v6' if review_profile=='audit-v6' else 'review-flat-codec-v5' if tolerant_protocol else 'review-flat-codec-v4',
+                    parser_version='review-flat-codec',
                     reference_mode='bound-paragraph',rule_candidates=signals)
     elif reference_mode != 'literal': data['reference_mode'] = reference_mode
     if evidence_context is not None:
@@ -232,13 +232,13 @@ def read_report(view, version_id, report_id):
         raise NarrativeError('invalid_record', 'review profile differs from actual model input')
     if enhanced:
         profile = report.get('review_profile')
-        expected_parser = 'review-flat-codec-v6' if profile=='audit-v6' else 'review-flat-codec-v5' if profile=='audit-v5' else 'review-flat-codec-v4'
+        expected_parser = 'review-flat-codec'
         if (reference_mode != 'bound-paragraph' or report.get('parser_version') != expected_parser
                 or not task.startswith(reference_task(AUDIT_PROFILES[report['review_profile']][0])
                     if v.get('reference_profile')==STABLE else AUDIT_PROFILES[report['review_profile']][0])
                 or report.get('rule_candidates') != residue_signals(v)):
             raise NarrativeError('invalid_record','enhanced review protocol binding differs')
-        if profile in {'audit-v5','audit-v6'}:
+        if profile == 'chapter-review':
             messages = raw['request']['messages']
             required = [reference_examples(review_examples(profile,with_signals=bool(report.get('checks_id'))),
                 v.get('reference_profile')==STABLE)]
@@ -263,8 +263,8 @@ def read_report(view, version_id, report_id):
         if raw['request']['messages'][1:2+len(prefix)] != prefix+[text_messages(v, '')[1]]:
             raise NarrativeError('invalid_record','report context differs from actual model input')
         rows += evidence_context['rows']
-    current = report.get("parser_version") in {"review-flat-codec-v3","review-flat-codec-v4","review-flat-codec-v5","review-flat-codec-v6"}
-    tolerant_protocol = report.get('parser_version') in {'review-flat-codec-v5','review-flat-codec-v6'}
+    current = report.get("parser_version") == "review-flat-codec"
+    tolerant_protocol = report.get('parser_version') == 'review-flat-codec'
     signal_candidates = None
     allowed = {"FINDING", "UNRESOLVED", "SUMMARY"}
     if report.get('checks_id'):
@@ -273,13 +273,13 @@ def read_report(view, version_id, report_id):
         allowed.add('SIGNAL')
     parsed = read_records(view, version_id, report["generation_id"], report.get("repair_id"), allowed,
                           allow_intermediate_end=current,extra_fields=AUDIT_FIELDS if enhanced else None,
-                          syntax_profile='p6-tolerant-v1' if tolerant_protocol else 'legacy',
+                          syntax_profile='tolerant-records' if tolerant_protocol else 'legacy',
                           allow_preamble=tolerant_protocol)
     expected = parse_review(v, raw["generation"]["text"], rows, parsed=parsed,
-                            chapter_cross_references=report.get("parser_version") in {"review-flat-codec-v2", "review-flat-codec-v3", "review-flat-codec-v4", "review-flat-codec-v5", "review-flat-codec-v6"}, intermediate_end=current,
+                            chapter_cross_references=report.get("parser_version") in {"review-flat-codec", "review-flat-codec", "review-flat-codec", "review-flat-codec", "review-flat-codec"}, intermediate_end=current,
                             allow_label_only=report.get('reference_mode')=='paragraph',review_profile=report.get('review_profile','legacy'),signal_candidates=signal_candidates,
-                            derive_count=report.get('signal_codec')=='count-normalization-v2',
-                            count_policy='records-v1' if report.get('review_profile')=='audit-v6' else 'strict')
+                            derive_count=report.get('signal_codec')=='count-normalization',
+                            count_policy='records' if report.get('review_profile')=='chapter-review' else 'strict')
     if any(report[k] != val for k, val in expected.items()) or raw["version_id"] != version_id:
         raise NarrativeError("invalid_record", "review differs from raw output/version")
     return report
@@ -323,7 +323,7 @@ def model_adjudicate(session, version_id, report_id, *, protocol_profile=None, n
         "decision: confirmed|dismissed|unresolved\nreason: 依据原文明确解释判断\n最后@@END。所有finding必须给决定。\n")
     visible_findings=prompt_projection(report['findings'],session.view.archive.chapters.values()) if stable else report['findings']
     messages = text_messages(v, (AUDIT_PROFILES[prompt_profile][1] if enhanced or protocol_profile else legacy_task)+json.dumps(visible_findings,ensure_ascii=False))
-    tolerant_protocol = prompt_profile in {'audit-v5','audit-v6'}
+    tolerant_protocol = prompt_profile in {'chapter-review','chapter-review'}
     rows, evidence = lookup_evidence(session.view, version_id, report["lookup_ids"])
     if report.get('review_context_id'):
         from .context import read_review_context, context_messages
@@ -394,7 +394,7 @@ def model_adjudicate(session, version_id, report_id, *, protocol_profile=None, n
     raw = session.call(version_id, "adjudication", messages,
         **({'task_family': 'no-op-adjudication:'+no_op_proposal_id} if no_op_proposal_id else {}))
     parsed = parse_records(raw["generation"]["text"], allowed,allow_inline_end=enhanced,
-                           syntax_profile='p6-tolerant-v1' if tolerant_protocol else 'legacy',
+                           syntax_profile='tolerant-records' if tolerant_protocol else 'legacy',
                            extra_fields={'DECISION':{'source_ref','target_ref'}} if tolerant_protocol else None)
     if tolerant_protocol:
         expected={'DECISION':{f['id'] for f in report['findings']},
@@ -403,7 +403,7 @@ def model_adjudicate(session, version_id, report_id, *, protocol_profile=None, n
         parsed['errors'].extend(header_association_errors(parsed))
         if notes:
             session.view.store.put('review-protocol-recovery',{'version_id':version_id,'generation_id':raw['id'],
-                'parser':'p6-exact-header-id-v1','notes':notes,'raw_unchanged':True})
+                'parser':'exact-header-id','notes':notes,'raw_unchanged':True})
     if report.get('checks_id') and not tolerant_protocol:
         notes=[]
         expected={'DECISION':{f['id'] for f in report['findings']},'SIGNAL':{s['id'] for s in signals}}
@@ -416,10 +416,10 @@ def model_adjudicate(session, version_id, report_id, *, protocol_profile=None, n
                 f['decision']=enums[f['decision']];notes.append('closed_enum_alias:'+record['id'])
         if notes:
             session.view.store.put('review-protocol-recovery',{'version_id':version_id,'generation_id':raw['id'],
-                'parser':'p6-decision-header-v2','notes':notes,'raw_unchanged':True})
+                'parser':'decision-header','notes':notes,'raw_unchanged':True})
     if parsed.get('notes'):
         session.view.store.put('review-protocol-recovery',{'version_id':version_id,'generation_id':raw['id'],
-            'parser':'decision-v5-syntax-v1' if tolerant_protocol else 'decision-inline-end-v2',
+            'parser':'decision-tolerant-syntax' if tolerant_protocol else 'decision-inline-end',
             'notes':parsed['notes'],'raw_unchanged':True})
     decisions = [r["fields"] for r in parsed["records"] if r['record']=='DECISION']
     if parsed["errors"] or {d.get("finding") for d in decisions} != {f["id"] for f in report["findings"]}:
@@ -452,7 +452,7 @@ def model_adjudicate(session, version_id, report_id, *, protocol_profile=None, n
         session.view.store.put("review-decision-quarantine", {"version_id": version_id, "generation_id": raw["id"], "original_decisions": quarantined})
     if policy_changes:
         session.view.store.put('review-decision-policy',{'version_id':version_id,'generation_id':raw['id'],
-            'policy':'audit-v2-no-style-enforcement','original_decisions':policy_changes})
+            'policy':'chapter-review-no-style-enforcement','original_decisions':policy_changes})
     signal_decisions = None
     if report.get('checks_id'):
         signal_decisions,errors = resolutions(v,parsed,signals,report['findings'])

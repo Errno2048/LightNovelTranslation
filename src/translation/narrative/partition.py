@@ -20,7 +20,7 @@ class AdaptiveIndexSpec:
     minimum_output_tokens: int = 1024
     child_min_content_tokens: int = 0
     parent_summary_input_tokens_per_child: int = 8192
-    layout: str = "adaptive-v1"
+    layout: str = "adaptive"
 
     def __post_init__(self):
         for name in ('parent_max_chapters', 'child_max_chapters', 'child_output_per_chapter',
@@ -92,7 +92,7 @@ def plan_adaptive_index(pairs, index_spec, capacity, role_budget, counter, *,
     if not spec.child_min_content_tokens:
         identity_spec.pop('child_min_content_tokens',None)
         identity_spec.pop('parent_summary_input_tokens_per_child',None)
-    identity = {'planner':'adaptive-v2' if spec.child_min_content_tokens else 'adaptive-v1',
+    identity = {'planner':'adaptive-token' if spec.child_min_content_tokens else 'adaptive',
                 'spec':identity_spec,'capacity':asdict(capacity),
                 'role':asdict(role_budget),'counter':counter.identity,'source_manifest':source_manifest_id,
                 'visibility':visibility_policy_id}

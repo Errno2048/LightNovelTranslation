@@ -44,7 +44,7 @@ def propose_revision(session, version_id, report_id, adjudication_id):
         messages[-1]['content']=messages[-1]['content'].replace('start: T001','start: '+example).replace('end: T001','end: '+example)
     report = read_report(session.view,version_id,report_id)
     if report.get('review_profile') in AUDIT_PROFILES:
-        messages[-1]['content'] += ('\n【修订协议 audit-v2】每个已确认finding均绑定一个目标段。'
+        messages[-1]['content'] += ('\n【修订协议 chapter-review】每个已确认finding均绑定一个目标段。'
             '必须修复每条意见所绑定的T段；不能用修改另一段冒充完成。一个段有多条意见时合并一条PATCH并列出全部ID。'
             '每条PATCH必须start=end且等于所引用finding的target_location.alias。不要修改未确认问题或仅有风格偏好的段。'
             '不要只处理同类问题的第一个例子。替换时逐句保留原段其他事实、推测程度、条件和否定。'

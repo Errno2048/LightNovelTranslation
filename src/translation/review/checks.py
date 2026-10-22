@@ -35,7 +35,7 @@ def numbers(text):
 
 
 def run_checks(view, version_id, coverage_id, *, profile='legacy'):
-    if profile not in {'legacy','audit-v2','p6-mvp'}:
+    if profile not in {'plain','coarse','record-checks'}:
         raise NarrativeError('invalid_record','unknown checks profile')
     v, coverage = read_version(view, version_id), read_coverage(view, version_id, coverage_id)
     hard, signals = [], []
@@ -55,7 +55,7 @@ def run_checks(view, version_id, coverage_id, *, profile='legacy'):
             'source_text': [r['text'] for r in v['source_segments'] if r['id'] in source_ids],
             'target_text': [r['text'] for r in v['segments'] if r['id'] in target_ids],
             'instruction': '程序只恢复粗粒度结构覆盖。逐段检查原未映射项是否漏译、增译或仅为映射遗漏；不得因并组而直接驳回。'})
-    if profile == 'p6-mvp':
+    if profile == 'record-checks':
         from ..mvp.numbers import aligned_number_signals
         quantities_signals, diagnostics = aligned_number_signals(v, coverage)
         signals.extend(quantities_signals)
@@ -70,14 +70,14 @@ def run_checks(view, version_id, coverage_id, *, profile='legacy'):
             signals.append({"id": "brackets:"+left, "kind": "unbalanced_brackets"})
     if "@@" in v["text"] or "```" in v["text"]:
         signals.append({"id": "format", "kind": "machine_markup"})
-    if profile in {'audit-v2','p6-mvp'}:
+    if profile in {'coarse','record-checks'}:
         from .signals import residue_signals
         signals.extend(residue_signals(v))
     data = {"schema": "translation-checks-v1", "version_id": version_id,
         "coverage_id": coverage_id, "hard_failures": hard, "signals": signals,
         "semantic_coverage": "not_proven_by_rules", "state": "checked"}
     if profile != 'legacy': data['profile'] = profile
-    if profile == 'p6-mvp': data['diagnostics'] = diagnostics
+    if profile == 'record-checks': data['diagnostics'] = diagnostics
     return view.store.put('translation-checks',data)
 
 

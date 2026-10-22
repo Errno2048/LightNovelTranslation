@@ -7,8 +7,8 @@ from .repair import decode_records, read_records
 from ..references import STABLE
 from ..storage import digest
 
-PROFILES = {'legacy', 'audit-v2', 'coarse-v1'}
-RECOVERY_POLICY = {'version': 'local-monotone-gap-v1', 'max_gap_paragraphs': 2,
+PROFILES = {'plain', 'coarse'}
+RECOVERY_POLICY = {'version': 'local-monotone-gap', 'max_gap_paragraphs': 2,
                    'max_missing_per_side': 4, 'max_group_paragraphs_per_side': 8,
                    'max_group_characters': 6000}
 
@@ -128,7 +128,7 @@ def validate_mapping(version, parsed, *, profile="legacy"):
         status = f.get("status")
         # An observed response translated this enum. The opt-in codec only
         # recognizes this exact synonym; paragraph IDs and content stay intact.
-        if profile in {"audit-v2", "coarse-v1"} and status == "已映射":
+        if profile in {"coarse"} and status == "已映射":
             normalizations.append({"record_id": r["id"], "field": "status",
                                    "original": status, "canonical": "mapped"})
             status = "mapped"
@@ -149,9 +149,9 @@ def validate_mapping(version, parsed, *, profile="legacy"):
     result = {"groups": groups, "unmapped_source": unmapped_s, "unmapped_target": unmapped_t,
             "layout_exempt": version["layout_exempt"], "errors": errors,
             "mapping_complete": bool(groups) and not errors, "semantic_coverage_reviewed": False}
-    if profile in {"audit-v2", "coarse-v1"}:
+    if profile in {"coarse"}:
         result["normalizations"] = normalizations
-    if profile == 'coarse-v1':
+    if profile == 'coarse':
         result = recover_local_gaps(version, result)
     return result
 
@@ -197,7 +197,7 @@ def _mapping_feedback_policy(session, version_id, profile):
     # identity when resumed. Only entirely new tasks adopt detailed feedback.
     prior = any(v['version_id'] == version_id and v['kind'] == 'mapping'
                 for _, v in store.objects('review-request'))
-    policy = 'legacy' if prior else 'detailed-v1'
+    policy = 'legacy' if prior else 'detailed'
     store.put('mapping-feedback-policy', {'version_id':version_id, 'profile':profile, 'diagnostics':policy})
     return policy
 
@@ -220,13 +220,13 @@ def map_coverage(session, version_id, *, profile="legacy"):
             f"@@MAP m1\nsource: {source_example}\ntarget: {target_example}\nstatus: mapped\n"
             "逐组继续，最后单独一行@@END。不输出译文或解释。")
     messages = text_messages(v, task)
-    syntax = 'p6-tolerant-v1' if profile == 'coarse-v1' else 'legacy'
-    feedback_policy = _mapping_feedback_policy(session, version_id, profile) if profile == 'coarse-v1' else 'legacy'
+    syntax = 'tolerant-records' if profile == 'coarse' else 'plain'
+    feedback_policy = _mapping_feedback_policy(session, version_id, profile) if profile == 'coarse' else 'plain'
     attempts = []
-    max_attempts = min(3, getattr(session,'max_task_attempts',None) or 1) if profile=='coarse-v1' else 1
+    max_attempts = min(3, getattr(session,'max_task_attempts',None) or 1) if profile=='coarse' else 1
     for attempt in range(max_attempts):
         raw = session.call(version_id, "mapping", messages,
-            **({'task_family':'mapping:'+profile} if profile=='coarse-v1' else {}))
+            **({'task_family':'mapping:'+profile} if profile=='coarse' else {}))
         attempts.append(raw['id'])
         parsed, repair_id = decode_records(session, version_id, raw, {"MAP"}, syntax_profile=syntax)
         validated = validate_mapping(v, parsed, profile=profile)
@@ -237,7 +237,7 @@ def map_coverage(session, version_id, *, profile="legacy"):
         source_alias = {r['id']:r['alias'] for r in v['source_segments']}
         target_alias = {r['id']:r['alias'] for r in v['segments']}
         extra = ('\n非法引用诊断（只能引用实际存在的ID；附近正文仅供重新按含义判断）：'+str(mapping_diagnostics(v, parsed))
-                 if feedback_policy == 'detailed-v1' else '')
+                 if feedback_policy == 'detailed' else '')
         messages += [{'role':'assistant','content':raw['generation']['text']},
             {'role':'user','content':'上次映射未通过结构校验。请重新输出本章完整映射，不能只补缺口；'
              '仍须按含义判断，真实漏译或增译保留未对应，不得为凑全覆盖强配。'
@@ -247,7 +247,7 @@ def map_coverage(session, version_id, *, profile="legacy"):
     data = {"schema": "translation-coverage-v1", "version_id": version_id, "generation_id": raw["id"],
             "source_revision": v["source_revision"], "translation_hash": v["text_hash"], "repair_id": repair_id,
             **validated}
-    if profile=='coarse-v1':
+    if profile=='coarse':
         data['mapping_attempt_generation_ids'] = attempts
     if profile != "legacy":
         data["mapping_profile"] = profile
@@ -259,12 +259,12 @@ def read_coverage(view, version_id, coverage_id):
     c = view.store.get(coverage_id, "translation-coverage")
     if c["version_id"] != version_id or c["translation_hash"] != v["text_hash"] or c["source_revision"] != v["source_revision"]:
         raise NarrativeError("conflict", "coverage belongs to another text version")
-    if c.get('mapping_profile') == 'source-records-v1':
+    if c.get('mapping_profile') == 'source-records':
         if c != declared_coverage(v, version_id):
             raise NarrativeError('invalid_record', 'declared coverage differs from bound output')
         return c
-    if c.get('mapping_profile')=='coarse-v1':
-        # Early coarse-v1 artifacts predate the optional retry lineage; their
+    if c.get('mapping_profile')=='coarse':
+        # Early coarse artifacts predate the optional retry lineage; their
         # sole immutable generation still has an unambiguous binding.
         attempts=c.get('mapping_attempt_generation_ids',[c['generation_id']])
         if not attempts or attempts[-1]!=c['generation_id'] or len(attempts)>3:
@@ -273,7 +273,7 @@ def read_coverage(view, version_id, coverage_id):
             raw=view.store.get(ident,'review-generation')
             if raw['version_id']!=version_id or raw['kind']!='mapping':
                 raise NarrativeError('invalid_record','mapping attempt belongs to another task')
-    syntax = 'p6-tolerant-v1' if c.get('mapping_profile') == 'coarse-v1' else 'legacy'
+    syntax = 'tolerant-records' if c.get('mapping_profile') == 'coarse' else 'plain'
     expected = validate_mapping(v, read_records(view, version_id, c["generation_id"], c.get("repair_id"), {"MAP"}, syntax_profile=syntax),
                                 profile=c.get("mapping_profile", "legacy"))
     if any(c[k] != val for k, val in expected.items()):
@@ -286,7 +286,7 @@ def declared_coverage(version, version_id):
         raise NarrativeError('invalid_record', 'declared coverage requires a complete output binding')
     return {'schema': 'translation-coverage-v1', 'version_id': version_id,
         'generation_id': version['output_binding']['generation_id'], 'repair_id': None,
-        'mapping_profile': 'source-records-v1', 'mapping_quality': 'declared_by_translation_output',
+        'mapping_profile': 'source-records', 'mapping_quality': 'declared_by_translation_output',
         'source_revision': version['source_revision'], 'translation_hash': version['text_hash'],
         'groups': [{'source_paragraph_ids': [s['id']], 'target_paragraph_ids': [t['id']], 'status': 'mapped'}
                    for s, t in zip(version['source_segments'], version['segments'])],

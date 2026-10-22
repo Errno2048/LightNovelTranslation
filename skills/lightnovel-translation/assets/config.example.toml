@@ -64,7 +64,7 @@ window_l2_blocks = 3
 translation_concurrency = 3
 review_concurrency = 4
 provisional_lookahead = 1
-output_profile = "source-records-v1"
+output_profile = "source-records"
 
 [references]
 # Leave token budgets unset to derive them from capacity, output reserves and inflation.

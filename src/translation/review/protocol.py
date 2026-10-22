@@ -105,9 +105,9 @@ def _normalize_value(field, value, notes, line_number):
 
 def parse_records(text, allowed, *, allow_intermediate_end=True, extra_fields=None, allow_inline_end=False,
                   syntax_profile="legacy", allow_preamble=False, field_schema=None, implicit_fields=None):
-    if syntax_profile not in {"legacy", "p6-tolerant-v1"}:
+    if syntax_profile not in {"legacy", "tolerant-records"}:
         raise ValueError("unknown record syntax profile")
-    tolerant = syntax_profile == "p6-tolerant-v1"
+    tolerant = syntax_profile == "tolerant-records"
     schema = FIELDS if field_schema is None else field_schema
     records, errors, current, key, ended = [], [], None, None, False
     lines = text.replace("\r\n", "\n").splitlines()

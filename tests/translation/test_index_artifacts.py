@@ -13,7 +13,7 @@ def chapter_artifact(status=ChapterStatus.TRANSLATED, **overrides):
         "level": 0,
         "source_ids": ("src1",),
         "status": status,
-        "inputs": (InputRef("src1", "v1", "hash1"),),
+        "inputs": (InputRef("src1", "fixture", "hash1"),),
     }
     values.update(overrides)
     return Artifact(**values)
@@ -57,7 +57,7 @@ def test_artifact_status_validation():
     with pytest.raises(ValueError):
         block_artifact(status=BlockStatus.ACCEPTED)
     accepted = block_artifact(status=BlockStatus.ACCEPTED,
-                              inputs=(InputRef("src1", "v1", "hash1"),),
+                              inputs=(InputRef("src1", "fixture", "hash1"),),
                               review_mode="model", review_id="r1")
     assert accepted.status == "accepted"
 
@@ -92,7 +92,7 @@ def test_snapshot_parent_coverage_and_disabled_levels():
 def test_snapshot_rebuild_only_quality_label():
     accepted = block_artifact(
         artifact_id="b1", status=BlockStatus.ACCEPTED,
-        inputs=(InputRef("src1", "v1", "hash1"),),
+        inputs=(InputRef("src1", "fixture", "hash1"),),
         review_mode="rebuild_only")
     with pytest.raises(ValueError):
         IndexSnapshot(snapshot_id="s1", generation="g1",
@@ -100,7 +100,7 @@ def test_snapshot_rebuild_only_quality_label():
                       artifacts={"b1": accepted})
     accepted = block_artifact(
         artifact_id="b1", status=BlockStatus.ACCEPTED,
-        inputs=(InputRef("src1", "v1", "hash1"),),
+        inputs=(InputRef("src1", "fixture", "hash1"),),
         review_mode="rebuild_only", quality_labels=("rebuild_only",))
     snapshot = IndexSnapshot(snapshot_id="s2", generation="g2",
                              levels=LevelConfig((10,)),

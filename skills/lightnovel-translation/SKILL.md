@@ -1,6 +1,6 @@
 ---
 name: lightnovel-translation
-description: 使用 lightnovel_translation 的新分层索引工作流标准化 EPUB/TXT 轻小说、构建 lazy 参考索引、装配证据绑定上下文并执行日译中翻译；不自动完成审校/提交/导出，需要时明确手动接管。
+description: 使用 lightnovel_translation 的新分层索引工作流标准化 EPUB/TXT 轻小说、构建 lazy 参考索引、装配证据绑定上下文，并执行翻译→chapter-review 审校→裁决→修订→accepted 提交→EPUB 导出；跨版本目录对齐和 blocked 章节可能需要手动接管。
 ---
 
 # Light Novel Translation
@@ -10,6 +10,7 @@ description: 使用 lightnovel_translation 的新分层索引工作流标准化 
 ## 先查文档
 
 - 新工作流：[new-architecture.md](references/new-architecture.md)
+- **运行、恢复、blocked 修补、质量复查、导出与故障排查**：[operations.md](references/operations.md)
 - 完整设计与不变量：仓库 `docs/refactor-architecture-design.md`
 - 用户配置与运行说明：仓库 `docs/usage.md`
 - 输入结构异常：[input-repair.md](references/input-repair.md)
@@ -36,12 +37,12 @@ Agent 不读取、打印、复制或上传凭据文件；不要要求用户在�
 
 ```python
 from lightnovel_translation import TranslationProject
-from translation.index import FusedWorkflow, GlossaryTerm, LevelConfig
+from translation.index import TranslationWorkflow, GlossaryTerm, LevelConfig
 
 with TranslationProject("work/my-novel") as project:
     source = project.import_book("web-ja.epub", edition_id="web-ja", language="ja")
     reference = project.import_book("web-zh.epub", edition_id="web-zh", language="zh")
-    flow = FusedWorkflow(project, "web-ja", "web-zh",
+    flow = TranslationWorkflow(project, "web-ja", "web-zh",
                          levels=LevelConfig((10, 10), (3, 1)),
                          full_chapters=10)
 ```
@@ -102,15 +103,37 @@ print(result.text[:1000])
 
 术语优先使用 glossary/实体 target_form；参考事实不得覆盖日文事实。
 
-### 6. 审校、提交与导出（当前需手动接管）
+### 6. 审校、提交与导出
 
-main 分支尚未实现新审校/裁决/提交/导出的完整闭环。完成翻译后：
+使用 `TranslationRunner` 跑可恢复的章节闭环：
 
-- 必须人工或另行编写流程核对原文、术语、段落覆盖和未决问题；
-- 不得把草稿标成 accepted，也不得把 provisional/参考摘要混入最终交付；
-- 需要旧的完整自动 `create_job/job.run` 管线时，从 `legacy-sequence` 分支检出并在该分支运行；
-- 当前低层 `not_created` 块被真正请求时，先创建高层父块的全部低层子块再 rollup；
-- 单章拆分只有接口预留，译文对齐未实现；超限应 blocked 并交接。
+```python
+from translation.index import (TranslationRunner, TranslationStore,
+                               build_epub, collect_epub_chapters)
+
+with TranslationStore("work/my-novel/translation.sqlite") as store:
+    runner = TranslationRunner(
+        project, flow, store, continuation_start=199, main_end=260,
+        reference_texts=reference_by_source_order,
+        translation_tokens=65536, review_tokens=65536,
+        adjudication_tokens=32768)
+    runner.ensure_reference_summary()
+    runner.ensure_glossary()
+    spec = project.config.sequence_spec()
+    runner.run_concurrent(
+        start=199, end=260,
+        translation_concurrency=spec.translation_concurrency,
+        review_concurrency=spec.review_concurrency,
+        batch_size=30)
+    runner.update_target_summary(force=True)
+    chapters = collect_epub_chapters(
+        runner=runner, reference_chapters=official_chapters, end=260)
+    build_epub(output="book.epub", title="书名", chapters=chapters)
+```
+
+`run_order` 会逐源段翻译、用 `chapter-review` 审校、裁决、修订并复审；只有通过的章节写为 accepted。长任务改用 `run_concurrent`（见 [operations.md](references/operations.md#2-并发运行参数)）。
+
+遇到 `ChapterBlocked`、摘要停住、目录对齐、provider 502/524、事后质量复查或导出失败时，按 [operations.md](references/operations.md) 的对应小节操作；其中包含精确修补目标段落、恢复 accepted、再次导出和结构验证的完整代码。不要跳过 blocked 章节伪造 accepted，也不要凭空删除审校记录。跨版本目录必须按标题/内容锚点对齐，不能把中文文库章号直接当 Web 话序；单章拆分和线程目录仍可能需人工接管。
 
 ## 保留的约束
 

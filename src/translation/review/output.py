@@ -2,8 +2,8 @@
 from .protocol import parse_records
 
 
-PROFILE = 'source-records-v1'
-RULES = '''【译文输出协议 source-records-v1】
+PROFILE = 'source-records'
+RULES = '''【译文输出协议 source-records】
 整章连贯翻译，但逐个保留全部非空原文段落，每个源段只输出一条记录。
 复制该段给出的完整 C章节.J段落ID，不自行计数、改号或合并。即使一句话跨段，也逐段保留引语前后的叙述，不把后一段内容移到前一段。
 只输出如下记录，最后独占一行@@END；text为该源段的完整中文，不输出标题、分析或代码块。
@@ -28,14 +28,14 @@ def protocol_messages(messages, aliases):
     result[0]['content'] += '\n' + RULES
     result[-1]['content'] = result[-1]['content'].replace(
         '只翻译本章。只输出译文正文，不输出段落定位ID。',
-        '只翻译本章。按source-records-v1逐段输出，不输出纯正文。')
+        '只翻译本章。按source-records逐段输出，不输出纯正文。')
     result[-1]['content'] += '\n【本次合法源段ID，按此顺序各一次】\n' + ','.join(aliases)
     return result
 
 
 def parse_output(text, source_rows):
     parsed = parse_records(text, {'TRANSLATION'}, field_schema={'TRANSLATION': {'text'}},
-        syntax_profile='p6-tolerant-v1', implicit_fields={'TRANSLATION': 'text'},
+        syntax_profile='tolerant-records', implicit_fields={'TRANSLATION': 'text'},
         allow_intermediate_end=False)
     expected = [r['alias'] for r in source_rows]
     actual = [r['id'] for r in parsed['records']]

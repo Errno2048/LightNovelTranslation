@@ -20,7 +20,7 @@ SCHEMA = {
 
 def flat(text, allowed):
     return parse_records(text, set(allowed), field_schema=SCHEMA,
-                         syntax_profile='p6-tolerant-v1', allow_preamble=True,
+                         syntax_profile='tolerant-records', allow_preamble=True,
                          implicit_fields={'OVERVIEW': 'text'})
 
 

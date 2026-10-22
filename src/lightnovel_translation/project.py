@@ -205,7 +205,8 @@ class TranslationProject:
                 own = [e for e in archive.entries.values() if e['edition_id'] == ident]
                 own_ids = {e['entry_id'] for e in own}
                 rows = [r for r in archive.paragraphs.values() if r['entry_id'] in own_ids]
-                archive = EditionArchive(own, rows)
+                archive = EditionArchive(own, rows,
+                                         fingerprint=item['fingerprint'])
                 if archive.fingerprint != item['fingerprint']:
                     raise TranslationError('stale_corpus', 'registered corpus changed', details={'edition_id':ident})
                 self._archive_cache[ident] = (version, archive)
@@ -220,7 +221,10 @@ class TranslationProject:
                     archive = self._archive_cache[ident][1]
                     entries.extend(archive.entries.values())
                     paragraphs.extend(archive.paragraphs.values())
-                combined = EditionArchive(entries, paragraphs)
+                combined = EditionArchive(
+                    entries, paragraphs,
+                    fingerprint=digest(tuple(self._archive_cache[i][1].fingerprint
+                                             for i in ids)))
             self._combined_archive_cache[key] = combined
         return self._combined_archive_cache[key]
 

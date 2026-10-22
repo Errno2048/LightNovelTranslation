@@ -153,7 +153,7 @@ def plan_reference_blocks(documents: Mapping[str, ContextDocument],
                           capacity: int,
                           factor: float = DEFAULT_ESTIMATE_FACTOR,
                           prompt_overhead: int = DEFAULT_PROMPT_OVERHEAD,
-                          estimate_version: str = "reference-v1") -> ReferenceIndexPlan:
+                          estimate_version: str = "reference-plan") -> ReferenceIndexPlan:
     ordered = sorted(documents.values(), key=lambda document: document.order)
     if not ordered:
         return ReferenceIndexPlan((), levels, estimate_version, factor)

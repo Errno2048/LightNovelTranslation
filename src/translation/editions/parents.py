@@ -17,7 +17,7 @@ def read_parent(pipeline, parent_id):
     if not path.exists():
         return None
     artifact = read_json(path)
-    if artifact.get('schema') == 'edition-parent-v2':
+    if artifact.get('schema') == 'edition-parent':
         payload = {k: v for k, v in artifact.items() if k != 'fingerprint'}
         if artifact['fingerprint'] != digest(payload) or artifact['node'] != parent:
             raise ValueError('stale/corrupted parent summary')
@@ -32,7 +32,7 @@ def read_parent(pipeline, parent_id):
 
 
 def save_parent(pipeline, artifact):
-    artifact = {'schema': 'edition-parent-v2', **artifact}
+    artifact = {'schema': 'edition-parent', **artifact}
     artifact['fingerprint'] = digest(artifact)
     write_json(pipeline.folder / 'parents' / 'revisions' / (artifact['fingerprint'] + '.json'), artifact)
     write_json(pipeline.folder / 'parents' / (artifact['parent_id'] + '.json'), artifact)
@@ -77,7 +77,7 @@ def build_parent(pipeline, parent_id, *, allow_partial=False, output_tokens=8192
             reason = {'kind': 'local_context_limit', 'budget': budget}
         else:
             try:
-                outcome = pipeline.caller.structured('edition-index:' + parent_id + ':direct-v1',
+                outcome = pipeline.caller.structured('edition-index:' + parent_id + ':direct',
                     messages, output_tokens, lambda text: parse_summary(text, parent, pipeline.archive.refs(parent['entry_ids'])))
             except ProviderError as error:
                 if not context_overflow(error):
@@ -116,7 +116,7 @@ def build_parent(pipeline, parent_id, *, allow_partial=False, output_tokens=8192
         {'role': 'user', 'content': j({'edition_id': parent['edition_id'],
             'coverage': {k: v for k, v in catalog.items() if k != 'entities'},
             'children': [c['content'] for c in children]})}]
-    raw = pipeline.caller.call('edition-parent:' + parent_id + ':rollup-v2', messages, output_tokens)
+    raw = pipeline.caller.call('edition-parent:' + parent_id + ':rollup', messages, output_tokens)
     covered = [eid for c in children for eid in c['node']['entry_ids']]
     complete = not catalog['missing_child_ids']
     return save_parent(pipeline, {'node': parent, 'parent_id': parent_id,

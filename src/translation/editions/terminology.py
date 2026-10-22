@@ -35,7 +35,7 @@ def parse_resolution(text, forms, source_rows, reference_rows):
     # A local schema avoids changing the shared extraction codec vocabulary.
     from ..review.protocol import parse_records
     parsed = parse_records(text, {'TERM'}, field_schema={**SCHEMA, 'TERM': FIELDS},
-                           syntax_profile='p6-tolerant-v1')
+                           syntax_profile='tolerant-records')
     errors, items, seen = list(parsed['errors']), [], []
     for record in parsed['records']:
         row = record['fields']

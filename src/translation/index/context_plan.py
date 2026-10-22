@@ -26,6 +26,7 @@ class ContextDocument:
     source_text: str
     translation_text: str | None = None
     translation_artifact_id: str | None = None
+    provisional: bool = False
 
 
 @dataclass(frozen=True)
@@ -159,8 +160,12 @@ def _align_full_start(snapshot, documents, align, batch_start, warnings):
 
 def _select_level(snapshot, documents, level, boundary, remaining_budget,
                   estimator, warnings):
+    # A block that starts before the full-text boundary but ends inside it is
+    # still useful: including it may overlap a few recent full chapters, but
+    # omitting it would leave an uncovered gap between the summary and the
+    # full-text window.
     rows = [row for row in _block_rows(snapshot, level, documents)
-            if row[1] <= boundary]
+            if row[0] < boundary]
     if not rows:
         warnings = warnings + (f"no usable level-{level} blocks before {boundary}",)
         return [], boundary, warnings
@@ -210,7 +215,8 @@ def build_context_plan(snapshot: IndexSnapshot, documents: Mapping[str, ContextD
                  doc.source_id in accepted and doc.translation_text]
 
     def full_text(doc):
-        return f"【已译章节 {doc.title}】\n{doc.source_text}\n---\n{doc.translation_text}"
+        label = "未审草稿" if doc.provisional else "已译章节"
+        return f"【{label} {doc.title}】\n{doc.source_text}\n---\n{doc.translation_text}"
 
     near_texts = [full_text(doc) for doc in full_docs]
     prefix_docs = [doc for doc in batch_docs if doc.order < target.order]

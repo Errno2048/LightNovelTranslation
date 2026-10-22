@@ -11,7 +11,7 @@ from .archive import document_dependency
 class EditionIndexSpec:
     parent_max_chapters: int = 100
     child_max_chapters: int = 100
-    layout: str = 'token-v2'
+    layout: str = 'token'
     parent_min_chapters: int | None = None
     expected_l2_count: int = 10
     l2_prepartition_min_chapters: int = 3
@@ -34,15 +34,15 @@ class EditionIndexSpec:
             raise ValueError('child hard cap exceeds parent hard cap')
         if self.entity_catalog_threshold > self.core_entity_limit:
             raise ValueError('entity catalog threshold cannot exceed the core entity limit')
-        if self.layout not in {'token-v2', 'legacy-v1'}:
+        if self.layout not in {'token', 'plain'}:
             raise ValueError('unknown index layout')
-        if self.layout == 'token-v2' and self.parent_min_chapters > self.parent_max_chapters:
+        if self.layout == 'token' and self.parent_min_chapters > self.parent_max_chapters:
             raise ValueError('L1 minimum chapter count exceeds the configured hard maximum')
         if self.parent_build_mode not in {'direct', 'child_summary_rollup', 'direct_then_rollup'}:
             raise ValueError('invalid L1 build mode')
 
 
-def _plan_edition_index_legacy(archive, edition_id, capacity, counter, spec=None, *, output_tokens=None):
+def _plan_edition_index_plain(archive, edition_id, capacity, counter, spec=None, *, output_tokens=None):
     spec = spec or EditionIndexSpec()
     output_tokens = output_tokens or min(12288, capacity.max_output_tokens)
     docs = [d for d in archive.documents(edition_id) if d['rows']]
@@ -54,7 +54,7 @@ def _plan_edition_index_legacy(archive, edition_id, capacity, counter, spec=None
     sizes = {d['entry_id']: counter.count(d['raw_title'] + '\n' + d['text']) + len(d['rows'])*32 + 64 for d in docs}
     if any(v > usable for v in sizes.values()):
         raise ValueError('oversized single document: split its paragraph ranges before indexing')
-    identity = {'schema': 'edition-plan-v1', 'edition_id': edition_id, 'spec': asdict(spec),
+    identity = {'schema': 'edition-plan-plain', 'edition_id': edition_id, 'spec': asdict(spec),
                 'capacity': asdict(capacity), 'counter': counter.identity, 'output_tokens': output_tokens}
     logical_volumes = any(d.get('metadata', {}).get('index_boundary_profile') == 'logical-volume-v1' for d in docs)
     if logical_volumes:
@@ -117,12 +117,12 @@ def plan_edition_index(archive, edition_id, capacity, counter, spec=None, *, out
     """Plan token-balanced L1/L2 nodes and expose strict L1 feasibility locally.
 
     The old fixed/target-token layout remains available for frozen experiments
-    through ``layout='legacy-v1'``. New plans use the exact prompt projection
+    through ``layout='plain'``. New plans use the exact prompt projection
     plus the configured conservative tokenizer inflation factor.
     """
     spec = spec or EditionIndexSpec()
-    if spec.layout == 'legacy-v1':
-        return _plan_edition_index_legacy(archive, edition_id, capacity, counter, spec,
+    if spec.layout == 'plain':
+        return _plan_edition_index_plain(archive, edition_id, capacity, counter, spec,
                                           output_tokens=output_tokens)
     from .prompts import summary_messages
 
@@ -131,7 +131,7 @@ def plan_edition_index(archive, edition_id, capacity, counter, spec=None, *, out
     docs = sorted(docs, key=lambda d: d['edition_order'])
     effective_min = min(spec.parent_min_chapters, spec.parent_max_chapters)
     effective_max = spec.parent_max_chapters
-    identity = {'schema': 'edition-plan-v2', 'planner': 'token-v2', 'edition_id': edition_id,
+    identity = {'schema': 'edition-plan', 'planner': 'token', 'edition_id': edition_id,
                 'spec': asdict(spec), 'capacity': asdict(capacity), 'counter': counter.identity,
                 'output_tokens': output_tokens, 'inflation': capacity.token_inflation_factor}
     logical_volumes = any(d.get('metadata', {}).get('index_boundary_profile') == 'logical-volume-v1'

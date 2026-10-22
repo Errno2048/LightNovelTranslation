@@ -1,4 +1,4 @@
-"""Source/output prompts shared by the fused index workflow."""
+"""Source/output prompts shared by the hierarchical index workflow."""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,7 @@ import json
 from ..references import STABLE, chapter_ref, pair_rows, prompt_projection
 
 
-def source_message(source, unresolved=(), *, reference_profile="legacy", documents=()):
+def source_message(source, unresolved=(), *, reference_profile="plain", documents=()):
     if reference_profile == STABLE:
         rows, _ = pair_rows({"source": source, "translation": []})
         return {
@@ -29,7 +29,26 @@ def source_message(source, unresolved=(), *, reference_profile="legacy", documen
     }
 
 
-def full_pair_message(pair, *, reference_profile="legacy"):
+SOURCE_RECORDS_RULES = """【译文输出协议 source-records】
+先输出一条标题记录，再逐个保留全部非空原文段落，每个源段只输出一条记录。
+复制该段给出的完整S标签，不自行计数、改号、合并或遗漏。即使一句话跨段，也逐段保留引语前后的叙述，不把后一段内容移到前一段。
+只输出如下记录，最后独占一行@@END；text为该源段或标题的完整中文，不输出分析、代码块或额外说明。
+@@TITLE
+text: 本章标题的中文翻译
+@@TRANSLATION S001
+text: 第一段的完整中文
+@@TRANSLATION S002
+text: 第二段的完整中文
+@@END
+实际输出必须使用本章全部实际S标签，按原文顺序各一次。text中的换行仅作记录内排版；不要借换行遗漏或重复源段。"""
+
+
+def source_records_rules(aliases):
+    return (SOURCE_RECORDS_RULES + "\n【本次合法源段ID，按原文顺序各一次】\n"
+            + ",".join(aliases))
+
+
+def full_pair_message(pair, *, reference_profile="plain"):
     if reference_profile == STABLE:
         rows, _ = pair_rows(pair)
         return {

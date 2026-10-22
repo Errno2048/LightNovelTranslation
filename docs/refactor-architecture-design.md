@@ -951,7 +951,9 @@ Token 预算应由旧 `plan_request` 统一计算；workset/实体/线程/定向
   - `sequence/output.py` → `translation/review/output.py`
   - `sequence/targeted.py` → `translation/evidence/targeted.py`
   - `source_message`/`full_pair_message` → `translation/index/prompts.py`
-- 新增 `translation/index/workflow.py`，提供 `FusedWorkflow`：lazy 参考规划、高层摘要、快照、ContextPlan + workset/实体/线程/定向证据装配、`plan_request` 预算和真实翻译。
+- 新增 `translation/index/workflow.py`，提供 `TranslationWorkflow`：lazy 参考规划、高层摘要、快照、ContextPlan + workset/实体/线程/定向证据装配、`plan_request` 预算和真实翻译。
+- 新增 `translation/index/pipeline.py`，提供 `TranslationStore`、`TranslationRunner`、`build_epub`：逐章 `source-records` 翻译、`chapter-review` 审校、裁决、有限修订/复审、accepted 提交、滚动摘要、术语抽取和 EPUB 导出；状态存 SQLite，可中断续跑。
+- `TranslationRunner.run_concurrent` 支持批次并发：同批次章节没有译文依赖，翻译第 i 章使用共享已接受前缀 + 批内前序章节的日文原文；批次开始前统一做专名预抽取。`translation_concurrency` 个翻译请求并发，`review_concurrency` 个审校/裁决/修订并发，主线程按顺序提交 accepted。批量大小由 `batch_size` 控制，需按容量选择。
 - 新增离线示例 `examples/library_offline.py`，验证新 API 不依赖模型或本地语料。
 - 新文档：
   - `docs/usage.md`：新工作流与当前自动化边界
@@ -961,7 +963,7 @@ Token 预算应由旧 `plan_request` 统一计算；workset/实体/线程/定向
 
 当前 main 的自动化边界：
 
-- 已实现：导入、lazy 参考索引规划、direct/rollup 摘要、ContextPlan、workset/实体/线程/定向证据装配、预算、TaskStore/指针、真实翻译、指标。
-- 需手动接管：章节审校/裁决/提交、最终导出、实体/线程目录生产、单章拆分译文对齐。
+- 已实现：导入、lazy 参考索引规划、direct/rollup 摘要、ContextPlan、workset/实体/线程/定向证据装配、预算、TaskStore/指针、逐章翻译、`chapter-review` 审校/裁决/修订/提交、滚动摘要、术语抽取、EPUB 导出和指标。
+- 仍需 agent 判断：跨版本目录锚点、实体/线程目录、单章拆分译文对齐、blocked 章节的局部修复。
 - 需要旧完整自动管线时使用 `legacy-sequence` 分支。
-- 验证：剩余共享测试与新索引测试共 94 项通过；离线示例输出摘要 + 全文 + target 段并完成两次 provider 调用。
+- 验证：共享测试、新索引测试和 pipeline 离线测试通过；离线示例输出摘要 + 全文 + target 段并完成两次 provider 调用；真实 Web 章节已跑通翻译 → 审校 → 裁决 → 修订 → 复审 → accepted。

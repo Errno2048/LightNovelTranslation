@@ -18,12 +18,12 @@ python -m lightnovel_translation config path
 
 ```python
 from lightnovel_translation import TranslationProject
-from translation.index import FusedWorkflow, GlossaryTerm, LevelConfig
+from translation.index import TranslationWorkflow, GlossaryTerm, LevelConfig
 
 with TranslationProject("workspaces/my-novel") as project:
     source = project.import_book("web-ja.epub", edition_id="web-ja", language="ja")
     reference = project.import_book("web-zh.epub", edition_id="web-zh", language="zh")
-    flow = FusedWorkflow(project, "web-ja", "web-zh",
+    flow = TranslationWorkflow(project, "web-ja", "web-zh",
                          levels=LevelConfig((10, 10), (3, 1)),
                          full_chapters=10)
 
@@ -44,9 +44,9 @@ with TranslationProject("workspaces/my-novel") as project:
     print(result.text[:1000])
 ```
 
-新流程：lazy 参考索引 → 直出高层摘要 → ContextPlan + workset/实体/线程/定向证据 → `source_message` 输出协议 → 实际翻译。目标是保留旧实现的证据协议，同时用新快照/指针/惰性物化降低历史索引成本。
+新流程：lazy 参考索引 → 直出高层摘要 → ContextPlan + workset/实体/线程/定向证据 → `source-records` 输出协议 → 翻译 → `chapter-review` 审校/裁决/修订 → accepted 提交与 EPUB 导出。目标是保留旧实现的证据协议，同时用新快照/指针/惰性物化降低历史索引成本。
 
-**当前自动化边界**：main 已实现索引规划、上下文装配和真实翻译；章节审校/裁决/提交/导出尚未接入新闭环，需要手动接管，或在 `legacy-sequence` 分支使用旧 `create_job/job.run` 管线。完整说明见[新架构技能文档](skills/lightnovel-translation/references/new-architecture.md)、[库使用说明](docs/usage.md)和[架构设计](docs/refactor-architecture-design.md)。
+**章节闭环**：`translation.index.TranslationRunner` 提供逐章翻译、审校、裁决、有限修订/复审、accepted 提交、滚动摘要与 EPUB 导出；状态保存在 SQLite，可中断续跑。跨版本目录对齐仍需按标题/内容建立映射（可用模型或显式锚点），单章拆分、线程目录和部分质量判定仍可能需人工接管。完整说明见[新架构技能文档](skills/lightnovel-translation/references/new-architecture.md)、[库使用说明](docs/usage.md)和[架构设计](docs/refactor-architecture-design.md)。
 
 ## 获取日文 Web 原作
 
@@ -78,7 +78,7 @@ Claude Code 工作区可导出到 `.claude/skills/lightnovel-translation`。导�
 ```text
 src/
   lightnovel_translation/   项目/配置/导入/技能导出外壳与 CLI
-  translation/index/        新分层索引、ContextPlan、lazy 规划、TaskStore/指针、FusedWorkflow
+  translation/index/        新分层索引、ContextPlan、lazy 规划、TaskStore/指针、TranslationWorkflow
   translation/              共享存储、预算、provider、ingestion、edition/review 基础
 skills/lightnovel-translation/
   SKILL.md                 Agent 技能入口

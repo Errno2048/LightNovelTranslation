@@ -8,8 +8,7 @@ import re
 
 from .storage import digest
 
-STABLE = 'stable-v1'
-LEGACY = 'legacy'
+STABLE = 'stable'
 PARAGRAPH_PATTERN = r'C[A-Za-z0-9_]+\.[JZ]\d+'
 
 

@@ -27,7 +27,7 @@ def segment_translation(text, source_revision, *, chapter=None):
     return result
 
 
-def source_segments(source, *, reference_profile='legacy'):
+def source_segments(source, *, reference_profile='plain'):
     result, exempt = [], []
     for pid, text in zip(source["paragraph_ids"], source["paragraph_texts"]):
         if not text.strip():
@@ -127,7 +127,7 @@ def create_version(view, context, text, *, finish_reason="stop", parent=None, re
     if profile == STABLE:
         data['reference_profile'] = STABLE
     if output_generation:
-        data['output_binding'] = {'profile': 'source-records-v1', 'generation_id': output_generation,
+        data['output_binding'] = {'profile': 'source-records', 'generation_id': output_generation,
             'authority': 'declared_by_translation_output', 'semantic_status': 'not_verified'}
     elif previous and previous.get('output_binding'):
         data['output_binding'] = {**previous['output_binding'], 'inherited_from': parent}

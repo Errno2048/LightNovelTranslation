@@ -50,7 +50,7 @@
 | `revision` | 根据裁决修订译文 | 未指定时继承 translator |
 | `repair` | 有界格式修复 | 未指定时继承 reviewer |
 
-注意模板与空 `TranslationConfig()` 的默认值不同：未配置角色时，引擎主角色默认 16384、indexer 32768，公共配置先按 capacity 的输出上限裁剪。因此默认容量下均不超过 16384；显式角色预算超出容量会报错。模板还开启 `translation_tools=true`，空配置默认关闭；公共新任务默认使用 `source-records-v1`。
+注意模板与空 `TranslationConfig()` 的默认值不同：未配置角色时，引擎主角色默认 16384、indexer 32768，公共配置先按 capacity 的输出上限裁剪。因此默认容量下均不超过 16384；显式角色预算超出容量会报错。模板还开启 `translation_tools=true`，空配置默认关闭；公共新任务默认使用 `source-records`。
 
 最终请求预算按实际消息计算：
 
@@ -98,9 +98,9 @@ input_limit = min(context_window - requested_output - safety, max_input 或 cont
 | `compression_trigger` / `compression_target` | 0.85 / 0.65 | H 压缩触发比例与目标比例 |
 | `soft_input_tokens` | 省略 | 可选输入软预算，最终仍受 capacity 限制 |
 | `max_revisions` | 1 | 初始修订上限，允许 0–2；追加恢复另有接口 |
-| `review_profile` | `"audit-v6"` | 可选 v5/v6 审校协议 |
-| `reference_profile` | `"stable-v1"` | 稳定章/段别名；保留 legacy 兼容 |
-| `mapping_profile` | `"coarse-v1"` | plain 输出映射协议，也支持 audit-v2 |
+| `review_profile` | `"chapter-review"` | 可选 v5/v6 审校协议 |
+| `reference_profile` | `"stable"` | 稳定章/段别名；保留 legacy 兼容 |
+| `mapping_profile` | `"coarse"` | plain 输出映射协议，也支持 coarse |
 | `translation_tools` | false，模板 true | 翻译阶段是否允许只读查证 |
 | `targeted_evidence` / `targeted_evidence_tokens` | true / 12288 | 定向术语及局部证据开关与上限 |
 | `workset_max_tokens` / `workset_recent_chapters` | 128000 / 25 | 压缩 workset 预算与近期窗口 |
@@ -108,9 +108,9 @@ input_limit = min(context_window - requested_output - safety, max_input 或 cont
 | `window_l2_blocks` / `translation_concurrency` | 3 / 3 | 窗口翻译的 L2 块数与并行翻译数 |
 | `review_concurrency` | 4 | 并行审校数；建议低于翻译并发 |
 | `provisional_lookahead` | 1 | 允许未审校窗口领先已审校窗口的数量；0 禁用推测 |
-| `output_profile` | `"source-records-v1"` | 逐源段输出；plain-v1 为兼容路径 |
+| `output_profile` | `"source-records"` | 逐源段输出；plain 为兼容路径 |
 
-`source-records-v1` 要求 `stable-v1`。capacity、roles、累计请求/token 限额不能重复放进 sequence，分别在所属节配置。
+`source-records` 要求 `stable`。capacity、roles、累计请求/token 限额不能重复放进 sequence，分别在所属节配置。
 
 ## `[syosetu]`：原文下载
 

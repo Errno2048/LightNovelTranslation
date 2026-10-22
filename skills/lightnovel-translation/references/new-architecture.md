@@ -14,7 +14,7 @@ main 分支只保留新的分层索引能力。旧的 `create_job` / `job.run` /
 | `Artifact` / `IndexSnapshot` | 不可变章节/块、状态、输入、代际 |
 | `plan_reference_blocks` | 参考索引 lazy 规划，产出 `not_created` 边界 |
 | `build_context_plan` | 纯函数上下文：层级摘要 + 全文 + 批内日文 + 目标 |
-| `FusedWorkflow` | 把 lazy 参考索引、ContextPlan、workset/术语/线程/定向证据和 `source_message` 装配起来 |
+| `TranslationWorkflow` | 把 lazy 参考索引、ContextPlan、workset/术语/线程/定向证据和 `source_message` 装配起来 |
 | `TaskStore` / `fair_select` | 持久化 DAG、阶段配额、单调指针/outbox |
 | `IndexMetrics` | direct/fallback/split/estimate 偏差等 debug 指标 |
 
@@ -24,19 +24,19 @@ main 分支只保留新的分层索引能力。旧的 `create_job` / `job.run` /
 
 ```python
 from lightnovel_translation import TranslationProject
-from translation.index import FusedWorkflow, GlossaryTerm, IndexMetrics, LevelConfig
+from translation.index import TranslationWorkflow, GlossaryTerm, IndexMetrics, LevelConfig
 
 with TranslationProject("work/my-novel") as project:
     source = project.import_book("web-ja.epub", edition_id="web-ja", language="ja")
     reference = project.import_book("web-zh.epub", edition_id="web-zh", language="zh")
-    flow = FusedWorkflow(
+    flow = TranslationWorkflow(
         project, "web-ja", "web-zh",
         levels=LevelConfig((10, 10), (3, 1)),
         full_chapters=10,
     )
 ```
 
-`FusedWorkflow` 使用项目配置中的 provider；不要打印配置文件或 key。
+`TranslationWorkflow` 使用项目配置中的 provider；不要打印配置文件或 key。
 
 ## 3. 参考索引 lazy 规划
 
@@ -71,6 +71,7 @@ snapshot = flow.make_snapshot(
 - 先尝试 direct level-2；只有真实 context 越界才拆成两段/rollup。
 - 高层摘要成功后可缓存；参考低层块保持 `not_created`。
 - 如果上下文真正需要低层块，按设计先创建该高层父块的全部低层子块，再 rollup；不要只创建所需子集而留下覆盖缺口。
+- 只有高层摘要、没有 level-1 块时，最新摘要可能覆盖到近期全文窗口；ContextPlan 允许这种有限重叠，以避免摘要与全文之间出现空洞。重复是有意的安全余量。
 - 参考块使用 `quality_labels=("rebuild_only","reference")`，不进入目标 accepted knowledge。
 
 ## 5. 装配上下文
@@ -144,16 +145,74 @@ store.add(Task("translate-111", "translate", "translate"),
 - 不在持有写锁时调用模型。
 - 阶段配额建议 review/accept 40%、materialize/rebuild 30%、translate 30%。
 
+## 7.1 章节闭环：翻译、审校、提交与导出
+
+`translation.index.pipeline` 在 分层索引上下文之上提供可恢复的章节闭环：
+
+```python
+from translation.index import (TranslationRunner, TranslationStore,
+                               build_epub, collect_epub_chapters)
+
+with TranslationStore("work/my-novel/translation.sqlite") as store:
+    runner = TranslationRunner(
+        project, flow, store,
+        continuation_start=199, main_end=260,
+        reference_texts=reference_by_source_order,   # 官方参考 -> Web 话序
+        history_chapters=3, summary_every=5, summary_lag=0,
+        max_revisions=2,
+        translation_tokens=65536, review_tokens=65536,
+        adjudication_tokens=32768)
+    runner.ensure_reference_summary()
+    runner.ensure_glossary()
+    for order in range(199, 260):
+        runner.run_order(order)          # 每章一个可恢复事务
+    runner.update_target_summary(force=True)
+    chapters = collect_epub_chapters(
+        runner=runner, reference_chapters=official_chapters, end=260)
+    build_epub(output="book.epub", title="书名", chapters=chapters)
+```
+
+`TranslationStore` 保存不可变版本、当前 accepted 文本、滚动摘要、术语表和事件账本。`TranslationRunner.run_order`：
+
+1. 用 `source-records` 逐源段输出翻译（`@@TITLE` + 每个 S 段一条 `@@TRANSLATION`）；
+2. 用 `chapter-review` 对照完整 S/T 与近期 R/L 历史审校；
+3. 逐条裁决；confirmed 的 critical/major 触发完整重译修订；
+4. 复审，最多 `max_revisions` 轮；仍有 major 时写 `blocked` 并抛出 `ChapterBlocked`；
+5. 通过后原子写 `accepted`，并每隔 `summary_every` 章生成增量目标摘要。
+
+恢复时直接用同一 SQLite 重新构造 runner；accepted 章节会跳过。`blocked` 章节会重新进入草稿流程，或由 agent 检查 `review` 字段后局部接管。
+
+长任务使用 `run_concurrent` 窗口化执行：
+
+```python
+spec = project.config.sequence_spec()
+runner.run_concurrent(
+    start=continuation, end=main_end,
+    translation_concurrency=spec.translation_concurrency,  # 默认 3
+    review_concurrency=spec.review_concurrency,            # 默认 4
+    batch_size=30,                                         # 按容量选择
+    update_summaries=True,
+)
+```
+
+- 批次内章节**没有译文依赖**：翻译第 i 章时，上下文使用共享已接受前缀 + 批内前序章节的**日文原文**；不使用同批其他章节的译文。
+- 批次开始前做一次专名预抽取，生成所有 worker 共享的术语表；已有术语沿用原译名，新术语统一候选。`translation_concurrency` 控制并发翻译请求数。
+- 审校、裁决和修订在 `review_concurrency` 个线程中并发；审校历史可把同批已有译文作为 `provisional_target`，仅用于一致性检查。主线程按顺序写 accepted，SQLite 保持单写者。
+- 某章 blocked 时批次停止；已完成章节保留，修复后从同一 SQLite 续跑。
+- `batch_size` 决定批内前序原文的长度；1M 上下文可用数十章，较小模型应减小批次或增加高层摘要。`lookahead` 参数仅为旧调用兼容保留，不再驱动翻译上下文。
+
 ## 8. 当前自动化边界与手动接管
 
-main 分支尚未实现完整的新审校/提交/导出闭环。Agent 必须明确：
+具体的状态查询、blocked 章节修补、事后质量复查、EPUB 验证和 provider 故障处理见 [operations.md](operations.md)。
 
-1. **章节审校、裁决、提交、最终导出**仍需手动接管，或在 `legacy-sequence` 分支使用旧 `create_job/job.run`。
-2. **实体目录、线程目录、glossary** 目前由调用者提供或从参考数据构建；不要假定模型总结会自动更新 accepted glossary。
-3. **单章拆分**只有接口预留；译文对齐未实现。单章超限时应 blocked，等待人工/后续版本。
-4. **token 估算**目前使用保守 byte 估算；接入真实 tokenizer 或实际 usage 校准前，不要把估算值当作精确计费。
-5. **参考摘要**可能需要缓存；重复调用会增加费用。
-6. 低层 `not_created` 块被真正请求时，先创建高层父块的全部低层子块，再 rollup；这是当前阻塞规则，后续可优化为按需子集。
+章节审校/裁决/修订/提交与 EPUB 导出已由 `TranslationRunner` 覆盖。仍需 agent 明确处理：
+
+1. **跨版本目录对齐**：官方文库章号与 Web 话号可能因拆章、合章、插图/设定页而不同，不能按序号硬配。`align_reference_by_titles` 可调用模型对齐；模型不可用时需要人工核对的锚点（见 `work/hero/anchors.py` 一类脚本）。
+2. **实体目录、线程目录、glossary**：`ensure_glossary` 提供基于双语对照的自动抽取，但术语冲突仍以日文和人工核对为准；线程目录仍由调用者提供。
+3. **单章拆分**只有接口预留；单章超出上下文时应 blocked 并交接。
+4. **token 估算**仍使用保守 byte 估算；接入真实 tokenizer 或 usage 校准前，不要把估算值当作精确计费。
+5. **审校成本**：每章至少一次翻译、一次审校、一次裁决和可能的修订/复审；应记录 usage 并避免无界重试。
+6. 低层 `not_created` 块被真正请求时，先创建高层父块的全部低层子块，再 rollup。
 7. 任何 provisional 参考内容都不得标记为 accepted 目标知识；最终交付必须明确哪些章节只是草稿。
 
 ## 9. 调试指标

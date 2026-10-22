@@ -56,7 +56,7 @@ def plan_acceptance(view, version_id, coverage_id, checks_id, report_id, *, adju
     if checks["coverage_id"] != coverage_id:
         raise NarrativeError("conflict", "checks bind a different coverage record")
     blockers = list(checks["hard_failures"])
-    if report.get('review_profile') in AUDIT_PROFILES and checks.get('profile') not in {'audit-v2','p6-mvp'}:
+    if report.get('review_profile') in AUDIT_PROFILES and checks.get('profile') not in {'coarse','record-checks'}:
         blockers.append('enhanced_checks_required')
     if not coverage["mapping_complete"]: blockers.append("mapping_incomplete")
     if not report["review_complete"] or not report["semantic_coverage_reviewed"]: blockers.append("semantic_review_incomplete")
@@ -81,7 +81,7 @@ def plan_acceptance(view, version_id, coverage_id, checks_id, report_id, *, adju
             raise NarrativeError("invalid_record", "unknown or duplicate "+label+" decision")
         blockers += [label+":"+i for i in required if i not in resolved]
     if not actor or not reason: raise NarrativeError("invalid_record", "acceptance actor and reason required")
-    data = {"schema": "translation-acceptance-plan-v1", "policy_version": "explicit-reviewed-v1",
+    data = {"schema": "translation-acceptance-plan-v1", "policy_version": "explicit-reviewed",
         "version_id": version_id, "source_id": v["source_id"], "coverage_id": coverage_id, "checks_id": checks_id,
         "report_id": report_id, "adjudication_id": adjudication_id, "expected_head": expected_head,
         "actor": actor, "reason": reason, "signal_decisions": list(signal_decisions), "unresolved_decisions": list(unresolved_decisions),

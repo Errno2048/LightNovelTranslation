@@ -39,7 +39,7 @@ def parser():
             a.add_argument('--near-source',nargs='*',default=None)
             a.add_argument('--prior-context',nargs='*',default=[])
         if cmd in {"check", "plan-acceptance"}: a.add_argument("--coverage", required=True)
-        if cmd in {'check', 'map'}: a.add_argument('--profile',choices=['legacy','audit-v2'],default='legacy')
+        if cmd in {'check', 'map'}: a.add_argument('--profile',choices=['plain','coarse'],default='plain')
         if cmd in {"adjudicate", "revise", "plan-acceptance"}: a.add_argument("--report", required=True)
         if cmd in {"revise", "plan-acceptance"}: a.add_argument("--adjudication", required=cmd == "revise")
         if cmd == "run":
@@ -50,8 +50,8 @@ def parser():
             a.add_argument('--evidence-context',help='Frozen review-evidence-context ID')
             a.add_argument('--reference-mode',choices=['literal','paragraph'],default='literal',
                            help='Experimental paragraph mode binds S/T labels to full paragraphs; external evidence still requires literal quotes')
-            a.add_argument('--review-profile',choices=['legacy','audit-v2','audit-v3','audit-v4','audit-v5','audit-v6'],default='legacy',
-                           help='audit-v6 adds count-consistent examples and auditable record-count metadata recovery; v5 remains available')
+            a.add_argument('--review-profile',choices=['plain','chapter-review'],default='plain',
+                           help='chapter-review adds count-consistent examples and auditable record-count metadata recovery; v5 remains available')
             a.add_argument("--resolve-lookups", action="store_true", help="One bounded model-requested evidence round")
         if cmd == "adjudicate": a.add_argument("--decisions", type=Path)
         if cmd == "lookup": a.add_argument("--query", nargs="+", required=True)

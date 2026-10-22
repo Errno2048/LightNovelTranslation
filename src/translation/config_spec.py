@@ -20,7 +20,7 @@ class SequenceSpec:
     n_child: int = 2
     child_max_chapters: int = 10
     parent_max_chapters: int = 100
-    index_layout: str = 'token-v2'
+    index_layout: str = 'token'
     parent_min_chapters: int | None = None
     expected_l2_count: int = 10
     l2_prepartition_min_chapters: int = 3
@@ -38,10 +38,10 @@ class SequenceSpec:
     max_output_tokens: int = 0
     max_attempts: int = 3
     max_revisions: int = 1
-    review_profile: str = 'audit-v6'
+    review_profile: str = 'chapter-review'
     translation_tools: bool = False
-    reference_profile: str = 'stable-v1'
-    mapping_profile: str = 'coarse-v1'
+    reference_profile: str = 'stable'
+    mapping_profile: str = 'coarse'
     targeted_evidence: bool = True
     targeted_evidence_tokens: int = 12288
     workset_max_tokens: int = 128000
@@ -51,15 +51,15 @@ class SequenceSpec:
     translation_concurrency: int = 3
     review_concurrency: int = 4
     provisional_lookahead: int = 1
-    output_profile: str = 'plain-v1'
+    output_profile: str = 'plain'
 
     def __post_init__(self):
         if self.parent_min_chapters is None:
             object.__setattr__(self, 'parent_min_chapters', min(30, self.parent_max_chapters))
-        if self.output_profile not in {'plain-v1', 'source-records-v1'}:
+        if self.output_profile not in {'plain', 'source-records'}:
             raise ValueError('unknown translation output profile')
-        if self.output_profile == 'source-records-v1' and self.reference_profile != 'stable-v1':
-            raise ValueError('source-bound output requires stable-v1 source references')
+        if self.output_profile == 'source-records' and self.reference_profile != 'stable':
+            raise ValueError('source-bound output requires stable source references')
         if type(self.targeted_evidence) is not bool or type(self.targeted_evidence_tokens) is not int or self.targeted_evidence_tokens<=0:
             raise ValueError('invalid targeted evidence settings')
         if any(type(value) is not int or value<=0 for value in
@@ -72,7 +72,7 @@ class SequenceSpec:
             raise ValueError('invalid window translation settings')
         if type(self.provisional_lookahead) is not int or self.provisional_lookahead<0:
             raise ValueError('provisional_lookahead must be a non-negative integer')
-        if self.reference_profile not in {'legacy', 'stable-v1'} or self.mapping_profile not in {'audit-v2', 'coarse-v1'}:
+        if self.reference_profile not in {'plain', 'stable'} or self.mapping_profile not in {'coarse'}:
             raise ValueError('unknown reference or mapping protocol')
         if self.strategy not in {'R','U','H'} or self.mode not in {'working','accepted_only'}:
             raise ValueError('invalid sequence strategy or mode')
@@ -91,10 +91,10 @@ class SequenceSpec:
             if type(getattr(self,name)) is not int or getattr(self,name)<0:
                 raise ValueError('cumulative sequence budgets must be nonnegative; 0 means unlimited')
         if (self.child_max_chapters>self.parent_max_chapters or
-                (self.index_layout == 'token-v2' and self.parent_min_chapters>self.parent_max_chapters) or
+                (self.index_layout == 'token' and self.parent_min_chapters>self.parent_max_chapters) or
                 not 1<=self.max_attempts<=3 or not 0<=self.max_revisions<=2):
             raise ValueError('invalid block bounds or retry limits')
-        if self.index_layout not in {'token-v2', 'legacy-v1'}:
+        if self.index_layout not in {'token', 'plain'}:
             raise ValueError('unknown index layout')
         if self.parent_build_mode not in {'direct', 'child_summary_rollup', 'direct_then_rollup'}:
             raise ValueError('invalid L1 build mode')
@@ -104,8 +104,8 @@ class SequenceSpec:
             raise ValueError('parent summary input allowance must be a positive integer')
         if self.soft_input_tokens is not None and self.soft_input_tokens<=0:
             raise ValueError('invalid input soft budget')
-        if self.review_profile not in {'audit-v5','audit-v6'}:
-            raise ValueError('sequence requires a versioned audit-v5/v6 review profile')
+        if self.review_profile not in {'chapter-review'}:
+            raise ValueError('sequence requires the chapter-review profile')
         for role in ('translator','reviewer','adjudicator','indexer','compressor'):
             if role not in self.roles or self.roles[role].requested_output_tokens>self.capacity.max_output_tokens:
                 raise ValueError('missing role or role output exceeds capacity')
@@ -115,13 +115,13 @@ class SequenceSpec:
     @classmethod
     def from_dict(cls, value):
         value=dict(value)
-        value.setdefault('index_layout', 'legacy-v1')
+        value.setdefault('index_layout', 'plain')
         # Frozen pre-feature jobs retain the historical capacity-fallback policy.
         value.setdefault('parent_min_chapters', min(30, value.get('parent_max_chapters', 100)))
         value.setdefault('parent_build_mode', 'direct_then_rollup')
-        value.setdefault('review_profile','audit-v5')
-        value.setdefault('reference_profile','legacy')
-        value.setdefault('mapping_profile','audit-v2')
+        value.setdefault('review_profile','chapter-review')
+        value.setdefault('reference_profile','plain')
+        value.setdefault('mapping_profile','coarse')
         # Frozen pre-feature runs must retain their exact prompts and cache keys.
         value.setdefault('targeted_evidence',False)
         value.setdefault('workset_max_tokens',128000)
@@ -131,7 +131,7 @@ class SequenceSpec:
         value.setdefault('translation_concurrency',3)
         value.setdefault('review_concurrency',4)
         value.setdefault('provisional_lookahead',1)
-        value.setdefault('output_profile','plain-v1')
+        value.setdefault('output_profile','plain')
         value['capacity']=ModelCapacity(**value['capacity'])
         value['roles']={k:RoleBudget(**v) for k,v in value['roles'].items()}
         return cls(**value)
@@ -141,8 +141,8 @@ class SequenceSpec:
         if settings.generation.capacity is None:
             raise ValueError('P7 requires explicit [capacity] configuration')
         values=dict(settings.sequence)
-        if settings.index.get('layout','adaptive-v1')!='adaptive-v1':
-            raise ValueError('P7 currently supports adaptive-v1 for new partitions')
+        if settings.index.get('layout','adaptive')!='adaptive':
+            raise ValueError('P7 currently supports adaptive for new partitions')
         mapping={'parent_max_chapters','child_max_chapters','parent_min_chapters',
                  'expected_l2_count','l2_prepartition_min_chapters','entity_catalog_threshold',
                  'core_entity_limit','parent_build_mode','planning_utilization',

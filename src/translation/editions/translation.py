@@ -1,7 +1,7 @@
 """An explicit cross-edition execution path sharing the existing audit protocol."""
 import re
 
-from ..review.prompts import AUDIT_V6_TASK, AUDIT_V6_ADJUDICATION, review_examples
+from ..review.prompts import AUDIT_TASK, AUDIT_ADJUDICATION, review_examples
 from ..review.protocol import locate, parse_records
 from ..storage import atomic_text, digest, write_json
 from .context import review_reference_packet
@@ -23,7 +23,7 @@ def _review_rows(pipeline, packet, target, text):
 
 def _parse_review(text, source, target, history):
     parsed = parse_records(text, {'FINDING', 'UNRESOLVED', 'SUMMARY'},
-        extra_fields={'FINDING': {'basis'}}, syntax_profile='p6-tolerant-v1', allow_preamble=True)
+        extra_fields={'FINDING': {'basis'}}, syntax_profile='tolerant-records', allow_preamble=True)
     errors, findings = list(parsed['errors']), []
     for row in parsed['records']:
         if row['record'] != 'FINDING':
@@ -50,7 +50,7 @@ def _parse_review(text, source, target, history):
 
 
 def _parse_decisions(text, findings):
-    parsed = parse_records(text, {'DECISION'}, syntax_profile='p6-tolerant-v1', allow_inline_end=True,
+    parsed = parse_records(text, {'DECISION'}, syntax_profile='tolerant-records', allow_inline_end=True,
                            allow_preamble=True)
     errors, decisions, seen = list(parsed['errors']), [], set()
     expected = {f['id'] for f in findings}
@@ -97,7 +97,7 @@ class CrossEditionTranslator:
                 payload = {'context': review_reference_packet(packet, include_body=False), 'source': source,
                            'translation': translated, 'allowed_history': history,
                            'findings': initial['result']['findings']}
-                messages = [{'role': 'system', 'content': AUDIT_V6_ADJUDICATION + self._edition_rules()},
+                messages = [{'role': 'system', 'content': AUDIT_ADJUDICATION + self._edition_rules()},
                             {'role': 'user', 'content': j(payload)}]
                 adjudication = pipeline.caller.structured('edition-adjudication', messages, output_tokens,
                     lambda text: _parse_decisions(text, initial['result']['findings']))
@@ -127,10 +127,10 @@ class CrossEditionTranslator:
 
     def review(self, target, packet, text, *, output_tokens=8192):
         source, translated, history = _review_rows(self.pipeline, packet, target, text)
-        messages = [{'role': 'system', 'content': AUDIT_V6_TASK + self._edition_rules()}]
+        messages = [{'role': 'system', 'content': AUDIT_TASK + self._edition_rules()}]
         # Examples teach the existing wire syntax, while this task supplies a
         # frozen native-edition registry instead of canonical chapter aliases.
-        messages += review_examples('audit-v6')
+        messages += review_examples('chapter-review')
         messages += [{'role': 'user', 'content': j({'context': review_reference_packet(packet, include_body=False),
                     'source': source, 'translation': translated, 'allowed_history': history})}]
         return self.pipeline.caller.structured('edition-review', messages, output_tokens,

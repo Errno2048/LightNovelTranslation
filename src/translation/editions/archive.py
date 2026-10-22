@@ -1,6 +1,5 @@
 """Read native documents without inventing a canonical bilingual binding."""
 from collections import defaultdict
-from copy import deepcopy
 from pathlib import Path
 
 from ..storage import digest, read_json, read_jsonl
@@ -54,7 +53,7 @@ def classify_reference_mode(manifest, existing_mapping=(), probes=(), requested=
 
 
 class EditionArchive:
-    def __init__(self, entries, paragraphs):
+    def __init__(self, entries, paragraphs, *, fingerprint=None):
         self.entries = {}
         self.paragraphs = {}
         self.by_entry = defaultdict(list)
@@ -62,7 +61,7 @@ class EditionArchive:
             key = entry['entry_id']
             if key in self.entries:
                 raise ValueError('duplicate edition entry ID')
-            self.entries[key] = deepcopy(entry)
+            self.entries[key] = entry
         for row in paragraphs:
             eid, pid = row['entry_id'], row['paragraph_id']
             if eid not in self.entries or pid in self.paragraphs:
@@ -70,13 +69,14 @@ class EditionArchive:
             entry = self.entries[eid]
             if row.get('edition_id') != entry['edition_id'] or row.get('revision_id') != entry['revision_id']:
                 raise ValueError('paragraph edition/revision mismatch')
-            self.paragraphs[pid] = deepcopy(row)
+            self.paragraphs[pid] = row
             self.by_entry[eid].append(self.paragraphs[pid])
         for rows in self.by_entry.values():
             rows.sort(key=lambda r: r['ordinal'])
             if len({r['ordinal'] for r in rows}) != len(rows):
                 raise ValueError('duplicate paragraph ordinal')
-        self.fingerprint = digest({'entries': self.entries, 'paragraphs': self.paragraphs})
+        self.fingerprint = fingerprint or digest(
+            {'entries': self.entries, 'paragraphs': self.paragraphs})
 
     @classmethod
     def from_folder(cls, folder):
@@ -85,11 +85,13 @@ class EditionArchive:
         paragraphs = read_jsonl(folder / 'paragraphs.jsonl')
         manifest_path = folder / 'manifest.json'
         manifest = read_json(manifest_path) if manifest_path.is_file() else {}
+        fingerprint = None
         if manifest.get('schema') == 'editions-export-v1':
             _validate_import_export(folder, manifest, entries, paragraphs)
+            fingerprint = manifest['view_fingerprint']
         elif any(entry.get('metadata', {}).get('import_revision') for entry in entries):
             raise ValueError('generic edition export has no valid completion manifest')
-        return cls(entries, paragraphs)
+        return cls(entries, paragraphs, fingerprint=fingerprint)
 
     def documents(self, edition_id, *, narrative_only=True):
         entries = [e for e in self.entries.values() if e['edition_id'] == edition_id]

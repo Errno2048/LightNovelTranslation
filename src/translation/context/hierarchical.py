@@ -7,7 +7,7 @@ from ..narrative.service import dependency
 from ..storage import digest
 from ..workflow import SYSTEM
 
-PROMPT_VERSION = "hierarchical-context-v1"
+PROMPT_VERSION = "hierarchical-context"
 
 
 def _validate_examples(view, examples):
@@ -108,7 +108,7 @@ def compile_hierarchical_context(view, index_id, summaries, *, spec=None, knowle
                 raise NarrativeError("coverage_gap", "missing exact block/prefix summary: " + block["block_id"])
             summary = summary_view.read_summary(sid, block["chapter_ids"])
             coverage_review_ids = []
-            if summary.get("schema_version") == "bilingual-block-v2" and summary["content"].get("coverage_notes"):
+            if summary.get("schema_version") == "bilingual-block" and summary["content"].get("coverage_notes"):
                 note_reviews=[(rid,r) for rid,r in view.store.objects("summary-coverage-review") if r.get("summary_id")==sid]
                 if (not note_reviews or any(r.get("decision") != "non_material_compression_or_reference_warning" or
                         r.get("notes_hash") != digest(summary["content"]["coverage_notes"]) or
@@ -191,7 +191,7 @@ def compile_hierarchical_context(view, index_id, summaries, *, spec=None, knowle
               "examples": list(examples)}
     result["example_dependencies"] = [x.get("source_dependencies", []) for x in examples]
     if translation_metadata is not None:
-        result.update(version="hierarchical-context-v2", translation_metadata=translation_metadata,
+        result.update(version="hierarchical-context", translation_metadata=translation_metadata,
                       metadata_workset=metadata_workset, metadata_core_forms=list(metadata_core_forms))
     result["fingerprint"] = digest(result)
     return result

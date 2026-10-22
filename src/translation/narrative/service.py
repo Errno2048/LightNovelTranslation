@@ -109,7 +109,7 @@ class NarrativeView:
         summary = self.store.get(summary_id, "summary")
         if summary["chapter_ids"] != chapter_ids:
             raise NarrativeError("visibility_denied", "summary is not for the exact visible block/prefix")
-        if summary.get("schema_version") == "bilingual-block-v2":
+        if summary.get("schema_version") == "bilingual-block":
             from .bilingual import validate_artifact
             validate_artifact(self, summary)
             return summary

@@ -1,6 +1,6 @@
 """Run the installed public library without API keys, network or repository data.
 
-This demonstrates the fused index/context/provider surface; replies are fixed
+This demonstrates the hierarchical index/context/provider surface; replies are fixed
 and do not measure translation quality. python examples/library_offline.py <dir>
 """
 from __future__ import annotations
@@ -11,7 +11,7 @@ import sys
 
 from lightnovel_translation import (EditionIndexSpec, GenerationResult, TranslationConfig,
                                     TranslationProject)
-from translation.index import FusedWorkflow, LevelConfig
+from translation.index import TranslationWorkflow, LevelConfig
 
 
 class OfflineProvider:
@@ -22,7 +22,7 @@ class OfflineProvider:
         self.requests.append(request)
         if request.task == "reference_summary":
             text = "诺亚回到村子，并向众人讲述旅途。"
-        elif request.task.startswith("fused_translate_"):
+        elif request.task.startswith("translate_"):
             text = "诺亚回到了村子。\n众人听他讲述旅途。"
         else:
             raise AssertionError("unhandled offline task: " + request.task)
@@ -49,7 +49,7 @@ def run_demo(destination: str | Path) -> dict:
                             paragraph_policy="blank_line")
         project.import_book(chinese, edition_id="zh", language="zh",
                             paragraph_policy="blank_line")
-        flow = FusedWorkflow(project, "ja", "zh",
+        flow = TranslationWorkflow(project, "ja", "zh",
                              levels=LevelConfig((2, 2), (1, 1)), full_chapters=2)
         plan = flow.reference_plan()
         documents = flow.documents(start=0, end=5)

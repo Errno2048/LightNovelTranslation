@@ -1,4 +1,4 @@
-"""Fused workflow: lazy reference index, ContextPlan and evidence-bound prompts.
+"""Hierarchical translation workflow: lazy reference index, ContextPlan and evidence-bound prompts.
 
 This is the supported surface for the new architecture. Review/commit are
 intentionally not hidden here; callers should keep those steps explicit or use
@@ -16,7 +16,7 @@ from .artifacts import Artifact, InputRef
 from .context_plan import ContextDocument, build_context_plan
 from .lazy import plan_reference_blocks
 from .levels import LevelConfig
-from .prompts import source_message
+from .prompts import source_message, source_records_rules
 from .snapshot import IndexSnapshot
 
 
@@ -28,7 +28,7 @@ class GlossaryTerm:
 
 
 @dataclass
-class FusedWorkflow:
+class TranslationWorkflow:
     project: object
     source_edition: str
     reference_edition: str
@@ -37,6 +37,7 @@ class FusedWorkflow:
     prompt_overhead: int = 2048
     full_chapters: int = 10
     reference_summary_tokens: int = 4096
+    reference_map: Mapping[int, int] | None = None
 
     def __post_init__(self):
         self.archive = self.project._archive([self.source_edition, self.reference_edition])
@@ -44,23 +45,35 @@ class FusedWorkflow:
         self._reference_docs = self.archive.documents(self.reference_edition)
         self._reference_by_order = {doc["edition_order"]: doc
                                     for doc in self._reference_docs}
+        self._reference_by_source_order = (
+            {source_order: self._reference_by_order[reference_order]
+             for source_order, reference_order in self.reference_map.items()
+             if reference_order in self._reference_by_order}
+            if self.reference_map is not None else self._reference_by_order)
+
+    def reference_for(self, order: int):
+        return self._reference_by_source_order.get(order)
 
     @property
     def capacity(self) -> int:
         return self.project.config.capacity.context_window_tokens
 
     def documents(self, *, start: int = 0, end: int | None = None,
-                  with_reference: bool = True) -> dict[int, ContextDocument]:
+                  with_reference: bool = True,
+                  translations: Mapping[int, str] | None = None) -> dict[int, ContextDocument]:
         documents = {}
         for doc in self._source_docs:
             order = doc["edition_order"]
             if order < start or (end is not None and order >= end):
                 continue
-            reference = self._reference_by_order.get(order)
+            reference = self._reference_by_source_order.get(order)
+            translation = (translations or {}).get(order)
+            if translation is None and with_reference and reference:
+                translation = reference["text"]
             documents[order] = ContextDocument(
                 source_id=doc["entry_id"], order=order,
                 title=doc["raw_title"], source_text=doc["text"],
-                translation_text=(reference["text"] if with_reference and reference else None))
+                translation_text=translation)
         return documents
 
     def reference_documents(self) -> dict[int, ContextDocument]:
@@ -100,9 +113,9 @@ class FusedWorkflow:
                            for order in range(summary_start, summary_end)
                            if order in documents)
         block = Artifact(
-            artifact_id="reference-L2-summary", kind="block", level=2,
+            artifact_id="reference-summary", kind="block", level=2,
             source_ids=source_ids, status="accepted",
-            inputs=(InputRef("reference", "lazy-v1", "summary"),),
+            inputs=(InputRef("reference", "lazy-plan", "summary"),),
             content={"summary": summary}, review_mode="rebuild_only",
             quality_labels=("rebuild_only", "reference"))
         artifacts = {block.artifact_id: block}
@@ -116,14 +129,19 @@ class FusedWorkflow:
                 inputs=(InputRef(doc.source_id, "reference", str(order)),),
                 quality_labels=("reference",))
             artifacts[artifact.artifact_id] = artifact
-        return IndexSnapshot(snapshot_id="fused-workflow", generation="fused",
+        return IndexSnapshot(snapshot_id="translation-workflow", generation="hierarchical",
                              levels=self.levels, artifacts=artifacts)
 
     def assemble(self, *, snapshot: IndexSnapshot, documents: Mapping[int, ContextDocument],
                  target_order: int, batch_orders: Iterable[int],
                  glossary: Iterable[GlossaryTerm] = (), unresolved: Iterable[str] = (),
                  threads: Mapping | None = None,
-                 output_tokens: int = 16384) -> tuple[list[dict], dict, object]:
+                 output_tokens: int = 16384,
+                 output_profile: str = "plain",
+                 source_rows: Iterable[Mapping] | None = None,
+                 provisional_orders: Iterable[int] = ()) -> tuple[list[dict], dict, object]:
+        if output_profile not in {"plain", "source-records"}:
+            raise ValueError("unknown output profile")
         batch_orders = tuple(batch_orders)
         target = documents[target_order]
         batch_ids = [documents[order].source_id for order in batch_orders]
@@ -140,14 +158,24 @@ class FusedWorkflow:
             "unresolved": list(unresolved),
             "extraction_gaps": ["参考索引为 lazy planned blocks；仅使用已物化摘要或全文。"],
             "threads": dict(threads or {"active": [], "resolved": [], "dormant_relevant": []}),
-            "selection": {"target_order": target_order, "recent_chapters": self.full_chapters},
+            "selection": {"target_order": target_order,
+                          "recent_chapters": self.full_chapters,
+                          "batch_orders": list(batch_orders),
+                          "provisional_target_orders": list(provisional_orders)},
             "authority": "candidate_unreviewed",
         }
+        if output_profile == "source-records":
+            system = (
+                "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
+                "日文原文是事实依据。术语优先使用候选 target_form。按源段记录协议输出，"
+                "不要解释、不要代码块。")
+        else:
+            system = (
+                "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
+                "日文原文是事实依据。术语优先使用候选 target_form。只输出正文，不输出标题、"
+                "段落定位ID或解释。")
         messages = [
-            {"role": "system", "content":
-             "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
-             "日文原文是事实依据。术语优先使用候选 target_form。只输出正文，不输出标题、"
-             "段落定位ID或解释。"},
+            {"role": "system", "content": system},
             {"role": "user", "content":
              "【冻结约定、候选知识、未决与线程】\n" +
              json.dumps(workset, ensure_ascii=False, separators=(",", ":"))},
@@ -165,12 +193,24 @@ class FusedWorkflow:
             messages.append({"role": "user", "content":
                              "【本章定向词条与局部证据；未审候选】\n" +
                              json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))})
-        source = {"chapter_id": target.source_id, "match_key": target.title,
-                  "title": target.title, "text": target.source_text,
-                  "order": target.order, "language": "ja"}
-        messages.append(source_message(source, list(unresolved), reference_profile="legacy"))
-        messages.append({"role": "user", "content":
-                         "只输出最终中文译文正文；不要标题、不要段落ID、不要解释。"})
+        if output_profile == "source-records":
+            rows = list(source_rows or ())
+            if not rows or any(not str(row.get("text", "")).strip() for row in rows):
+                raise ValueError("source_rows must contain the target chapter's nonempty paragraphs")
+            aliases = [f"S{index:03d}" for index in range(1, len(rows) + 1)]
+            messages.append({"role": "user", "content":
+                             f"【当前目标 {target.title} 完整日文正文；只翻译本章】\n" +
+                             "\n".join(f"[{alias}] {row['text']}"
+                                       for alias, row in zip(aliases, rows))})
+            messages.append({"role": "user", "content":
+                             source_records_rules(aliases)})
+        else:
+            source = {"chapter_id": target.source_id, "match_key": target.title,
+                      "title": target.title, "text": target.source_text,
+                      "order": target.order, "language": "ja"}
+            messages.append(source_message(source, list(unresolved), reference_profile="plain"))
+            messages.append({"role": "user", "content":
+                             "只输出最终中文译文正文；不要标题、不要段落ID、不要解释。"})
         report = plan_request(messages, self.project.config.capacity,
                               RoleBudget(output_tokens), self.project.counter)
         if not report["fits"]:
@@ -185,14 +225,18 @@ class FusedWorkflow:
                   documents: Mapping[int, ContextDocument], target_order: int,
                   batch_orders: Iterable[int], glossary: Iterable[GlossaryTerm] = (),
                   unresolved: Iterable[str] = (), threads: Mapping | None = None,
-                  output_tokens: int = 16384):
+                  output_tokens: int = 16384, output_profile: str = "plain",
+                  source_rows: Iterable[Mapping] | None = None,
+                  provisional_orders: Iterable[int] = ()):
         messages, report, plan = self.assemble(
             snapshot=snapshot, documents=documents, target_order=target_order,
             batch_orders=batch_orders, glossary=glossary, unresolved=unresolved,
-            threads=threads, output_tokens=output_tokens)
+            threads=threads, output_tokens=output_tokens,
+            output_profile=output_profile, source_rows=source_rows,
+            provisional_orders=provisional_orders)
         result = self.project.provider.generate(GenerationRequest(
             messages, max_tokens=output_tokens, temperature=0,
-            task=f"fused_translate_{target_order}"))
+            task=f"translate_{target_order}"))
         return result, report, plan
 
 

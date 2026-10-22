@@ -25,12 +25,12 @@ def _prior_context(view, context_id):
 
 
 def compile_review_context(view, version_id, *, profile='hierarchical', near_source_ids=None,
-                           prior_context_ids=(), projection_version='clean-v2'):
+                           prior_context_ids=(), projection_version='clean'):
     if profile not in {'near', 'hierarchical'}:
         raise NarrativeError('invalid_record', 'unknown review context profile')
     version = read_version(view, version_id)
     stable = version.get('reference_profile') == STABLE
-    if projection_version not in {'initial-v1','clean-v2'}:
+    if projection_version not in {'initial','clean'}:
         raise NarrativeError('invalid_record','unknown context presentation protocol')
     base = view.store.get(version['context_id'], 'review-context')
     if near_source_ids is None:
@@ -170,7 +170,7 @@ def compile_review_context(view, version_id, *, profile='hierarchical', near_sou
         'semantic_status':'historical_navigation_and_observed_usage_not_confirmed_facts'}
     if stable:
         data['reference_profile'] = STABLE
-        if projection_version!='initial-v1':
+        if projection_version!='initial':
             data['projection_version'] = projection_version
         data['reference_documents'] = [{k:d[k] for k in ('chapter_id','match_key')}
             for d in view.archive.chapters.values() if d['chapter_id'] in
@@ -190,7 +190,7 @@ def read_review_context(view, version_id, context_id):
     validate_additional_dependencies(view,value['dependencies'])
     expected = compile_review_context(view,version_id,profile=value['profile'],
         near_source_ids=value['near_source_ids'],prior_context_ids=value['prior_context_ids'],
-        projection_version=value.get('projection_version','initial-v1'))
+        projection_version=value.get('projection_version','initial'))
     if expected != context_id:
         raise NarrativeError('stale_summary','review context differs from frozen evidence')
     return value
@@ -204,7 +204,7 @@ def context_messages(value):
     messages = [{'role':'user','content':instructions}]
     stable = value.get('reference_profile') == STABLE
     project = lambda x: prompt_projection(x, value.get('reference_documents', value['documents']),
-        scrub_inline=value.get('projection_version')=='clean-v2') if stable else x
+        scrub_inline=value.get('projection_version')=='clean') if stable else x
     if stable:
         messages[0]['content'] = ('【审校上下文使用规则】以下只含允许的历史资料，不含目标章参考译文。'
             '历史正文也使用C章节.J/Z段落ID，evidence_ref复制实际ID。日文用于事实判断，中文用于核对译法。'

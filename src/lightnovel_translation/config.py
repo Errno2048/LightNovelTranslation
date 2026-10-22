@@ -138,7 +138,7 @@ class TranslationConfig:
         allowed = {f.name for f in fields(SequenceSpec)} - controlled
         values = _known(self.sequence, allowed, "sequence")
         # Source-bound records avoid silently accepting merged/missing paragraphs.
-        values = {"output_profile": "source-records-v1",
+        values = {"output_profile": "source-records",
                   "parent_max_chapters": self.index.parent_max_chapters,
                   "child_max_chapters": self.index.child_max_chapters,
                   "index_layout": self.index.layout,

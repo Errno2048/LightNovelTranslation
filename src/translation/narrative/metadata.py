@@ -13,7 +13,7 @@ def merge_book_metadata(view, summary_ids, *, description_reviews=(), persist=Tr
         artifact = view.store.get(sid, "summary")
         artifact = view.read_summary(sid, artifact["chapter_ids"])
         artifacts[sid] = artifact
-        if artifact.get("schema_version") != "bilingual-block-v2":
+        if artifact.get("schema_version") != "bilingual-block":
             raise NarrativeError("coverage_gap", "v1 summary has no bilingual metadata")
         index.append({"summary_id": sid, "chapter_ids": artifact["chapter_ids"]})
         meta = artifact["content"]["translation_metadata"]

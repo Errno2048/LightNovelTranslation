@@ -15,7 +15,7 @@ from . import classify, extract_paragraphs, load_chapters, normal_title
 from .linovelib import PROFILE, SCRIPT_SHA256, page_info, replace_pua, restore_order
 from ..storage import atomic_text, digest, file_digest, read_json, read_jsonl, write_json, write_jsonl
 
-AUDIT_VERSION = "reference-order-audit-v2"
+AUDIT_VERSION = "reference-order-audit"
 
 
 def _page_address(book: int, chapter: int, page: int) -> str:
