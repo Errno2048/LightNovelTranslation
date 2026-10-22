@@ -78,7 +78,7 @@
 - `batch_translation_block_level` 必须小于等于已配置的最高层级；默认 1。
 - `num_lookahead_batches` 只允许 `-1` 或非负整数；`-1` 表示不按审校进度阻塞，但仍受资源上限约束。
 - 当前阶段每个层的 `max_levelN_children` 与 `context_num_blocks[level-1]` 可由 agent 在创建任务前决定，并记录在冻结快照中。
-- `not_created` 惰性边界只用于参考索引；目标分支已 accepted 的章节必须保持完整索引。
+- `not_created` 惰性边界只用于参考索引；目标分支已 accepted 的章节必须保持完整索引（设计目标；当前 `TranslationRunner` 尚未自动物化目标 level-1 块，见 §21）。
 - direct-first 只在真实 context 越界时触发 fallback；不再单设 0.75 阈值，由 `token_estimate_factor` 吸收保守性。
 
 ## 4. 核心数据模型

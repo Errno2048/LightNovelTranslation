@@ -83,9 +83,10 @@ print(len(chapters), chapters[0].to_dict(), chapters[-1].to_dict())
  "mapping": {"187": 198}}
 ```
 
-- `zh` 是中文主線列表中的 **0 基下标**（不是 `edition_order`）。
+- `zh` 是中文主線列表中的 **0 基下标**（不是 `edition_order`）；构造 `reference_texts` 时通过 `zh_main[pair["zh"]]["order"]` 取实际 order。
 - `ja` 是日文 `edition_order`。
 - 允许一个 `ja` 对应多个 `zh`（拆章）。
+- 方向必须是 `{日文 edition_order: 中文正文}`；反过来会取错历史参考。
 - 模型可能把编号错配；必须用已知标题锚点复核。模型不可用时使用人工锚点插值，不要用简单标题相似度直接按顺序对齐（本次实测会产生十几章的偏移）。
 
 ### 1.4 参考摘要、术语与上下文预算
@@ -148,7 +149,7 @@ runner.run_concurrent(start=continuation, end=main_end)
 | `translation_tokens` / `review_tokens` / `adjudication_tokens` | 各阶段输出预算 |
 | `summary_tokens` / `glossary_tokens` | 摘要 / 术语抽取输出预算 |
 
-旧 `[sequence]` 仅用于兼容：没有 `[workflow]` 时，`translation_concurrency`、`review_concurrency` 会从旧值迁移；其他旧字段（包括 `max_revisions`）不再驱动新 runner，使用 workflow 默认值。`max_requests` / `max_input_tokens` / `max_output_tokens` 也不会被新 runner 强制执行；每次模型调用写入 `events` 的 `model` 记录。不要把旧 limits 当成费用护栏。配置模板见 [config.example.toml](../assets/config.example.toml)。
+旧 `[sequence]` 仅用于兼容：没有 `[workflow]` 时，`translation_concurrency`、`review_concurrency` 会从旧值迁移；其他旧字段（包括 `max_revisions`）不再驱动新 runner，使用 workflow 默认值。`[limits]` 的 `max_attempts` 控制传输/截断重试；总请求/token 上限在批次边界检查（批次内可能短暂超出）。每次模型尝试（成功或失败）都写入 `events` 的 `model` 记录。配置模板见 [config.example.toml](../assets/config.example.toml)。
 
 ### 2.3 输出预算与截断
 
@@ -158,6 +159,7 @@ runner.run_concurrent(start=continuation, end=main_end)
   - 摘要：减小 `reference_chunk`；
   - 翻译：单章过长时不要静默截断，标记 blocked 并交接（见第 8 节）。
 - 32k 审校预算在长章 + 推理模型上可能截断；本次使用 65,536。
+- `_generate` 只自动重试状态明确的失败：`truncated`（加预算）、`empty`/`finish_reason`、`rate_limit`（429）。`timeout`、`network`、`server`/502/524 的远端完成状态未知，不会自动重发；先查事件/产物再决定是否新建请求。重试次数由 `[limits] max_attempts` 控制。
 - 端点有约 100 秒 Cloudflare 上限时，过大的 prompt 会 524；减小上下文或改用不受该限制的端点。不要用简单重试掩盖容量问题。
 
 ## 3. 状态、进度与成本
@@ -185,10 +187,10 @@ ORDER BY event_id DESC LIMIT 20;
 | `translate` / `accept` / `blocked` / `revise` | 章节生命周期 |
 | `summary_chunk` / `summary` | 参考/目标摘要进度 |
 | `glossary_chunk` / `glossary_complete` / `glossary_failed` | 术语抽取 |
-| `quality_fix` / `quality_fix_blocked` | 事后质量修补 |
+| `quality_fix` / `quality_fix_blocked` | 由外部质量修补脚本/agent 写入，不是 `TranslationRunner` 自动发出 |
 | `manual_fix` | 人工精确修补 |
 
-`events.payload` 是 JSON。模型 `usage` 中 `prompt_tokens`/`completion_tokens`/`reasoning_tokens` 可用于成本分析。审校通常是最大开销：本次 4 章窗口约 7 分钟审校/修订，翻译只占其中约 3–5 分钟。
+`events.payload` 是 JSON。`model` 记录包含 `success`、`attempt`、`task`、`usage`、`elapsed`；失败尝试也保留。模型 `usage` 中 `prompt_tokens`/`completion_tokens`/`reasoning_tokens` 可用于成本分析。审校通常是最大开销：本次 4 章窗口约 7 分钟审校/修订，翻译只占其中约 3–5 分钟。
 
 轮询时不要重建整个 `TranslationProject`；SQLite WAL 允许只读查询。不要删除 `-wal`/`-shm` 文件，也不要并发启动两个写 runner。
 

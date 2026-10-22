@@ -26,19 +26,6 @@ max_output_tokens = 131072
 token_inflation_factor = 1.05
 safety_tokens = 2048
 
-[roles.translator]
-requested_output_tokens = 65536
-[roles.reviewer]
-requested_output_tokens = 65536
-[roles.adjudicator]
-requested_output_tokens = 32768
-[roles.indexer]
-requested_output_tokens = 32768
-[roles.compressor]
-requested_output_tokens = 16384
-[roles.revision]
-requested_output_tokens = 65536
-
 [workflow]
 # Batch-source translation: chapters in a batch do not depend on each other's
 # translations. A batch-wide glossary keeps names consistent.

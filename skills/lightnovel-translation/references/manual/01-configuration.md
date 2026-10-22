@@ -2,6 +2,8 @@
 
 [返回目录](index.md) · 下一步：[输入标准化](02-ingestion.md)
 
+> 新工作流（main）使用 `[workflow]` 配置批次并发、上下文窗口和输出预算；本页的 `[roles.*]` / `[sequence]` 说明属于 legacy 引擎，仅供参考或在 `legacy-sequence` 分支使用。
+
 ## 配置如何加载
 
 `TranslationProject(workspace)` 使用默认私有配置；默认文件不存在时允许本地导入、检查与规划，模型操作才要求配置就绪。`TranslationProject(workspace, config="path.toml")` 使用指定 TOML/JSON；显式 `config=TranslationConfig()` 跳过用户文件，适合离线操作。公共入口只加载指定格式的配置，不执行 Python 配置文件。

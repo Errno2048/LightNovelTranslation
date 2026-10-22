@@ -56,10 +56,10 @@ print([(b.level, b.start, b.end, b.estimated_tokens, b.oversized)
        for b in plan.by_level(2)])
 ```
 
-- 只规划 `not_created` 边界，不立即调用模型。
-- 目标分支 accepted 章节需要完整索引；参考分支低层块默认懒创建。
+- 只规划 `not_created` 边界，不立即调用模型；估算使用 1.15 系数。
+- 参考分支低层块默认懒创建。当前 `TranslationRunner` 的 accepted 快照只包含章节和已生成的 level-2 摘要，**不会自动物化目标 level-1 块**；不要把规划能力当成已接入的自动闭环。
 - 未配置的高层（例如 level 3）禁止创建。
-- direct 摘要只在真实 context 越界时拆段/rollup；估算使用 1.15 系数。
+- `summarize_reference` 是一次性直出辅助，**不做容量预检/自动拆段/rollup**；长参考请用 `runner.ensure_reference_summary()` 按 `reference_chunk` 分块。
 
 ### 3. 直出所需高层摘要
 
@@ -110,10 +110,15 @@ print(result.text[:1000])
 from translation.index import (TranslationRunner, TranslationStore,
                                build_epub, collect_epub_chapters)
 
+# {Web edition_order: official Chinese prose}
+# Build this from the verified alignment; never reverse the direction or pass
+# a directory object. Split Chinese chapters are concatenated with "\n\n".
+reference_texts = {ja_order: chinese_text, ...}
+
 with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner = TranslationRunner(
         project, flow, store, continuation_start=199, main_end=260,
-        reference_texts=reference_by_source_order)
+        reference_texts=reference_texts)
     runner.ensure_reference_summary()
     runner.ensure_glossary()
     runner.run_concurrent(start=199, end=260)
@@ -133,5 +138,5 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
 - 不删除错误标记、伪造指纹、添加空译文、重复段落或凭剧情补齐缺页来通过验证。
 - 参考译文只用于译名、实体、事件和文风候选；冲突以日文为准。
 - LLM 摘要/实体不是权威事实；partial、未决和抽取缺口必须保留。
-- 请求、token 和尝试上限保留持久记账；同一付费响应应复用，未知远端完成状态不可直接重发。
-- 指标和参考摘要可能产生费用；记录 direct/fallback/split/estimate 偏差和每批 token 构成。
+- 每次模型尝试（含失败）写入 `events`；`limits.max_attempts` 控制传输/截断重试。总请求/token 上限在批次边界检查，批次内可能短暂超出。timeout/524 等未知远端完成状态不自动重发。
+- 指标和参考摘要可能产生费用；`IndexMetrics` 需要调用方手动记录，runner 不会自动写入 direct/fallback/split/estimate 指标。

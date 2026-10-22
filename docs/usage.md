@@ -27,7 +27,7 @@ python -m lightnovel_translation config check
 
 默认配置为 `~/.lightnovel_translation/config.toml`；可用 `LIGHTNOVEL_TRANSLATION_HOME` 指定私有目录。模板见 [config.example.toml](../skills/lightnovel-translation/assets/config.example.toml)。
 
-用户在本地填写 `[model]` 的 `model`、`base_url`、`api_key`，以及实际 `[capacity]` 和角色输出预算。Agent 不读取、打印、复制或上传凭据文件；`config check` 只返回路径、就绪状态和缺失字段名。
+用户在本地填写 `[model]` 的 `model`、`base_url`、`api_key`，以及实际 `[capacity]` 和 `[workflow]` 输出预算。Agent 不读取、打印、复制或上传凭据文件；`config check` 只返回路径、就绪状态和缺失字段名。
 
 新工作流的批次大小、并发数、上下文窗口、摘要节奏和各阶段输出预算在 `[workflow]` 节；模板已给出新默认值。旧的 `[sequence]` 节只在没有 `[workflow]` 时提供兼容迁移（`translation_concurrency`、`review_concurrency`），其余参数使用新的 workflow 默认值。
 
@@ -64,8 +64,8 @@ print([(b.start, b.end, b.estimated_tokens, b.oversized)
 
 - level 1 = 章节组块，level 2 = 父块；未配置的高层禁止创建。
 - 参考分支先只规划 `not_created` 边界，不立即物化。
-- 目标分支已接受章节需要完整索引。
-- 估算使用 1.15 系数和 direct/rollup 两套公式；超限时按章节边界拆分。
+- 当前 `TranslationRunner` 的 accepted 快照只包含章节和已生成的 level-2 摘要，不会自动物化目标 level-1 块；规划 API 与自动闭环要分开理解。
+- 估算使用 1.15 系数和 direct/rollup 两套公式；`oversized` 只是规划标记。当前摘要流程不会自动 split/rollup，长参考请用 `runner.ensure_reference_summary()` 分块。
 
 ### 2. 直出高层摘要并构建快照
 
@@ -124,15 +124,16 @@ print(result.text[:1000])
 from translation.index import (TranslationRunner, TranslationStore,
                                build_epub, collect_epub_chapters)
 
+# {Web edition_order: 官方中文正文}; split Chinese chapters are concatenated.
+reference_texts = {ja_order: chinese_text, ...}
+
 with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner = TranslationRunner(
         project, flow, store, continuation_start=199, main_end=260,
-        reference_texts=reference_by_source_order,
-        )
+        reference_texts=reference_texts)
     runner.ensure_reference_summary()   # 官方参考的滚动摘要
     runner.ensure_glossary()            # 日中双语对照术语
-    for order in range(199, 260):
-        runner.run_order(order)         # accepted 章节自动跳过
+    runner.run_concurrent(start=199, end=260)
     runner.update_target_summary(force=True)
     chapters = collect_epub_chapters(
         runner=runner, reference_chapters=official_chapters, end=260)
@@ -192,7 +193,7 @@ metrics.record("direct_attempt", level=2)
 metrics.dump("work/my-novel/metrics.jsonl")
 ```
 
-建议记录 direct 尝试/成功/失败、rollup、split、estimate/actual 偏差、lazy planned/created 数量、指针推进和每批 token 构成。
+`IndexMetrics` 需要调用方手动记录；`TranslationRunner` 不会自动写入 direct/fallback/split/estimate 指标。建议另行记录 lazy planned/created 数量、指针推进和每批 token 构成。
 
 ## 旧版本
 

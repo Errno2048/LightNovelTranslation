@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+import json
 import re
 import threading
 
-from lightnovel_translation import GenerationResult, TranslationConfig, TranslationProject
+import pytest
+
+from lightnovel_translation import (GenerationResult, Limits, TranslationConfig,
+                                    TranslationProject, WorkflowConfig)
 from translation.index import (TranslationRunner, TranslationWorkflow, LevelConfig,
                                TranslationStore, build_epub, verify_epub)
+from translation.providers import ProviderError
 
 
 class ScriptedProvider:
@@ -88,6 +94,8 @@ def test_runner_accepts_a_clean_review(tmp_path: Path):
             assert runner.translation_tokens == project.config.workflow.translation_tokens
             assert runner.review_tokens == project.config.workflow.review_tokens
             assert runner.adjudication_tokens == project.config.workflow.adjudication_tokens
+            assert runner.summary_tokens == project.config.workflow.summary_tokens
+            assert runner.glossary_tokens == project.config.workflow.glossary_tokens
             result = runner.run_order(1)
             assert result["status"] == "accepted"
             assert store.translations()[1] == "诺亚回到了村子。\n\n众人听他讲述旅途。"
@@ -232,3 +240,89 @@ def test_collect_epub_skips_extra_and_missing_orders(tmp_path: Path):
             chapters = collect_epub_chapters(
                 runner=runner, reference_chapters=[], end=4)
             assert [row["order"] for row in chapters] == [0, 2, 3]
+
+
+class FailingProvider:
+    def __init__(self, failures):
+        self.failures = list(failures)
+        self.calls = 0
+
+    def generate(self, request):
+        self.calls += 1
+        failure = self.failures.pop(0) if self.failures else None
+        if failure is not None:
+            raise failure
+        return GenerationResult("OK", "stop", "fake", str(self.calls),
+                                {"prompt_tokens": 10, "completion_tokens": 5}, 0)
+
+
+def _failure_runner(tmp_path: Path, provider, *, max_attempts=3):
+    config = TranslationConfig(
+        limits=Limits(max_attempts=max_attempts),
+        workflow=WorkflowConfig(summary_tokens=2048, glossary_tokens=1024))
+    project = SimpleNamespace(config=config, provider=provider)
+    flow = SimpleNamespace(_source_docs=[],
+                           _reference_by_source_order={},
+                           full_chapters=5)
+    store = TranslationStore(tmp_path / "translation.sqlite")
+    runner = TranslationRunner(project, flow, store,
+                               continuation_start=0, main_end=0)
+    return runner, store
+
+
+def test_timeout_is_not_retried(tmp_path: Path):
+    provider = FailingProvider([ProviderError("timeout", retryable=True)])
+    runner, store = _failure_runner(tmp_path, provider)
+    with pytest.raises(ProviderError):
+        runner._generate([{"role": "user", "content": "x"}], 64, "probe")
+    assert provider.calls == 1
+    events = [json.loads(row[0]) for row in store.db.execute(
+        "SELECT payload FROM events WHERE kind='model'")]
+    assert len(events) == 1 and events[0]["success"] is False
+    assert events[0]["error"] == "timeout"
+    store.close()
+
+
+def test_server_error_is_not_retried(tmp_path: Path):
+    provider = FailingProvider([ProviderError("server", "HTTP 502", retryable=True)])
+    runner, store = _failure_runner(tmp_path, provider)
+    with pytest.raises(ProviderError):
+        runner._generate([{"role": "user", "content": "x"}], 64, "probe")
+    assert provider.calls == 1
+    store.close()
+
+
+def test_rate_limit_retries_with_configured_attempts(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("translation.index.pipeline.time.sleep", lambda _: None)
+    provider = FailingProvider([ProviderError("rate_limit", retryable=True)])
+    runner, store = _failure_runner(tmp_path, provider, max_attempts=2)
+    result = runner._generate([{"role": "user", "content": "x"}], 64, "probe")
+    assert result.text == "OK" and provider.calls == 2
+    events = [json.loads(row[0]) for row in store.db.execute(
+        "SELECT payload FROM events WHERE kind='model'")]
+    assert [event["success"] for event in events] == [False, True]
+    store.close()
+
+
+def test_workflow_budgets_are_config_driven(tmp_path: Path):
+    provider = FailingProvider([])
+    runner, store = _failure_runner(tmp_path, provider)
+    assert runner.summary_tokens == 2048
+    assert runner.glossary_tokens == 1024
+    store.close()
+
+
+def test_persistent_request_limit_is_checked(tmp_path: Path):
+    from translation.index import PipelineError
+    config = TranslationConfig(limits=Limits(max_requests=1))
+    project = SimpleNamespace(config=config, provider=FailingProvider([]))
+    flow = SimpleNamespace(_source_docs=[], _reference_by_source_order={},
+                           full_chapters=5)
+    with TranslationStore(tmp_path / "translation.sqlite") as store:
+        runner = TranslationRunner(project, flow, store,
+                                   continuation_start=0, main_end=0)
+        store.event("model", task="probe", success=True,
+                    usage={"prompt_tokens": 10, "completion_tokens": 5})
+        with pytest.raises(PipelineError) as caught:
+            runner._check_limits()
+        assert caught.value.code == "budget"

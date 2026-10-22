@@ -77,9 +77,11 @@ def main():
     assert not Path(inspected["engine"]).resolve().is_relative_to(root)
     assert inspected["version"] == "0.4.0" and inspected["typed"] and inspected['reference_config']
     demo = json.loads(call("demo", [str(python), "-I", str(external / "demo.py"), str(external / "run")]))
-    assert demo["first"]["state"] == "paused_at_limit"
-    assert demo["final"]["state"] == "complete" and demo["final"]["committed_count"] == 5
-    assert demo["checkpoint"]
+    assert demo["planned_blocks"] > 0
+    assert demo["fits"] is True
+    assert demo["requests"] == 2
+    assert demo["text"] == "诺亚回到了村子。\n众人听他讲述旅途。"
+    assert demo["context_segments"][0][0] == "summary"
     cli = environment / ("Scripts/novel-translate.exe" if os.name == "nt" else "bin/novel-translate")
     help_text = call("cli", [str(cli), "--help"])
     assert "import" in help_text

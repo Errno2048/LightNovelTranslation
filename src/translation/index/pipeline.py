@@ -168,6 +168,18 @@ class TranslationStore:
                               (order,)).fetchone()
         return dict(row) if row else None
 
+    def model_totals(self) -> dict:
+        """Persistent model-attempt totals used for optional workflow limits."""
+        requests = prompt = completion = 0
+        for (payload,) in self.db.execute(
+                "SELECT payload FROM events WHERE kind='model'"):
+            requests += 1
+            usage = json.loads(payload).get("usage") or {}
+            prompt += usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+            completion += usage.get("completion_tokens") or usage.get("output_tokens") or 0
+        return {"requests": requests, "input_tokens": prompt,
+                "output_tokens": completion}
+
     def put_draft(self, *, order: int, source_id: str, source_hash: str,
                   ja_title: str, title_zh: str, text: str,
                   status: str = "draft", review: Mapping | None = None) -> int:
@@ -272,6 +284,8 @@ class TranslationRunner:
                  translation_tokens: int | None = None,
                  review_tokens: int | None = None,
                  adjudication_tokens: int | None = None,
+                 summary_tokens: int | None = None,
+                 glossary_tokens: int | None = None,
                  reference_chunk: int | None = None):
         self.project = project
         self.flow = flow
@@ -294,6 +308,10 @@ class TranslationRunner:
                               if review_tokens is None else review_tokens)
         self.adjudication_tokens = (workflow.adjudication_tokens
                                     if adjudication_tokens is None else adjudication_tokens)
+        self.summary_tokens = (workflow.summary_tokens
+                               if summary_tokens is None else summary_tokens)
+        self.glossary_tokens = (workflow.glossary_tokens
+                                if glossary_tokens is None else glossary_tokens)
         self.reference_chunk = (workflow.reference_chunk
                                 if reference_chunk is None else reference_chunk)
         self.source_by_order = {doc["edition_order"]: doc
@@ -314,6 +332,26 @@ class TranslationRunner:
 
     def source_rows(self, order: int) -> list[dict]:
         return list(self.source(order).get("rows") or [])
+
+    def _check_limits(self):
+        limits = self.project.config.limits
+        if not (limits.max_requests or limits.max_input_tokens or limits.max_output_tokens):
+            return
+        totals = self.store.model_totals()
+        reasons = []
+        if limits.max_requests and totals["requests"] >= limits.max_requests:
+            reasons.append("max_requests")
+        if limits.max_input_tokens and totals["input_tokens"] >= limits.max_input_tokens:
+            reasons.append("max_input_tokens")
+        if limits.max_output_tokens and totals["output_tokens"] >= limits.max_output_tokens:
+            reasons.append("max_output_tokens")
+        if reasons:
+            raise PipelineError(
+                "budget", "persistent model limits reached",
+                details={"limits": {"max_requests": limits.max_requests,
+                                    "max_input_tokens": limits.max_input_tokens,
+                                    "max_output_tokens": limits.max_output_tokens},
+                         "totals": totals, "reasons": reasons})
 
     def documents(self, end: int,
                   provisional: Mapping[int, str] | None = None) -> dict[int, ContextDocument]:
@@ -437,15 +475,19 @@ class TranslationRunner:
 
     # -- model calls --------------------------------------------------------
     def _generate(self, messages: list[dict], max_tokens: int, task: str,
-                  *, attempts: int = 4, log_event: bool = True,
+                  *, attempts: int | None = None, log_event: bool = True,
                   usage_sink: list | None = None):
+        if attempts is None:
+            attempts = self.project.config.limits.max_attempts
         request = GenerationRequest(messages, max_tokens=max_tokens,
                                     temperature=0, task=task)
         last = None
         for attempt in range(attempts):
+            started = time.monotonic()
             try:
                 result = self.project.provider.generate(request)
-                record = {"task": task, "usage": result.usage,
+                record = {"task": task, "success": True, "attempt": attempt + 1,
+                          "usage": result.usage,
                           "elapsed": result.elapsed_seconds,
                           "request_id": result.request_id,
                           "max_tokens": request.max_tokens}
@@ -456,6 +498,20 @@ class TranslationRunner:
                 return result
             except ProviderError as exc:
                 last = exc
+                details = exc.details if isinstance(exc.details, dict) else {}
+                record = {"task": task, "success": False, "attempt": attempt + 1,
+                          "error": exc.kind, "elapsed": round(time.monotonic() - started, 3),
+                          "request_id": details.get("request_id"),
+                          "max_tokens": request.max_tokens,
+                          "usage": details.get("usage") if isinstance(details.get("usage"), dict) else None}
+                if log_event:
+                    self.store.event("model", **record)
+                if usage_sink is not None:
+                    usage_sink.append(record)
+                # Only retry failures whose remote completion state is known and
+                # non-billable (or a completed truncated/empty response). Timeout,
+                # network and gateway 5xx/524 states are ambiguous and are not
+                # silently resent.
                 if exc.kind == "truncated" and attempt + 1 < attempts:
                     capacity = self.project.config.capacity.max_output_tokens
                     if request.max_tokens < capacity:
@@ -467,7 +523,7 @@ class TranslationRunner:
                 if exc.kind in {"empty", "finish_reason"} and attempt + 1 < attempts:
                     time.sleep(1 + attempt)
                     continue
-                if exc.retryable and attempt + 1 < attempts:
+                if exc.kind == "rate_limit" and attempt + 1 < attempts:
                     time.sleep(min(2 ** attempt, 20))
                     continue
                 raise
@@ -857,6 +913,7 @@ class TranslationRunner:
         current = self.store.chapter(order)
         if current and current["status"] == "accepted":
             return {"order": order, "status": "accepted", "reused": True}
+        self._check_limits()
         if current and current["status"] == "blocked":
             self.store.set_status(order, "draft")
         draft = self.translate_order(order)
@@ -931,8 +988,21 @@ class TranslationRunner:
 
     def _process_draft(self, draft: DraftChapter, *, history, glossary,
                        unresolved_prior, max_revisions: int) -> dict:
-        """Pure worker: model calls only, no SQLite or mutable runner state."""
         usages = []
+        try:
+            return self._process_draft_inner(
+                draft, history=history, glossary=glossary,
+                unresolved_prior=unresolved_prior,
+                max_revisions=max_revisions, usages=usages)
+        except Exception as exc:
+            return {"status": "error", "draft": draft, "review": None,
+                    "decisions": {}, "rounds": 0, "usages": usages,
+                    "message": str(exc)}
+
+    def _process_draft_inner(self, draft: DraftChapter, *, history, glossary,
+                             unresolved_prior, max_revisions: int,
+                             usages: list) -> dict:
+        """Pure worker: model calls only, no SQLite or mutable runner state."""
         review = self._review_draft(
             draft, history=history, glossary=glossary,
             unresolved_prior=unresolved_prior, log_event=False,
@@ -1020,6 +1090,7 @@ class TranslationRunner:
         with ThreadPoolExecutor(max_workers=max(1, translation_concurrency)) as trans_pool, \
                 ThreadPoolExecutor(max_workers=max(1, review_concurrency)) as review_pool:
             while index < len(orders):
+                self._check_limits()
                 batch = orders[index:index + batch_size]
                 documents = self.documents(max(batch) + 1)
                 snapshot = self.snapshot(batch[0], documents)
@@ -1169,6 +1240,7 @@ class TranslationRunner:
             pairs.append(f"### {row['ja_title']}\n{source['text']}\n---\n{row['text']}")
         if not pairs:
             return None
+        self._check_limits()
         prompt = (
             "你是轻小说资料整理员。下面是此前累计摘要（仅用于保持连续性）和新增章节的"
             "日文原文与已审中文译文。请输出新增部分的中文摘要，覆盖人物、地点、事件、"
@@ -1177,7 +1249,7 @@ class TranslationRunner:
         result = self._generate([
             {"role": "system", "content": "你是严谨的轻小说资料整理员，只输出中文摘要。"},
             {"role": "user", "content": prompt},
-        ], 16384, f"target_summary_{start}_{stop}")
+        ], self.summary_tokens, f"target_summary_{start}_{stop}")
         self.store.put_summary("target", start, stop, result.text)
         self._last_summary_end = stop
         self.store.event("summary", kind_detail="target", start=start, end=stop)
@@ -1197,6 +1269,7 @@ class TranslationRunner:
                 previous, cursor = latest["text"], latest["end_order"]
         chunks = list(range(cursor, self.continuation_start, self.reference_chunk))
         for start in chunks:
+            self._check_limits()
             stop = min(start + self.reference_chunk, self.continuation_start)
             blocks = []
             for order in range(start, stop):
@@ -1215,7 +1288,7 @@ class TranslationRunner:
             result = self._generate([
                 {"role": "system", "content": "你是严谨的轻小说资料整理员，只输出中文摘要。"},
                 {"role": "user", "content": prompt},
-            ], 16384, f"reference_summary_{start}_{stop}")
+            ], self.summary_tokens, f"reference_summary_{start}_{stop}")
             previous = result.text
             self.store.put_summary("reference-progress", 0, stop, previous)
             self.store.event("summary_chunk", start=start, end=stop,
@@ -1241,6 +1314,7 @@ class TranslationRunner:
         expected = {(start, min(start + chunk, self.continuation_start))
                     for start in range(0, self.continuation_start, chunk)}
         for start in range(0, self.continuation_start, chunk):
+            self._check_limits()
             stop = min(start + chunk, self.continuation_start)
             if (start, stop) in done:
                 continue
@@ -1265,7 +1339,7 @@ class TranslationRunner:
                 result = self._generate([
                     {"role": "system", "content": "你是严谨的日中对照术语整理员。"},
                     {"role": "user", "content": prompt},
-                ], 16384, f"glossary_{start}_{stop}")
+                ], self.glossary_tokens, f"glossary_{start}_{stop}")
                 rows = _parse_json_array(result.text)
                 self.store.put_glossary(rows)
                 self.store.event("glossary_chunk", start=start, end=stop,
@@ -1296,6 +1370,7 @@ class TranslationRunner:
             f"### {self.source(order)['raw_title']}\n{self.source(order)['text']}"
             for order in orders)
         existing = self.store.glossary(limit=300)
+        self._check_limits()
         rows = []
         prompt = (
             "下面是本批次相邻章节的日文原文和已有术语表。请补充本批次出现的专有名词："
@@ -1311,7 +1386,7 @@ class TranslationRunner:
             result = self._generate([
                 {"role": "system", "content": "你是严谨的日中轻小说术语整理员。"},
                 {"role": "user", "content": prompt},
-            ], 16384, f"batch_glossary_{orders[0]}_{orders[-1]}")
+            ], self.glossary_tokens, f"batch_glossary_{orders[0]}_{orders[-1]}")
             rows = _parse_json_array(result.text)
             self.store.put_glossary(rows)
             self.store.event("batch_glossary", start=orders[0], end=orders[-1] + 1,

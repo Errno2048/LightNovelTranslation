@@ -18,7 +18,7 @@ main 分支只保留新的分层索引能力。旧的 `create_job` / `job.run` /
 | `TaskStore` / `fair_select` | 持久化 DAG、阶段配额、单调指针/outbox |
 | `IndexMetrics` | direct/fallback/split/estimate 偏差等 debug 指标 |
 
-**目标分支**的 accepted 章节需要完整索引；**参考分支**才使用 `not_created` 惰性边界。参考译文只作术语/风格候选，日文是事实来源。
+**目标分支**的 accepted 章节需要完整索引；**参考分支**才使用 `not_created` 惰性边界。参考译文只作术语/风格候选，日文是事实来源。当前 `TranslationRunner` 的 accepted 快照只包含 level-0 章节和已生成的 level-2 摘要，尚未自动物化目标 level-1 块；不要把规划 API 当成已接入的自动闭环。
 
 ## 2. 导入与配置
 
@@ -67,7 +67,7 @@ snapshot = flow.make_snapshot(
 
 建议：
 
-- 先尝试 direct level-2；只有真实 context 越界才拆成两段/rollup。
+- `summarize_reference` 是一次性直出辅助，不做容量预检、自动拆段或 rollup；长参考请用 `TranslationRunner.ensure_reference_summary()` 按 `reference_chunk` 分块。
 - 高层摘要成功后可缓存；参考低层块保持 `not_created`。
 - 如果上下文真正需要低层块，按设计先创建该高层父块的全部低层子块，再 rollup；不要只创建所需子集而留下覆盖缺口。
 - 只有高层摘要、没有 level-1 块时，最新摘要可能覆盖到近期全文窗口；ContextPlan 允许这种有限重叠，以避免摘要与全文之间出现空洞。重复是有意的安全余量。
@@ -156,7 +156,7 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner = TranslationRunner(
         project, flow, store,
         continuation_start=199, main_end=260,
-        reference_texts=reference_by_source_order,   # 官方参考 -> Web 话序
+        reference_texts=reference_texts,   # {Web edition_order: 官方中文正文}
         )
     runner.ensure_reference_summary()
     runner.ensure_glossary()

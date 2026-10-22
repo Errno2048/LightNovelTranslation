@@ -14,10 +14,10 @@ Python 代码采用 [Python Packaging User Guide 的 src layout](https://packagi
 
 1. `python -m pip install -e ".[dev,narrative,syosetu]"` 后运行 `python -m pytest -q`。
 2. `python -m build` 默认先构建 sdist，再从 sdist 构建 wheel，验证源分发不依赖仓库外文件。
-3. 用 `scripts/verify_distribution.py --wheel <wheel> --output <仓库外临时目录>` 验证技能资源完整性、隔离安装与离线五章翻译恢复。该脚本不访问模型、不读取用户凭据；安装依赖需要包索引网络或本机缓存。
+3. 用 `scripts/verify_distribution.py --wheel <wheel> --output <仓库外临时目录>` 验证技能资源完整性、隔离安装与离线翻译示例。该脚本不访问模型、不读取用户凭据；安装依赖需要包索引网络或本机缓存。
 
 工作区、小说、请求日志、旧构建和临时模型验证脚本保存在仓库外。临时目录应传给示例和验证命令；`.venv`、构建目录及测试缓存可在本地重建，均受 Git 忽略规则约束。
 
 旧版 `sequence` 引擎的历史设计、索引修复和实体目录文档（`sequence-index-repair-plan.md`、`token-index-entity-catalog-design.md`）仅作 legacy 参考；它们对应的实现位于 `legacy-sequence` 分支。
 
-main 的当前自动化边界：新索引、lazy 参考规划、ContextPlan、TaskStore/指针和实际翻译已实现；章节审校/裁决/提交/导出尚未接入新闭环，需要手动接管或在 `legacy-sequence` 分支运行旧管线。公开行为变更同时维护 README、使用说明和新架构技能文档。
+main 的当前自动化边界：新索引、lazy 参考规划、ContextPlan、TaskStore/指针、批次并发翻译、章节审校/裁决/修订/accepted 提交、滚动摘要和 EPUB 导出已实现（`translation.index.pipeline`）。仍需人工判断：跨版本目录锚点、实体/线程目录、单章超长拆分、blocked 章节的局部修复。旧完整管线在 `legacy-sequence` 分支。公开行为变更同时维护 README、使用说明和新架构技能文档。
