@@ -150,6 +150,20 @@ class TranslationConfig:
                   "core_entity_limit": self.index.core_entity_limit,
                   "child_min_content_tokens": self.index.child_min_content_tokens,
                   **values}
+        # Accept profile names written by earlier releases while keeping the
+        # current workflow vocabulary canonical.
+        aliases = {
+            "output_profile": {"plain-v1": "plain",
+                               "source-records-v1": "source-records"},
+            "review_profile": {"audit-v5": "chapter-review",
+                               "audit-v6": "chapter-review"},
+            "reference_profile": {"legacy": "plain", "stable-v1": "stable"},
+            "mapping_profile": {"audit-v2": "coarse", "coarse-v1": "coarse"},
+            "index_layout": {"legacy-v1": "plain", "token-v2": "token"},
+        }
+        for key, mapping in aliases.items():
+            if key in values:
+                values[key] = mapping.get(values[key], values[key])
         try:
             return SequenceSpec(self.capacity, roles=self.role_budgets(), **asdict(self.limits), **values)
         except (TypeError, ValueError) as exc:
