@@ -191,10 +191,30 @@ def _select_level(snapshot, documents, level, boundary, remaining_budget,
     return selected, new_boundary, warnings
 
 
-def build_context_plan(snapshot: IndexSnapshot, documents: Mapping[str, ContextDocument],
-                       target_id: str, batch_ids: Sequence[str], *,
-                       estimator: TokenEstimator, max_tokens: int,
-                       full_chapters: int = 5) -> ContextPlan:
+@dataclass(frozen=True)
+class NearContext:
+    """Per-target text that must stay adjacent to the request's tail.
+
+    ``near_tokens`` feeds the history budget. Batch callers pass the largest
+    value in the batch as ``selection_reserve_tokens`` so every request selects
+    the same history blocks; otherwise the summary prefix changes with the
+    target and no batch request can reuse another's cached prefix.
+    """
+    batch_start: int
+    full_start: int
+    full_docs: tuple[ContextDocument, ...]
+    full_texts: tuple[str, ...]
+    prefix_docs: tuple[ContextDocument, ...]
+    prefix_text: str
+    target_text: str
+    near_tokens: int
+    warnings: tuple[str, ...]
+
+
+def near_context(snapshot: IndexSnapshot, documents: Mapping[str, ContextDocument],
+                 target_id: str, batch_ids: Sequence[str], *,
+                 estimator: TokenEstimator,
+                 full_chapters: int = 5) -> NearContext:
     if target_id not in documents:
         raise ValueError("target is not present in documents")
     if not batch_ids or target_id not in batch_ids:
@@ -210,21 +230,59 @@ def build_context_plan(snapshot: IndexSnapshot, documents: Mapping[str, ContextD
                                           max(1, full_chapters))
     full_start, warnings = _align_full_start(snapshot, documents, align,
                                              batch_start, warnings)
-    full_docs = [doc for doc in sorted(documents.values(), key=lambda item: item.order)
-                 if full_start <= doc.order < batch_start and
-                 doc.source_id in accepted and doc.translation_text]
+    full_docs = tuple(doc for doc in sorted(documents.values(), key=lambda item: item.order)
+                      if full_start <= doc.order < batch_start and
+                      doc.source_id in accepted and doc.translation_text)
 
     def full_text(doc):
         label = "未审草稿" if doc.provisional else "已译章节"
         return f"【{label} {doc.title}】\n{doc.source_text}\n---\n{doc.translation_text}"
 
     near_texts = [full_text(doc) for doc in full_docs]
-    prefix_docs = [doc for doc in batch_docs if doc.order < target.order]
+    prefix_docs = tuple(doc for doc in batch_docs if doc.order < target.order)
     prefix_text = "\n\n".join(f"【{doc.title}】\n{doc.source_text}" for doc in prefix_docs)
     target_text = f"【{target.title}】\n{target.source_text}"
     near_tokens = (sum(estimator.count(text) for text in near_texts) +
                    (estimator.count(prefix_text) if prefix_text else 0) +
                    estimator.count(target_text))
+    return NearContext(batch_start=batch_start, full_start=full_start,
+                       full_docs=full_docs, full_texts=tuple(near_texts),
+                       prefix_docs=prefix_docs, prefix_text=prefix_text,
+                       target_text=target_text, near_tokens=near_tokens,
+                       warnings=warnings)
+
+
+def batch_near_reserve(snapshot: IndexSnapshot,
+                       documents: Mapping[str, ContextDocument],
+                       batch_ids: Sequence[str], *,
+                       estimator: TokenEstimator,
+                       full_chapters: int = 5) -> int:
+    """Worst-case near-context size across a batch, for a shared history budget."""
+    return max(near_context(snapshot, documents, source_id, batch_ids,
+                            estimator=estimator,
+                            full_chapters=full_chapters).near_tokens
+               for source_id in batch_ids)
+
+
+def build_context_plan(snapshot: IndexSnapshot, documents: Mapping[str, ContextDocument],
+                       target_id: str, batch_ids: Sequence[str], *,
+                       estimator: TokenEstimator, max_tokens: int,
+                       full_chapters: int = 5,
+                       selection_reserve_tokens: int | None = None) -> ContextPlan:
+    parts = near_context(snapshot, documents, target_id, batch_ids,
+                         estimator=estimator, full_chapters=full_chapters)
+    batch_start = parts.batch_start
+    full_start = parts.full_start
+    target = documents[target_id]
+    warnings = parts.warnings
+    full_docs = parts.full_docs
+    near_texts = list(parts.full_texts)
+    prefix_docs = parts.prefix_docs
+    prefix_text = parts.prefix_text
+    target_text = parts.target_text
+    near_tokens = parts.near_tokens
+    if selection_reserve_tokens is not None:
+        near_tokens = max(near_tokens, selection_reserve_tokens)
     remaining = max(0, max_tokens - near_tokens)
 
     selected_by_level = {}
@@ -249,8 +307,7 @@ def build_context_plan(snapshot: IndexSnapshot, documents: Mapping[str, ContextD
                 status=_value(block.status), text=text,
                 token_estimate=estimator.count(text), artifact_id=block.artifact_id,
                 source_ids=tuple(block.source_ids)))
-    for doc in full_docs:
-        text = full_text(doc)
+    for doc, text in zip(full_docs, near_texts):
         segments.append(CoverageSegment(
             representation="full", level=0, start=doc.order, end=doc.order + 1,
             status="accepted", text=text, token_estimate=estimator.count(text),

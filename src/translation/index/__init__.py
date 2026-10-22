@@ -2,7 +2,8 @@
 from .artifacts import (Artifact, ArtifactKind, BlockStatus, ChapterStatus,
                         InputRef)
 from .context_plan import (BatchPlan, BatchSelection, ContextDocument, ContextPlan,
-                           CoverageSegment, build_context_plan, choose_batch_size,
+                           CoverageSegment, NearContext, batch_near_reserve,
+                           build_context_plan, choose_batch_size, near_context,
                            preflight_batch)
 from .lazy import (DEFAULT_ESTIMATE_FACTOR, MaterializationDecision, PlannedBlock,
                    ReferenceIndexPlan, SingleChapterSplitRequired,
@@ -24,7 +25,8 @@ from .workflow import TranslationWorkflow, GlossaryTerm, glossary_evidence
 __all__ = [
     "Artifact", "ArtifactKind", "BlockStatus", "ChapterStatus", "InputRef",
     "BatchPlan", "BatchSelection", "ContextDocument", "ContextPlan",
-    "CoverageSegment", "build_context_plan", "choose_batch_size", "preflight_batch",
+    "CoverageSegment", "NearContext", "batch_near_reserve", "near_context",
+    "build_context_plan", "choose_batch_size", "preflight_batch",
     "LevelConfig", "PointerAdvance", "PointerEvent", "PointerSet",
     "IndexSnapshot", "block_identity", "block_key", "contiguous_advance",
     "Task", "TaskStore", "fair_select", "run_once",

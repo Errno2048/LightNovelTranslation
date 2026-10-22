@@ -258,9 +258,11 @@ class TranslationStore:
                     (source, target, kind, now))
 
     def glossary(self, limit: int = 200) -> list[dict]:
+        # First-seen order is append-only: new terms do not move existing ones,
+        # so a growing glossary keeps a reusable prompt prefix.
         return [dict(row) for row in self.db.execute(
             "SELECT source,target,kind,evidence_count FROM glossary"
-            " ORDER BY evidence_count DESC, source LIMIT ?", (limit,))]
+            " ORDER BY rowid LIMIT ?", (limit,))]
 
     def stats(self) -> dict:
         return {
@@ -432,13 +434,13 @@ class TranslationRunner:
         return IndexSnapshot(snapshot_id=f"run-{order}", generation="hierarchical",
                              levels=self.flow.levels, artifacts=artifacts)
 
-    def _glossary_cards(self, order: int) -> list[GlossaryTerm]:
+    def _glossary_cards(self) -> list[GlossaryTerm]:
         if self.glossary:
-            return self.glossary
-        rows = self.store.glossary(limit=160)
-        text = self.source(order)["text"]
+            return list(self.glossary)
+        # Do not filter per chapter: a chapter-dependent subset changes the
+        # prompt prefix on every call. First-seen order is append-only.
         return [GlossaryTerm(row["source"], row["target"], row["kind"])
-                for row in rows if row["source"] in text]
+                for row in self.store.glossary(limit=200)]
 
     def _history_pairs(self, order: int,
                        provisional: Mapping[int, str] | None = None) -> list[dict]:
@@ -550,7 +552,7 @@ class TranslationRunner:
         if order not in batch:
             batch = (order,) + batch
         terms = (list(glossary) if glossary is not None
-                 else self._glossary_cards(order))
+                 else self._glossary_cards())
         unresolved = (list(unresolved_prior) if unresolved_prior is not None
                       else self._unresolved())
         aliases = [f"S{index:03d}" for index in range(1, len(rows) + 1)]
@@ -661,19 +663,22 @@ class TranslationRunner:
         source_by_ref = {row["ref"]: row["text"] for row in source}
         target_by_ref = {row["ref"]: row["text"] for row in target}
         history = list(history) if history is not None else self._history_pairs(draft.order)
-        glossary = list(glossary) if glossary is not None else self._glossary_cards(draft.order)
+        glossary = list(glossary) if glossary is not None else self._glossary_cards()
         unresolved = (list(unresolved_prior) if unresolved_prior is not None
                       else self._unresolved())
+        # Stable-for-this-chapter material first; the draft is the only part
+        # that changes between review/revision rounds, so it goes last.
+        glossary_cards = [{"source": term.source, "target": term.target,
+                           "kind": term.kind} for term in glossary]
         context = {
+            "glossary": glossary_cards,
             "chapter": {"order": draft.order, "ja_title": draft.ja_title,
                         "zh_title": draft.title_zh},
             "source": source,
-            "draft": target,
             "history": history,
-            "glossary": [{"source": term.source, "target": term.target,
-                          "kind": term.kind} for term in glossary],
             "unresolved_prior": unresolved,
             "authority": "draft is unverified; provisional history may still change",
+            "draft": target,
         }
         messages = [{"role": "system", "content": AUDIT_TASK}]
         messages.extend(AUDIT_REVIEW_FEWSHOT)
@@ -849,13 +854,13 @@ class TranslationRunner:
         evidence = {
             "chapter": {"order": draft.order, "ja_title": draft.ja_title},
             "source": source,
-            "draft": target,
             "confirmed_findings": [
                 {**{key: finding.get(key) for key in (
                     "id", "category", "severity", "source_ref", "target_ref",
                     "claim", "suggestion", "confidence", "source_text", "target_text")},
                  "adjudication_reason": decisions[finding["id"]]["reason"]}
                 for finding in confirmed],
+            "draft": target,
         }
         aliases = [row["ref"] for row in source]
         messages = [
@@ -1066,8 +1071,12 @@ class TranslationRunner:
         source text of preceding chapters in the same batch, not their
         translations. A shared batch glossary is extracted first, so all
         workers can run concurrently without a translation dependency chain.
-        Reviews/adjudication/revisions then run concurrently; acceptance is
-        written in order by the main thread.
+
+        The last chapter is translated first and alone: its prompt contains
+        every earlier chapter's prefix, so finishing it warms provider-side
+        prefix caches for the rest of the batch. Reviews/adjudication/revisions
+        then run concurrently; acceptance is written in order by the main
+        thread.
         """
         workflow = self.project.config.workflow
         translation_concurrency = (workflow.translation_concurrency
@@ -1096,25 +1105,41 @@ class TranslationRunner:
                 snapshot = self.snapshot(batch[0], documents)
                 glossary = self.ensure_batch_glossary(batch)
                 unresolved = self._unresolved()
-                translation_jobs = []
-                for order in batch:
+                translation_jobs = {}
+
+                def submit_translation(order):
                     usages = []
-                    job = trans_pool.submit(
+                    return (trans_pool.submit(
                         self._translate_draft, order,
                         documents=documents, snapshot=snapshot,
                         batch_orders=batch, glossary=glossary,
                         unresolved_prior=unresolved, log_event=False,
-                        usage_sink=usages)
-                    translation_jobs.append((order, job, usages))
+                        usage_sink=usages), usages)
+
+                # The last chapter's prompt contains every earlier chapter's
+                # prefix. Finishing it first warms the provider's prefix cache
+                # for the whole batch; fan-out afterwards is nearly all hits.
+                if len(batch) > 1:
+                    warm = submit_translation(batch[-1])
+                    translation_jobs[batch[-1]] = warm
+                    try:
+                        warm[0].result()
+                    except Exception:
+                        pass
+                for order in batch:
+                    if order not in translation_jobs:
+                        translation_jobs[order] = submit_translation(order)
                 drafts, translation_error = [], None
-                for order, job, usages in translation_jobs:
+                for order in batch:
+                    job, usages = translation_jobs[order]
                     try:
                         draft = job.result()
                     except Exception as exc:
                         for usage in usages:
                             self.store.event("model", **usage)
-                        translation_error = (order, type(exc).__name__, str(exc))
-                        break
+                        if translation_error is None:
+                            translation_error = (order, type(exc).__name__, str(exc))
+                        continue
                     for usage in usages:
                         self.store.event("model", **usage)
                     version = self.store.put_draft(
@@ -1369,7 +1394,9 @@ class TranslationRunner:
         text = "\n\n".join(
             f"### {self.source(order)['raw_title']}\n{self.source(order)['text']}"
             for order in orders)
-        existing = self.store.glossary(limit=300)
+        existing = self.store.glossary(limit=1000)
+        relevant = [row for row in existing
+                    if str(row.get("source", "")).strip() in text]
         self._check_limits()
         rows = []
         prompt = (
@@ -1380,14 +1407,21 @@ class TranslationRunner:
             '[{"source":"クリシェ","target":"库莉茜耶","kind":"person","confidence":"high"}]\n'
             "kind只能是person、place、organization、title、item、skill、other。最多80项。\n\n"
             "【已有术语表】\n" +
-            json.dumps(existing, ensure_ascii=False, separators=(",", ":")) +
+            json.dumps(relevant, ensure_ascii=False, separators=(",", ":")) +
             "\n\n【本批次原文】\n" + text)
         try:
             result = self._generate([
                 {"role": "system", "content": "你是严谨的日中轻小说术语整理员。"},
                 {"role": "user", "content": prompt},
             ], self.glossary_tokens, f"batch_glossary_{orders[0]}_{orders[-1]}")
-            rows = _parse_json_array(result.text)
+            parsed_rows = _parse_json_array(result.text)
+            deduped = {}
+            for row in parsed_rows:
+                source = str(row.get("source", "")).strip()
+                target = str(row.get("target", "")).strip()
+                if source and target and source not in deduped:
+                    deduped[source] = {**row, "source": source, "target": target}
+            rows = [deduped[source] for source in sorted(deduped)]
             self.store.put_glossary(rows)
             self.store.event("batch_glossary", start=orders[0], end=orders[-1] + 1,
                              terms=len(rows))
@@ -1395,18 +1429,18 @@ class TranslationRunner:
             self.store.event("batch_glossary_failed", start=orders[0],
                              end=orders[-1] + 1)
         merged = {}
-        for row in existing:
+        # Preserve the existing first-seen order and append new terms; sorting
+        # a growing table would move old entries and break cached prefixes.
+        for row in relevant:
             source = str(row.get("source", "")).strip()
             target = str(row.get("target", "")).strip()
-            if source and target and source in text:
+            if source and target:
                 merged[source] = GlossaryTerm(source, target,
                                               str(row.get("kind") or "other"))
         for row in rows:
-            source = str(row.get("source", "")).strip()
-            target = str(row.get("target", "")).strip()
-            if source and target and source in text and source not in merged:
-                merged[source] = GlossaryTerm(source, target,
-                                              str(row.get("kind") or "other"))
+            merged.setdefault(row["source"],
+                              GlossaryTerm(row["source"], row["target"],
+                                           str(row.get("kind") or "other")))
         return list(merged.values())
 
 

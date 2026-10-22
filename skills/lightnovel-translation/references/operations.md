@@ -129,7 +129,8 @@ runner.run_concurrent(start=continuation, end=main_end)
 
 - 批次按 `batch_size` 切分。**同批次章节之间没有译文依赖**：翻译第 i 章时，上下文由“共享已接受前缀”加“批内前序章节的日文原文”组成；前序章节的译文不进入 prompt。
 - 翻译前执行一次批次专名预抽取：模型读取本批次日文原文与已有术语表，沿用已有译名并补充新专名；所有翻译 worker 使用同一份术语表。这样即使批内看不到彼此的译文，也能统一人名/地名/组织名。
-- `translation_concurrency` 控制批次内并发翻译请求数；`review_concurrency` 控制审校/裁决/修订并发。主线程按顺序写 accepted，SQLite 保持单写者。
+- 批次开始先单独翻译**最后一章**，等它完成后再把其余章节提交到线程池并发。最后一章的 prompt 包含批内所有前序日文，先完成它等于为整批预热 provider 的前缀缓存；其余请求的公共前缀随后基本都是缓存命中。代价是每批多一次串行等待，换来整批大段上下文按缓存价计费。
+- `translation_concurrency` 控制预热之后批次内并发翻译请求数；`review_concurrency` 控制审校/裁决/修订并发。主线程按顺序写 accepted，SQLite 保持单写者。
 - 批内前序**译文**只在审校阶段作为 provisional 历史使用（所有译文已完成），用于检查跨章一致性；它们不参与翻译上下文。
 - 某章 blocked 时该批停止；已完成 accepted 的章节保留，其余 draft 不自动接受。修复后从同一 SQLite 续跑，未 accepted 的章节会重新进入批次翻译。
 - 顺序调试/单章复现用 `run_order(order)`；长任务用 `run_concurrent`。
@@ -161,6 +162,27 @@ runner.run_concurrent(start=continuation, end=main_end)
 - 32k 审校预算在长章 + 推理模型上可能截断；本次使用 65,536。
 - `_generate` 只自动重试状态明确的失败：`truncated`（加预算）、`empty`/`finish_reason`、`rate_limit`（429）。`timeout`、`network`、`server`/502/524 的远端完成状态未知，不会自动重发；先查事件/产物再决定是否新建请求。重试次数由 `[limits] max_attempts` 控制。
 - 端点有约 100 秒 Cloudflare 上限时，过大的 prompt 会 524；减小上下文或改用不受该限制的端点。不要用简单重试掩盖容量问题。
+
+### 2.4 KV 前缀缓存
+
+provider 按“从头开始的精确 token 前缀”复用缓存。任何逐章变化的字段只要出现在 prompt 前部，后面再长的参考摘要、全文和术语表都不会命中。当前约定：
+
+- 翻译 prompt 的顺序是 system → 稳定 workset（术语表按首次出现顺序）→ 参考摘要/近章全文/批内前序日文 → 本章动态字段 → 定向证据 → 当前目标 → 输出协议。
+- 同批所有章节使用同一组历史摘要/全文段（`batch_near_reserve` 取批内最大近端上下文作为统一预算）；否则预算差异会让某章少选一段旧摘要，前缀在摘要处即分叉。
+- 术语表按首次出现顺序追加，不按 `evidence_count` 或 `source` 重排；新词只追加到末尾，已有词条位置不变。不要按“本章出现”过滤掉术语表中间项，否则每次请求前缀都会在术语表处断开。
+- 审校 prompt 把 glossary、source、history、unresolved 放在前面，**草稿放在 JSON 最后**；同一章的复审/修订可以复用草稿之前的前缀。修订同样把 confirmed findings 放在 source 之后、draft 之前。
+- 批次预热见 2.1。若 provider 不支持前缀缓存，预热只损失一次串行等待，不影响正确性。
+
+查看命中情况（DeepSeek 兼容端点通常在 `usage` 返回 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`）：
+
+```sql
+SELECT json_extract(payload, '$.task') AS task,
+       json_extract(payload, '$.usage.prompt_cache_hit_tokens') AS hit,
+       json_extract(payload, '$.usage.prompt_cache_miss_tokens') AS miss
+FROM events WHERE kind='model' ORDER BY event_id DESC LIMIT 50;
+```
+
+若网关在多个账号/节点间轮询，缓存亲和性可能变差；这属于网关配置，prompt 顺序无法修正。
 
 ## 3. 状态、进度与成本
 

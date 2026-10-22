@@ -882,15 +882,18 @@ review/
 
 ### 19.3 建议的上下文装配顺序
 
-新 ContextPlan 的 `segments` 之后应增加一个 `ContextAssembler`，按以下顺序组装最终 messages：
+新 ContextPlan 的 `segments` 之后应增加一个 `ContextAssembler`。为复用 provider 的前缀缓存，必须按“全章稳定 → 逐章变化”排序：
 
 1. system + 未审候选声明；
-2. workset（core/unresolved/gaps/entity cards/selected K/threads/selection）；
+2. 稳定 workset（core、gaps、按首次出现顺序的 entity cards）；
 3. 层级导航（L1/L2 + not_built 详情）；
-4. 参考/目标全文或摘要 segments；
-5. 定向证据；
-6. 当前目标 `source_message`（含 unresolved 和输出协议）；
-7. 可选的 review/checks/evidence 上下文。
+4. 参考/目标全文或摘要 segments；同批所有目标使用同一组历史段；
+5. 本章动态信息（unresolved、threads、target/batch selection）；
+6. 定向证据；
+7. 当前目标 `source_message`（只输出正文，输出协议随目标变化）；
+8. 可选的 review/checks/evidence 上下文，草稿放在最后。
+
+逐章变化字段若出现在第 2–4 步，后面的长上下文全部无法命中缓存。术语表应按首次出现顺序追加，不要按频次或字形重排。
 
 Token 预算应由旧 `plan_request` 统一计算；workset/实体/线程/定向证据都应有明确配额，超出时按旧 `selection` 的 omitted 统计记录，而不是静默丢弃。
 

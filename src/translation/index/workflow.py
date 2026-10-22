@@ -13,7 +13,8 @@ from typing import Iterable, Mapping
 from ..budget import RoleBudget, plan_request
 from ..schemas import GenerationRequest
 from .artifacts import Artifact, InputRef
-from .context_plan import ContextDocument, build_context_plan
+from .context_plan import (ContextDocument, batch_near_reserve,
+                           build_context_plan)
 from .lazy import plan_reference_blocks
 from .levels import LevelConfig
 from .prompts import source_message, source_records_rules
@@ -150,24 +151,38 @@ class TranslationWorkflow:
         batch_orders = tuple(batch_orders)
         target = documents[target_order]
         batch_ids = [documents[order].source_id for order in batch_orders]
-        plan = build_context_plan(snapshot, {doc.source_id: doc for doc in documents.values()},
-                                  target.source_id, batch_ids,
+        by_source = {doc.source_id: doc for doc in documents.values()}
+        # Every chapter in a batch must select the same history blocks, or the
+        # first differing summary invalidates the rest of the cached prefix.
+        reserve = (batch_near_reserve(snapshot, by_source, batch_ids,
+                                      estimator=_ByteCounter(),
+                                      full_chapters=self.full_chapters)
+                   if len(batch_ids) > 1 else None)
+        plan = build_context_plan(snapshot, by_source, target.source_id, batch_ids,
                                   estimator=_ByteCounter(),
                                   max_tokens=self.capacity - output_tokens,
-                                  full_chapters=self.full_chapters)
+                                  full_chapters=self.full_chapters,
+                                  selection_reserve_tokens=reserve)
+        # Keep the caller's stable order. Re-sorting a growing glossary breaks
+        # the cached prefix at the first newly inserted term.
         terms = list(glossary)
         cards = [_entity_card(index, term) for index, term in enumerate(terms, 1)]
-        workset = {
+        # Keep the cacheable prefix free of per-chapter values. The glossary and
+        # fixed rules go first; target/batch selection and thread state go after
+        # the reference context.
+        stable_workset = {
             "core": [{"id": "CORE-REF", "value": "参考译文只作术语/风格候选，日文是事实依据。"}],
             "candidates": cards,
-            "unresolved": list(unresolved),
             "extraction_gaps": ["参考索引为 lazy planned blocks；仅使用已物化摘要或全文。"],
+            "authority": "candidate_unreviewed",
+        }
+        dynamic_workset = {
+            "unresolved": list(unresolved),
             "threads": dict(threads or {"active": [], "resolved": [], "dormant_relevant": []}),
             "selection": {"target_order": target_order,
                           "recent_chapters": self.full_chapters,
                           "batch_orders": list(batch_orders),
                           "provisional_target_orders": list(provisional_orders)},
-            "authority": "candidate_unreviewed",
         }
         if output_profile == "source-records":
             system = (
@@ -182,14 +197,17 @@ class TranslationWorkflow:
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content":
-             "【冻结约定、候选知识、未决与线程】\n" +
-             json.dumps(workset, ensure_ascii=False, separators=(",", ":"))},
+             "【冻结约定与稳定候选；参考译文不是事实】\n" +
+             json.dumps(stable_workset, ensure_ascii=False, separators=(",", ":"))},
             {"role": "user", "content":
              "【参考索引与近期全文；参考译文不是目标已提交译文】"},
         ]
         rendered = plan.render_messages()
         messages.extend(message for message, segment in zip(rendered, plan.segments)
                         if segment.representation != "target_source")
+        messages.append({"role": "user", "content":
+             "【本章未决、线程与选择元数据；未审候选】\n" +
+             json.dumps(dynamic_workset, ensure_ascii=False, separators=(",", ":"))})
         evidence = glossary_evidence(
             target.source_text, terms,
             [doc.translation_text for doc in documents.values()

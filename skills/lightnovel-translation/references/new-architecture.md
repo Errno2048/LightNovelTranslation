@@ -100,14 +100,17 @@ for segment in context.segments:
     print(segment.representation, segment.level, segment.start, segment.end)
 ```
 
-装配顺序：
+装配顺序按“稳定 → 动态”排列，以复用 provider 的前缀缓存：
 
 1. system + 未审候选声明；
-2. workset（core、实体卡片、unresolved、extraction_gaps、threads）；
-3. 参考索引/全文/批内日文/目标（ContextPlan segments）；
-4. 定向证据（术语出现位置、参考译文命中）；
-5. `source_message`（只输出正文，不输出标题/段落 ID）；
-6. final output-only 指令。
+2. 稳定 workset（core、按首次出现顺序的术语实体卡片、extraction_gaps）；
+3. 参考索引/全文/批内日文（ContextPlan segments）；
+4. 本章动态信息（unresolved、threads、target/batch 选择元数据）；
+5. 定向证据（术语出现位置、参考译文命中）；
+6. 当前目标日文正文；
+7. 输出协议与 final output-only 指令。
+
+不要把 `target_order`、`unresolved`、`threads` 等逐章变化的内容放回 workset 开头：一旦前缀在早期分叉，后面的摘要、全文和术语都无法命中缓存。同批所有目标使用同一份历史段选择（`batch_near_reserve`），因此第 k 章的 prompt 是第 k+1 章（更长的批内前文）的字节前缀。
 
 `assemble` 会自动用 `plan_request` 检查预算；不 fit 时先丢弃可选定向证据。仍不 fit 时应缩小 batch，不要截断最近章节前缀。
 

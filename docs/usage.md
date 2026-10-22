@@ -105,14 +105,17 @@ result, report, context = flow.translate(
 print(result.text[:1000])
 ```
 
-装配内容：
+装配内容（按稳定 → 动态排列，便于复用 provider 前缀缓存）：
 
 1. system + 未审候选声明；
-2. workset（core、实体卡片、unresolved、gaps、threads）；
-3. ContextPlan segments（层级摘要、全文、批内日文、目标）；
-4. 定向证据（术语出现位置、参考命中）；
-5. `source_message`（只输出正文，不输出标题/段落 ID）；
-6. final output-only 指令。
+2. 稳定 workset（core、术语实体卡片、gaps；术语表按首次出现顺序）；
+3. ContextPlan segments（层级摘要、全文、批内前日文）；
+4. 本章动态信息（unresolved、threads、target/batch 元数据）；
+5. 定向证据（术语出现位置、参考命中）；
+6. 当前目标日文正文；
+7. 输出协议与 final output-only 指令。
+
+不要把逐章变化的字段放在稳定块之前。`run_concurrent` 会先单独翻译批尾章以预热前缀缓存，再并发其余章节；同一批使用相同的历史段选择。
 
 不 fit 时先缩小 batch，不能截断最近章节前缀。
 

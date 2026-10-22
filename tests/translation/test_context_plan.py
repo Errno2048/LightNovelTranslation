@@ -1,7 +1,7 @@
 """Pure context planning over synthetic hierarchical snapshots."""
 from translation.index import (Artifact, ContextDocument, IndexSnapshot, InputRef,
-                               LevelConfig, build_context_plan, choose_batch_size,
-                               preflight_batch)
+                               LevelConfig, batch_near_reserve, build_context_plan,
+                               choose_batch_size, preflight_batch)
 
 
 class CharCounter:
@@ -126,6 +126,54 @@ def test_provisional_blocks_are_marked_in_coverage():
                  if segment.representation == "summary"]
     assert summaries
     assert all(segment.status == "provisional" for segment in summaries)
+
+
+def test_batch_reserve_keeps_summary_prefix_identical():
+    documents = {
+        f"s{i}": ContextDocument(source_id=f"s{i}", order=i, title=f"第{i}章",
+                                 source_text=f"日文{i}",
+                                 translation_text=f"中文{i}" if i < 25 else None)
+        for i in range(30)
+    }
+    artifacts = {f"c{i}": _chapter(i) for i in range(25)}
+    for index in range(5):
+        start = index * 5
+        artifacts[f"S{index}"] = _block(
+            f"S{index}", 2, [f"s{i}" for i in range(start, start + 5)],
+            summary=f"摘{index}" * 10)
+    snapshot = IndexSnapshot(
+        snapshot_id="snap", generation="gen",
+        levels=LevelConfig(max_children=(10, 10), context_num_blocks=(1, 1)),
+        artifacts=artifacts)
+    batch = ["s25", "s26"]
+    reserve = batch_near_reserve(snapshot, documents, batch,
+                                 estimator=CharCounter(), full_chapters=1)
+    limit = reserve + 72
+
+    one = build_context_plan(snapshot, documents, "s25", batch,
+                             estimator=CharCounter(), max_tokens=limit,
+                             full_chapters=1)
+    two = build_context_plan(snapshot, documents, "s26", batch,
+                             estimator=CharCounter(), max_tokens=limit,
+                             full_chapters=1)
+    one_ids = [segment.artifact_id for segment in one.segments
+               if segment.representation == "summary"]
+    two_ids = [segment.artifact_id for segment in two.segments
+               if segment.representation == "summary"]
+    assert one_ids != two_ids
+
+    one = build_context_plan(snapshot, documents, "s25", batch,
+                             estimator=CharCounter(), max_tokens=limit,
+                             full_chapters=1, selection_reserve_tokens=reserve)
+    two = build_context_plan(snapshot, documents, "s26", batch,
+                             estimator=CharCounter(), max_tokens=limit,
+                             full_chapters=1, selection_reserve_tokens=reserve)
+    one_ids = [segment.artifact_id for segment in one.segments
+               if segment.representation == "summary"]
+    two_ids = [segment.artifact_id for segment in two.segments
+               if segment.representation == "summary"]
+    assert one_ids == two_ids
+    assert one_ids
 
 
 def test_higher_level_summary_covers_missing_level1_blocks():

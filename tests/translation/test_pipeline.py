@@ -168,6 +168,69 @@ def test_concurrent_runner_accepts_a_window(tmp_path: Path):
             assert '"provisional_target_orders":[]' in text
 
 
+def test_glossary_order_is_append_only(tmp_path: Path):
+    with TranslationStore(tmp_path / "translation.sqlite") as store:
+        store.put_glossary([
+            {"source": "アイ", "target": "爱", "kind": "person"},
+            {"source": "イオ", "target": "依", "kind": "person"},
+        ])
+        store.put_glossary([{"source": "ウル", "target": "乌", "kind": "place"}])
+        store.put_glossary([{"source": "アイ", "target": "爱", "kind": "person"}])
+        assert [row["source"] for row in store.glossary()] == ["アイ", "イオ", "ウル"]
+
+
+def test_concurrent_runner_warms_the_last_chapter_first(tmp_path: Path):
+    japanese = tmp_path / "ja.txt"
+    chinese = tmp_path / "zh.txt"
+    japanese.write_text(
+        "第1話 帰還\n\nノアは村に帰った。\n\n皆は旅の話を聞いた。\n\n"
+        "第2話 出発\n\nノアは村を出た。\n\n皆は見送った。\n\n"
+        "第3話 到着\n\nノアは町に着いた。\n\n皆は迎えた。\n\n"
+        "第4話 再会\n\nノアは友に会った。\n\n皆は喜んだ。\n",
+        encoding="utf-8")
+    chinese.write_text(
+        "第1章 归来\n\n诺亚回到了村子。\n\n众人听他讲述旅途。\n\n"
+        "第2章 出发\n\n诺亚离开了村子。\n\n众人为他送行。\n\n"
+        "第3章 到达\n\n诺亚抵达了城镇。\n\n众人迎接他。\n\n"
+        "第4章 再会\n\n诺亚见到了朋友。\n\n众人十分高兴。\n",
+        encoding="utf-8")
+    provider = ConcurrentProvider()
+    with TranslationProject(tmp_path / "project",
+                            TranslationConfig(), provider=provider,
+                            provider_id="warmup-v1") as project:
+        project.import_book(japanese, edition_id="ja", language="ja",
+                            paragraph_policy="blank_line")
+        project.import_book(chinese, edition_id="zh", language="zh",
+                            paragraph_policy="blank_line")
+        flow = TranslationWorkflow(project, "ja", "zh",
+                                   levels=LevelConfig((2, 2), (1, 1)),
+                                   full_chapters=2)
+        with TranslationStore(tmp_path / "translation.sqlite") as store:
+            runner = TranslationRunner(
+                project, flow, store, continuation_start=1, main_end=4,
+                reference_texts={0: "诺亚回到了村子。\n\n众人听他讲述旅途。"},
+                translation_tokens=512, review_tokens=512,
+                adjudication_tokens=512)
+            result = runner.run_concurrent(
+                translation_concurrency=1, review_concurrency=1, batch_size=3,
+                update_summaries=False)
+            assert result["chapters"] == 3
+            tasks = [request.task for request in provider.requests
+                     if request.task.startswith("translate_")]
+            assert tasks == ["translate_3", "translate_1", "translate_2"]
+            rendered = {request.task: "\n".join(message["content"]
+                                                for message in request.messages)
+                        for request in provider.requests
+                        if request.task.startswith("translate_")}
+            # Each chapter's shared prefix must be a byte prefix of the next
+            # chapter's prompt; this is what makes the cache warm-up effective.
+            for earlier, later in (("translate_1", "translate_2"),
+                                   ("translate_2", "translate_3")):
+                prefix = rendered[earlier].split("【本章未决")[0]
+                assert prefix
+                assert rendered[later].startswith(prefix)
+
+
 def test_runner_revises_a_confirmed_major_finding(tmp_path: Path):
     japanese = tmp_path / "ja.txt"
     chinese = tmp_path / "zh.txt"
