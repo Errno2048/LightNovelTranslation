@@ -175,10 +175,10 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
 1. 用 `source-records` 逐源段输出翻译（`@@TITLE` + 每个 S 段一条 `@@TRANSLATION`）；
 2. 用 `chapter-review` 对照完整 S/T 与近期 R/L 历史审校；
 3. 逐条裁决；confirmed 的 critical/major 触发完整重译修订；
-4. 复审，最多 `max_revisions` 轮；仍有 major 时写 `blocked` 并抛出 `ChapterBlocked`；
+4. 复审，最多 `max_revisions` 轮；batch 模式仍有 major 时写 `blocked` 并抛出 `ChapterBlocked`，pipelined + strict 模式写 `manual_review`；
 5. 通过后原子写 `accepted`，并每隔 `summary_every` 章生成增量目标摘要。
 
-恢复时直接用同一 SQLite 重新构造 runner；accepted 章节会跳过。`blocked` 章节会重新进入草稿流程，或由 agent 检查 `review` 字段后局部接管。
+恢复时直接用同一 SQLite 重新构造 runner；accepted 章节会跳过。`blocked` 章节会重新进入草稿流程，或由 agent 检查 `review` 字段后局部接管；`manual_review` 用 `resolve_manual_review()` 处理。
 
 长任务使用 `run_concurrent` 批次执行：
 
@@ -190,9 +190,37 @@ runner.run_concurrent(start=continuation, end=main_end)
 
 - 批次内章节**没有译文依赖**：翻译第 i 章时，上下文使用共享已接受前缀 + 批内前序章节的**日文原文**；不使用同批其他章节的译文。
 - 批次开始前做一次专名预抽取，生成所有 worker 共享的术语表；已有术语沿用原译名，新术语统一候选。`translation_concurrency` 控制并发翻译请求数。
-- 审校、裁决和修订在 `review_concurrency` 个线程中并发；审校历史可把同批已有译文作为 `provisional_target`，仅用于一致性检查。主线程按顺序写 accepted，SQLite 保持单写者。
-- 某章 blocked 时批次停止；已完成章节保留，修复后从同一 SQLite 续跑。
+- 审校、裁决和修订在 `review_concurrency` 个线程中并发；batch 模式同批已有译文作为 `provisional_target`；pipelined 还可看到前驱未审 draft。主线程按顺序写 accepted，SQLite 保持单写者。
+- 某章 blocked 时该批停止；已完成章节保留，修复后从同一 SQLite 续跑。pipelined strict 的 manual_review 不停止后续翻译。
 - `batch_size` 决定批内前序原文的长度；1M 上下文可用数十章，较小模型应减小批次或增加高层摘要。
+
+### 7.2 pipelined 并发续译
+
+```toml
+translation_mode = "pipelined"
+pipeline_review_backlog = 2
+pipeline_manual_backlog = 2
+adjudication_mode = "strict"   # 或 normal
+```
+
+```python
+runner.run_pipelined(start=continuation, end=main_end)
+runner.run_mode(start=continuation, end=main_end)  # 按配置分派
+```
+
+- 批次 N 完成翻译后写 draft 并物化 `target-provisional` 摘要；N+1 只依赖索引物化，不等待 N 审校/accepted。
+- 下游上下文包含前驱未审 draft、provisional 摘要和滚动术语表，prompt 标注 `provisional`/`未审草稿`。
+- accepted 仍按连续前缀推进；`ready` 表示审校完成但因人工 hold 不能 accepted。
+- `manual_review` 队列、`resolve_manual_review()`、`accept_ready_prefix()` 处理人工接受/修订/阻塞；人工改术语时使用 `term_changes`，旧 target 通过 `mark_term_revisions` 记录。
+- strict 模式主要面向 pipelined；普通 `run_concurrent` 仍以 blocked 为主。
+
+### 7.3 实体/形式术语与标题模式
+
+- `term_entities` 保存实体身份，`term_forms` 保存每个 source form 的 target；全名/短名共享实体但 target 独立。
+- `aliases` 只是同一 form 的中文写法；同一实体的其它 source form 是独立行。
+- `link_term_form` / `merge_term_entities` 显式维护全名/短名关系；合并只改 `entity_id`，不改各 form target。
+- `promote_provisional_terms` 拒绝把 target 提升为另一个 form 已占用的 canonical，并记录/暴露 `term_conflicts`。
+- 标题模式存为 `form_type="title_pattern"`，由 `translation.index.titles` 解析固定前缀/序号/后缀并渲染；只归一化重复模式，`update_title_pattern()` 只更新 `title_zh`。
 
 ## 8. 当前自动化边界与手动接管
 
@@ -201,12 +229,12 @@ runner.run_concurrent(start=continuation, end=main_end)
 章节审校/裁决/修订/提交与 EPUB 导出已由 `TranslationRunner` 覆盖。仍需 agent 明确处理：
 
 1. **跨版本目录对齐**：官方文库章号与 Web 话号可能因拆章、合章、插图/设定页而不同，不能按序号硬配。`align_reference_by_titles` 可调用模型对齐；模型不可用时需要人工核对的锚点（见 `work/hero/anchors.py` 一类脚本）。
-2. **实体目录、线程目录、glossary**：`ensure_glossary` 提供基于双语对照的自动抽取，但术语冲突仍以日文和人工核对为准；线程目录仍由调用者提供。
+2. **实体目录、线程目录、glossary**：`ensure_glossary` 提供基于双语对照的自动抽取；术语表已有 `term_entities`/`term_forms`、`link_term_form`、`merge_term_entities` 和 target-conflict 保护，但全名/短名合并、target 冲突和实体关系仍需审校或人工确认；线程目录仍由调用者提供。
 3. **单章拆分**只有接口预留；单章超出上下文时应 blocked 并交接。
 4. **token 估算**仍使用保守 byte 估算；接入真实 tokenizer 或 usage 校准前，不要把估算值当作精确计费。
 5. **审校成本**：每章至少一次翻译、一次审校、一次裁决和可能的修订/复审；应记录 usage 并避免无界重试。
 6. 低层 `not_created` 块被真正请求时，先创建高层父块的全部低层子块，再 rollup。
-7. 任何 provisional 参考内容都不得标记为 accepted 目标知识；最终交付必须明确哪些章节只是草稿。
+7. 任何 provisional/ready/manual_review 参考内容都不得标记为 accepted 目标知识或进入最终导出；最终交付必须明确哪些章节仍只是草稿/待人工复核。
 
 ## 9. 调试指标
 

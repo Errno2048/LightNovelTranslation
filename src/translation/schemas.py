@@ -54,6 +54,7 @@ class GenerationRequest:
     task: str = "translation"
     tools: list[dict[str, Any]] | None = None
     tool_choice: str | dict[str, Any] | None = None
+    allow_truncated: bool = False
 
     def __post_init__(self):
         if self.max_tokens <= 0 or not self.messages:

@@ -4,12 +4,14 @@
 范围：存储、索引、上下文、翻译、物化、审校、提交与并发调度  
 目标读者：实现者、审校流程维护者、后续扩展层级/参考索引的开发者
 
+> **Round 2 更新（2026-10-26）**：`pipelined` 模式已经允许审校滞后于翻译，并使用前驱未审 draft/provisional index 作为下游翻译和审校的 **provisional 证据**；这些内容仍然不是 accepted。本文中“审校只使用 accepted 前缀”的早期约束仅适用于 batch 模式。术语表已升级为 `term_entities`/`term_forms`（全名/短名/别名共享实体但各有 target），标题模式使用确定性模板归一化；`adjudication_mode="strict"` 下 unresolved major 进入 `manual_review`，翻译可继续，但 accepted/export 仍按连续前缀 gate。详见 [pipelined 计划](pipelined-translation-plan.md) 和 [使用说明](usage.md)。
+
 ## 1. 目标与非目标
 
 ### 1.1 目标
 
 1. 把“章节正文、层级摘要、翻译位置、审校状态”拆成清晰、可独立演进的模块。
-2. 支持 provisional 索引：翻译可以使用未审校摘要，审校只使用已接受内容。
+2. 支持 provisional 索引：翻译可以使用未审校摘要；batch 审校使用 accepted 前缀，pipelined 审校可以把前驱未审 draft/provisional 作为标注来源的 provisional 证据，但不得当作 accepted。
 3. 支持跨窗口并发：翻译、物化、审校、提交可重叠执行，同时保持确定的先后约束。
 4. 把块边界、上下文范围和阻塞条件写成可测试的纯函数与显式不变量。
 5. 为未来更高层摘要（level 3+）预留扩展，但默认不创建未配置层级。
@@ -162,9 +164,9 @@ planned
 
 1. `Chapter.accepted` 的正文是最终事实来源。
 2. `Block.accepted` 蕴含其所有 `inputs` 仍为当前 accepted 版本。
-3. `Block.provisional` 只能用于翻译，不能直接进入块审校。
+3. `Block.provisional` 只能用于翻译上下文，不能直接进入块审校。
 4. 块审校前必须从 accepted 章节重建该块。
-5. 审校只使用 accepted 前缀，不使用 provisional 块作为证据。
+5. 块审校只使用 accepted 前缀。章节审校在 batch 模式使用 accepted 前缀；pipelined 模式可以把前驱未审 draft/provisional 作为明确标注的 provisional 证据，但不得当作 accepted。
 6. 未配置的层级不得创建，也不得被上下文标记为已覆盖。
 7. 指针单调推进；指针更新与 outbox 事件在同一事务提交。
 8. 批次超限时缩小 batch，不截断最近章节前缀。
@@ -329,10 +331,10 @@ while candidate >= 1:
 
 ### 7.1 章节审校
 
-- 输入：待审章节版本 + accepted 前缀（不得使用 provisional 块作为证据）。
+- 输入：待审章节版本 + accepted 前缀；pipelined 模式还可包含前驱未审 draft/provisional index，必须标注 `provisional`，不得当作 accepted。
 - 输出：findings、adjudication、可选的 revision。
-- 审校通过后 Chapter 进入 accepted；正文成为权威。
-- 章节修订创建新版本，旧版本保留；依赖块标记 stale。
+- 审校通过后 Chapter 进入 accepted；正文成为权威。strict 模式下 unresolved major 进入 `manual_review`，由人工接受/修订/阻塞。
+- 章节修订创建新版本，旧版本保留；依赖块标记 stale。人工修改 provisional 术语时，下游 ready/draft 需要重审或重译。
 
 ### 7.2 块审校（当前最小版本）
 
@@ -348,6 +350,8 @@ while candidate >= 1:
 - 块 accepted 后记录 `inputs`、`review_mode` 与 `review_id`（rebuild_only 时 `review_id` 为空）。
 
 ### 7.3 审校阻塞
+
+> 以下规则描述 **batch 模式**。`pipelined` 模式下翻译只需前驱 provisional index 已物化；审校可以滞后，accepted/export 才按连续前缀阻塞。strict 的人工复核 hold 不阻止翻译。
 
 批次 B 的审校开始前：
 
@@ -537,9 +541,9 @@ chapter revision
 
 ### 9.2 Provisional 块
 
-- provisional 块只服务于翻译，不需要向下游传播失效。
-- 当章节 accepted 后，provisional 块直接丢弃/重建。
-- 已用 provisional 块翻译的后续章节，由章节审校基于 accepted 前缀发现问题；不需要额外重译，除非审校确认问题。
+- provisional 块可以服务 pipelined 下游翻译和审校，始终带 `provisional` 标记，不得进入 accepted/export。
+- 当章节 accepted 后，accepted target summary 可以覆盖同范围 provisional 块；provisional 记录保留但不再被 snapshot 选中。
+- 已用 provisional 块翻译的后续章节，由章节审校或人工复核发现问题；如果人工/审校改变正文或 provisional canonical，下游 `ready`/draft 需要标记 stale 并重审/重译，不能默认沿用旧结果。
 
 ### 9.3 块内容修订
 
@@ -569,6 +573,7 @@ chapter revision
   ```
 - 支持一对多、多对一和未匹配。
 - 实体冲突时以日文为准；参考译名只作为候选，不自动成为 accepted glossary。
+- 术语实体和表面形式分层：`term_entities` 保存实体身份，`term_forms` 保存每个 source form 的 target；全名/短名可以共享实体但 target 独立。不要用单个 source-target 行表示整个实体。
 - 参考索引块使用独立命名空间与状态，不参与目标正文导出。
 
 ### 10.3 与现有 cross_edition 能力对齐
@@ -615,7 +620,7 @@ chapter revision
 | 章节翻译失败 | 指针停住；按策略重试；超过上限标记 blocked |
 | level-1 抽取失败 | 批次翻译不得越过 level-1 ready 门槛；显式失败而非静默降级 |
 | level>1 抽取失败 | 允许异步重试；不阻塞最近批次翻译 |
-| 章节审校失败 | 重试；超过上限 blocked |
+| 章节审校失败 | 重试；batch 超限 blocked；strict pipelined 进入 manual_review 并继续翻译后续批次 |
 | 块审校失败 | 重试；块保持 rebuild_required |
 | 预算超限 | 停止新任务；保留已提交结果；支持显式扩展 ledger 上限 |
 
@@ -754,7 +759,7 @@ review/
 - 单章拆分最小版本按行数对齐；译文对齐 TODO，对齐失败必须阻止提交。
 - 块审校当前为最小版本：从 accepted 输入重建块，成功即 accepted，`review_mode='rebuild_only'`；独立块审校 TODO。
 - 块审校不得提出正文修订。
-- 审校使用 accepted 前缀；翻译可使用 provisional。
+- batch 审校使用 accepted 前缀；pipelined 审校可使用标注过的前驱 draft/provisional；翻译可使用 provisional。strict 的 unresolved major 进入 manual review，翻译可继续。
 - 超限时缩小 batch，不截断最近章节前缀。
 - 参考索引默认 level-1 粒度，复用 `cross_edition` 的 L2 关联、实体匹配和术语补查；日文为事实权威。
 - 调度器采用持久化任务表 + 分层优先级 DAG + 全局加权模型门控；先线程池，后评估 asyncio。

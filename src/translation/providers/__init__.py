@@ -106,7 +106,7 @@ class HTTPProvider:
             raise ProviderError("invalid_response", "tool_calls must be a list")
         if message.get("refusal") or reason in {"content_filter", "sensitive"}:
             raise ProviderError("refusal", "generation was refused/filtered")
-        if reason == "length":
+        if reason == "length" and not request.allow_truncated:
             raise ProviderError("truncated", "output reached the generation limit", details={
                 "model": data.get("model"), "request_id": data.get("id"), "finish_reason": reason,
                 "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
@@ -122,13 +122,18 @@ class HTTPProvider:
                                     data.get("usage") or {},
                                     round(time.monotonic() - started, 3),
                                     tool_calls=tool_calls)
-        if not isinstance(text, str) or not text.strip():
+        if not isinstance(text, str):
+            if request.allow_truncated and reason == "length":
+                text = ""
+            else:
+                raise ProviderError("invalid_response", "content must be text")
+        if not text.strip() and not (request.allow_truncated and reason == "length"):
             raise ProviderError("empty", "no output text")
-        if reason != "stop":
+        if reason not in {"stop", "length"}:
             raise ProviderError("finish_reason", "completion did not finish normally")
         if data.get("usage") is not None and not isinstance(data["usage"],dict):
             raise ProviderError("invalid_response", "usage must be an object")
-        return GenerationResult(text.strip(), reason, data.get("model"), data.get("id"),
+        return GenerationResult(text.strip(), reason or "stop", data.get("model"), data.get("id"),
                                 data.get("usage") or {}, round(time.monotonic() - started, 3))
 
     def embed(self, texts: list[str]) -> dict:
@@ -162,8 +167,14 @@ class MockProvider:
             raise value
         if isinstance(value, dict):
             tool_calls = value.get("tool_calls") or []
-            return GenerationResult(value.get("text", ""),
-                                    "tool_calls" if tool_calls else "stop",
+            finish_reason = value.get("finish_reason") or (
+                "tool_calls" if tool_calls else "stop")
+            text = value.get("text", "")
+            if finish_reason == "length" and not request.allow_truncated:
+                raise ProviderError("truncated", "output reached the generation limit",
+                                    details={"finish_reason": "length",
+                                             "text": text, "usage": {}})
+            return GenerationResult(text, finish_reason,
                                     "mock", f"mock-{self.requests_made}", {}, 0,
                                     tool_calls=tool_calls)
         return GenerationResult(value, "stop", "mock", f"mock-{self.requests_made}", {}, 0)

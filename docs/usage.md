@@ -144,7 +144,7 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
 ```
 
 - 翻译使用 `source-records`：`@@TITLE` + 每条源段一条 `@@TRANSLATION`，程序验证顺序和覆盖。
-- 审校使用 `chapter-review`；confirmed 的 critical/major 触发修订，最多 `max_revisions` 轮，之后仍存在则写 `blocked`。
+- 审校使用 `chapter-review`；confirmed 的 critical/major 触发修订，最多 `max_revisions` 轮。批量模式下仍存在则写 `blocked`；pipelined + strict 模式写 `manual_review`，由人工接管。
 - `TranslationStore` 保存不可变版本、accepted 文本、滚动摘要、术语和事件；重启后从同一 SQLite 继续。
 - 官方文库与 Web 的章号可能因拆章/合章/插图页不同，`reference_texts` 必须来自人工核对锚点或模型对齐，不能按序号硬配。
 
@@ -155,6 +155,76 @@ runner.run_concurrent(start=199, end=260)
 ```
 
 默认参数来自配置文件的 `[workflow]` 节（并发数、批次大小、上下文窗口、摘要节奏和输出预算）；需要临时覆盖时再显式传参。批次内章节没有译文依赖：翻译第 i 章时使用“共享已接受前缀 + 批内前序章节的日文原文”，不使用同批其他章节译文。批次开始前会做一次专名预抽取，所有翻译 worker 共享术语表；`translation_concurrency` 个翻译请求并发执行。审校/裁决/修订按 `review_concurrency` 并发，同批已有译文只作为审校的 provisional 历史。主线程按顺序提交 accepted。`batch_size` 过大可能超出上下文，较小模型应减小批次。
+
+### 4.1 流水线并发续译
+
+```toml
+[workflow]
+translation_mode = "pipelined"
+pipeline_review_backlog = 2
+pipeline_manual_backlog = 2
+adjudication_mode = "strict"   # normal 或 strict
+```
+
+```python
+runner.run_pipelined(start=199, end=260)
+# 或按配置分派
+runner.run_mode(start=199, end=260)
+```
+
+- 批次 N 完成翻译后立即写 draft，并物化 `target-provisional` 摘要块；批次 N+1 不必等待 N 审校/接受。
+- N+1 的上下文包含 N 的未审 draft、provisional 摘要和滚动术语表；这些内容标记为 provisional，不冒充 accepted。
+- accepted 仍按连续前缀推进；`ready` 表示自动审校完成但因前面的人工/阻塞无法 accepted。
+- `pipeline_review_backlog` 限制自动审校积压；`pipeline_manual_backlog` 限制人工复核积压，达到上限时暂停启动新翻译。
+
+### 4.2 实体/形式术语表
+
+术语表不再把 `source→target` 和实体身份混在一行。每行 form 有独立 target，实体由 `entity_id` 表示：
+
+```python
+entity = store.term_entity("天津気 刹那")
+store.link_term_form("セツナ", entity["entity_id"],
+                     form_type="short", target="刹那")
+forms = store.term_entity_forms(entity["entity_id"])
+```
+
+- 全名和短名可以共享实体，但各自 target 不同；短名不会被强制成完整名。
+- `aliases` 只表示同一 form 允许的其它中文写法，不再表示“同一实体的其它 source 形式”。
+- `promote_provisional_terms()` 会拒绝把某个 form 的 target 提升为另一个 form 已经占用的 canonical，避免 `セツナ→天津气刹那` 这类首见错误。
+- `merge_term_entities()` 合并实体时只改 `entity_id`，保留每个 form 的 target；合并/链接应低频、显式进行。
+- 审校的 `lookup_term` 会返回同实体的 form 列表，以便判断全名/短名关系。
+
+### 4.3 标题模式
+
+标题模式保存在同一术语表中，`form_type="title_pattern"`，例如：
+
+```text
+source: @title:あなたの為のオーケストラ 其の{n}
+target: 为您独奏的管弦乐团 其{n}
+```
+
+- 程序解析源标题的固定前缀、序号、后缀和标记；
+- 已知模式直接渲染目标标题，不再让模型逐章重译固定部分；
+- 新标题模式先采用一次模型标题，登记为 provisional，并统一序号风格；
+- 序号使用单一中文/阿拉伯数字格式（由模板决定）；
+- 只归一化重复/已知模式，唯一标题保持原样；
+- 标题模式变更用 `runner.update_title_pattern(pattern_key, new_target)`，只更新 `title_zh`，不需要重译正文。
+
+### 4.4 严格裁决与人工接管
+
+```python
+queue = runner.manual_review_queue()
+runner.resolve_manual_review(
+    199, decision="accept",      # accept / revise / blocked
+    text=None, notes="人工复核通过")
+runner.accept_ready_prefix()
+```
+
+- strict 模式下，修订预算用尽仍有 unresolved major 时，章节写 `manual_review`，不抛出硬性 pipeline 错误。
+- 翻译/自动审校继续；manual 之前的 accepted 前缀不受影响，manual 之后的批次写 `ready`，不会自动 accepted 或导出。
+- `resolve_manual_review(decision="accept")` 接受该章并尝试按顺序提升后续 `ready` 批次；`revise` 写回正文并重新进入 draft；`blocked` 保持阻塞。
+- 若人工修改术语，使用 `term_changes`；旧 canonical 会通过 `mark_term_revisions` 记录受影响章节。下游是否重译/重审需要再执行相应流程。
+- strict 目前主要面向 pipelined 模式；普通 `run_concurrent` 仍以 blocked 为主。
 
 ## 任务 DAG 与指针
 
@@ -179,7 +249,7 @@ store.add(Task("translate-111", "translate", "translate"),
 章节审校、裁决、修订、提交和 EPUB 导出已由 `TranslationRunner` 覆盖；以下仍需 agent 判断：
 
 1. 跨版本目录对齐必须按标题/内容建立映射，不能把文库章号直接当 Web 话序。
-2. 实体/线程目录仍由调用者提供；`ensure_glossary` 的自动术语只作候选，冲突以日文和人工核对为准。
+2. 线程目录仍由调用者提供；术语表已有实体/form/link/merge API，但自动抽取只提供候选，全名/短名合并与 target 冲突仍需审校或人工确认。
 3. 单章拆分只有接口预留，译文对齐未实现；单章超限应 blocked。
 4. token 估算仍使用保守 byte 估算；接入真实 tokenizer/usage 校准前不要把估算当精确计费。
 5. 参考摘要/术语/审校都会产生模型费用，应缓存并复用 SQLite。

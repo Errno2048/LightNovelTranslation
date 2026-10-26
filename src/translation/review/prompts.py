@@ -10,7 +10,7 @@ AUDIT_TASK = """【审校协议 chapter-review】
 
 知识权威分级：
 - source_meaning：本章含义、内部指代或客观形式缺陷。
-- confirmed_term：term_checks 中 confidence=1 或 locked 的术语规范；必须按规则结果核对，不能直接替换正文。
+- confirmed_term：term_checks 中 confidence=1、locked 或 provisional 的术语规范；必须按规则结果核对，不能直接替换正文。
 - observed_usage：有R/L原段支持的历史译法；只是本章保持一致的候选，不是已审定或全书固定规范。
 - style_preference：正确表达之间的偏好，不计作错译，不得要求强制修复。
 除 term_checks 中的固定术语外，摘要和实体描述只能帮助寻找线索；历史译法建议必须定位到实际R/L正文或工具返回的正文。

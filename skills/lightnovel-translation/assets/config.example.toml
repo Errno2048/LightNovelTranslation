@@ -31,6 +31,10 @@ safety_tokens = 2048
 # translations. A batch-wide glossary keeps names consistent.
 translation_concurrency = 3
 review_concurrency = 4
+translation_mode = "batch" # "batch" or "pipelined".
+pipeline_review_backlog = 2 # In pipelined mode, reviewed batches may lag behind translation.
+pipeline_manual_backlog = 2 # Pending manual-review holds allowed before translation pauses.
+adjudication_mode = "normal" # "normal" or "strict"; strict sends unresolved major findings to manual review.
 batch_size = 30 # Must fit the endpoint context with preceding batch sources.
 full_chapters = 5 # Recently accepted chapters included as full text.
 history_chapters = 3 # Recent accepted chapters included in review evidence.
@@ -43,6 +47,11 @@ review_tokens = 65536
 adjudication_tokens = 32768
 summary_tokens = 16384
 glossary_tokens = 16384
+# Glossary extraction uses @@TERM records and resumes after a truncated
+# response. Per-chunk cap = per_chapter * effective chapters + base.
+glossary_terms_per_chapter = 5
+glossary_terms_base = 40
+glossary_max_continuations = 4
 # Per-review native tool-call budgets. The review model may request prior
 # chapters or term usages; the remaining budget is shown in its context.
 lookup_chapters = 8

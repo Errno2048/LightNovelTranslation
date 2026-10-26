@@ -29,6 +29,9 @@ class GlossaryTerm:
     confidence: int = 2
     aliases: tuple[str, ...] = ()
     locked: bool = False
+    provisional: bool = False
+    entity_id: int | None = None
+    form_type: str = "other"
 
 
 @dataclass
@@ -190,13 +193,13 @@ class TranslationWorkflow:
         if output_profile == "source-records":
             system = (
                 "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
-                "日文原文是事实依据。实体卡中 confidence=1 或 locked 的 target_form 必须使用；"
-                "其余术语为候选。按源段记录协议输出，不要解释、不要代码块。")
+                "日文原文是事实依据。实体卡中 confidence=1、locked 或 provisional 的 "
+                "target_form 必须使用；其余术语为候选。按源段记录协议输出，不要解释、不要代码块。")
         else:
             system = (
                 "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
-                "日文原文是事实依据。实体卡中 confidence=1 或 locked 的 target_form 必须使用；"
-                "其余术语为候选。只输出正文，不输出标题、段落定位ID或解释。")
+                "日文原文是事实依据。实体卡中 confidence=1、locked 或 provisional 的 "
+                "target_form 必须使用；其余术语为候选。只输出正文，不输出标题、段落定位ID或解释。")
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content":
@@ -271,7 +274,18 @@ class _ByteCounter:
         return len(text.encode("utf-8"))
 
 
+def _term_authority(term: GlossaryTerm) -> str:
+    if term.locked:
+        return "locked_canonical"
+    if term.provisional:
+        return "provisional_canonical"
+    if term.confidence == 1:
+        return "fixed_canonical"
+    return "candidate_unreviewed"
+
+
 def _entity_card(index: int, term: GlossaryTerm) -> dict:
+    authority = _term_authority(term)
     return {
         "id": f"E{index:02d}", "type": "ENTITY",
         "fields": {"name": [term.source], "kind": [term.kind],
@@ -280,9 +294,12 @@ def _entity_card(index: int, term: GlossaryTerm) -> dict:
                    "confidence": [term.confidence],
                    "aliases": list(term.aliases),
                    "locked": term.locked,
+                   "provisional": term.provisional,
+                   "entity_id": term.entity_id,
+                   "form_type": term.form_type,
                    "ambiguity": []},
-        "authority": "candidate_unreviewed",
-        "semantic_status": "candidate_unreviewed",
+        "authority": authority,
+        "semantic_status": authority,
         "prompt_projection": "entity-card-v1",
     }
 
@@ -297,9 +314,15 @@ def glossary_evidence(target_text: str, glossary: Iterable[GlossaryTerm],
                        if term.source in line]
         hits = [text for text in reference_texts if term.target in text]
         terms.append({"source_form": term.source,
-                      "candidate_cards": [{"description": [f"参考译名候选：{term.target}"],
-                                          "target_forms": [term.target],
-                                          "semantic_status": "candidate_unreviewed"}],
+                      "candidate_cards": [{
+                          "description": [f"参考译名候选：{term.target}"],
+                          "target_forms": [term.target],
+                          "confidence": term.confidence,
+                          "locked": term.locked,
+                          "provisional": term.provisional,
+                          "entity_id": term.entity_id,
+                          "form_type": term.form_type,
+                          "semantic_status": _term_authority(term)}],
                       "occurrences": occurrences[:8],
                       "historical_match_count": len(hits),
                       "historical_excerpts": hits[:2]})

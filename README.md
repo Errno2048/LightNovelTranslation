@@ -47,6 +47,8 @@ with TranslationProject("workspaces/my-novel") as project:
 
 **章节闭环**：`translation.index.TranslationRunner` 提供逐章翻译、审校、裁决、有限修订/复审、accepted 提交、滚动摘要与 EPUB 导出；状态保存在 SQLite，可中断续跑。跨版本目录对齐仍需按标题/内容建立映射（可用模型或显式锚点），单章拆分、线程目录和部分质量判定仍可能需人工接管。完整说明见[新架构技能文档](skills/lightnovel-translation/references/new-architecture.md)、[库使用说明](docs/usage.md)和[架构设计](docs/refactor-architecture-design.md)。
 
+**流水线并发与人工接管**：`translation_mode="pipelined"` / `runner.run_pipelined()` 允许审校滞后于翻译；下一批只依赖前驱已物化的 provisional index（摘要、draft、滚动术语表），不等待前一批审校和 accepted。`adjudication_mode="strict"` 会把 unresolved major 写入 `manual_review` 队列，只暂停自动 accepted/导出，不停止翻译；`pipeline_manual_backlog` 控制人工复核积压。术语表使用实体/形式两层结构（同一实体的全名、短名、别名各有自己的 target，但共享 `entity_id`），标题模式由确定性解析/渲染归一化，避免批次间标题和短名漂移。人工 API 为 `manual_review_queue()` 和 `resolve_manual_review(order, decision="accept"|"revise"|"blocked", ...)`；详细说明见 [pipelined 计划](docs/pipelined-translation-plan.md) 和 [使用说明](docs/usage.md)。
+
 ## 获取日文 Web 原作
 
 可选采集模块通过官方 Narou API 搜索，使用 FanFicFare 下载 EPUB，不需要模型或 API key：

@@ -134,6 +134,16 @@ runner.ensure_glossary()           # 双语对照抽词，按 chunk 记录 gloss
 
 `put_glossary` 保留更权威的 canonical，并把其它写法放入 aliases。`locked` 词条不会被后续批次改写。
 
+术语抽取使用可续写的 `@@TERM` 记录协议：
+
+- 每块上限 = `glossary_terms_per_chapter × 该块有效章节数 + glossary_terms_base`，默认 `5x+40`；
+- 模型逐条输出 `@@TERM` 及 `source/target/kind/confidence/aliases` 字段，全部完成后单独一行输出 `@@END`；
+- 响应因输出预算被截断时，丢弃最后一条未完成记录，把已完成记录作为 assistant 历史，并要求从下一条继续；最多 `glossary_max_continuations` 轮；
+- 按 source 去重；无新增记录或达到上限时停止；事件记录 `terms/cap/rounds/truncated/complete/cap_reached/no_progress`；
+- `glossary_complete` 带协议版本；旧版 JSON 抽取结果会按新协议重新抽取。批次专名预抽取也使用同一协议；
+- 修改 `reference_chunk` 或 `glossary_terms_*` 后，已有 `glossary_complete` 不会自动失效；用 `ensure_glossary(force=True)` 或新库重跑。
+- 底层术语表是 `term_entities` + `term_forms`：每个 source form 有自己的 target，实体用 `entity_id` 关联；`glossary()` 是兼容视图。全名/短名/称号的链接和合并见 2.2.1。
+
 审校前会运行确定性术语检查：
 
 - 对源文中出现的 `confidence<=2` 词条，若对应译文段落没有 canonical/alias，生成 `term_checks`；
@@ -145,12 +155,15 @@ runner.ensure_glossary()           # 双语对照抽词，按 chunk 记录 gloss
 
 审校模型可使用原生工具：
 
-- `read_chapter(order, include_source=false)`：读取当前章之前的参考/已接受内容；
-- `lookup_term(term, limit=5)`：查询规范译名和之前章节的实际用法。
+- `read_chapter(order, include_source=false)`：读取当前章之前的参考/已接受/未审 draft；draft 返回 `language=zh-provisional`、`authority=provisional_draft`；
+- `lookup_term(term, limit=5)`：查询规范译名、同一实体的其它 source form，以及参考/已接受/未审 draft 的实际用法。
 
 预算来自 `[workflow]`：
 
 ```toml
+glossary_terms_per_chapter = 5
+glossary_terms_base = 40
+glossary_max_continuations = 4
 lookup_chapters = 8
 lookup_terms = 50
 max_term_checks = 50
@@ -178,13 +191,84 @@ runner.run_concurrent(start=continuation, end=main_end)
 - 顺序调试/单章复现用 `run_order(order)`；长任务用 `run_concurrent`。
 - `batch_size` 不是越大越好：第 30 章的 prompt 会包含前 29 章的日文原文。1M 上下文可支持数十章；较小模型应减小批次或依赖更高层摘要，否则会触发 `context_budget`。批内前序原文是完整源文，不包含同批译文。
 
-### 2.2 配置项归属
+### 2.2 `run_pipelined`：允许审校滞后的批次流水线
+
+```toml
+[workflow]
+translation_mode = "pipelined"   # "batch"（默认）或 "pipelined"
+pipeline_review_backlog = 2      # 允许多少个已翻译批次等待审校
+```
+
+```python
+runner.run_pipelined(start=continuation, end=main_end)
+# 或按配置分派：
+runner.run_mode(start=continuation, end=main_end)
+```
+
+流水线语义：
+
+- 批次翻译完成后立刻写 draft；随后物化 `target-provisional` 摘要块，并开始下一批翻译；审校和 accepted 可以滞后。
+- 下一批翻译上下文包含前驱未审 draft、provisional 摘要和滚动术语注册表；prompt 标注 `未审草稿` / `provisional`，不伪装成 accepted。
+- 批次专名预抽取在 pipelined 模式下把参考范围外的新词提升为 `confidence=1`、`provisional=1` 的强制规范；后续批次必须沿用。首批实际用词优先，后到候选只进 aliases。
+- 审校历史与工具（`read_chapter` / `lookup_term`）可读取前驱 draft，返回 `authority=provisional_draft`；`term_checks` 覆盖 provisional canonical，发现不同写法会触发修订。
+- accepted 仍按批次顺序在主线程写入；`pipeline_batch` 事件记录每批结果。硬错误/普通 blocked 会停止启动新翻译并收尾；strict 的 unresolved major 不硬停，进入 `manual_review`（见 2.2.3）。
+- `materialize_provisional_index` 失败时会写 fallback 摘要并记录 `index_block` 事件；`export` 仍只使用 accepted 文本。
+- 当前一致性策略是“首次 draft 用词成为 provisional canonical”。如果之后需要改 canonical，使用 `store.mark_term_revisions(old_target)` 标记受影响章节，再重译/定点修订；自动全局术语裁决仍需上层规则或人工。
+
+#### 2.2.1 实体/形式术语表
+
+术语表是 `term_entities` + `term_forms` 两层结构，不再用一行 `(source,target,aliases)` 同时承担实体身份和形式译名：
+
+- `term_entities.entity_id` 是稳定实体根，无 parent 链/path compression。
+- `term_forms` 每个 source 一行，拥有自己的 `target`、`form_type`、`target_aliases`、provisional/locked。
+- 全名、短名、称号可以共享 `entity_id`，但各自 target 独立；短名不会被强制成完整名。
+- `aliases` 只表示同一 form 的另一中文写法，不再表示同一实体的其它 source 形式。
+- 新增/链接/合并 API：`put_glossary`、`link_term_form`、`merge_term_entities`、`term_entity_forms`、`term_form`。
+- `promote_provisional_terms` 会拒绝把 form target 提升为另一个 form 已占用的 canonical，并写 `term_target_conflict`；`term_conflicts` 会进入审校上下文。
+- 实体合并只改 `entity_id`，不覆盖各 form target；合并是低频、显式操作。`lookup_term` 返回同实体 form 列表。
+
+#### 2.2.2 标题模式
+
+标题模式存放在 `term_forms`，`form_type="title_pattern"`：
+
+```text
+source: @title:あなたの為のオーケストラ 其の{n}
+target: 为您独奏的管弦乐团 其{n}
+metadata: {"ordinal_style":"chinese","marker":"其の","suffix":""}
+```
+
+- `translation.index.titles` 解析固定前缀、序号、后缀和标记；
+- 已知模式直接按模板渲染，序号由单一中文/阿拉伯格式生成，避免批次间漂移；
+- 新模式采用一次模型标题，登记 provisional，并规范序号；
+- 只归一化重复/已知模式，唯一标题不强行抽象；
+- 标题模式变更用 `runner.update_title_pattern(pattern_key, new_target)`，只更新 `title_zh`，不重译正文。
+
+#### 2.2.3 严格裁决与人工接管
+
+```toml
+adjudication_mode = "strict"     # normal 或 strict
+pipeline_manual_backlog = 2
+```
+
+- strict 模式下修订预算耗尽仍有 unresolved major，章节写 `manual_review`，不抛硬性 pipeline 错误。
+- 翻译/自动审校继续；manual 之前的 accepted 前缀不变，manual 之后的批次写 `ready`，不自动 accepted/导出。
+- `runner.manual_review_queue()` 查看队列；`runner.resolve_manual_review(order, decision="accept"|"revise"|"blocked", text=None, term_changes=None, notes="")` 处理。
+- accept 后自动尝试 `accept_ready_prefix()`；revise 写回正文，等重新审校；blocked 保持阻塞。
+- 人工修改术语时可在 `term_changes` 里给 source/target；旧 target 通过 `mark_term_revisions` 记录，下游重审/重译由调用者或后续流水线执行。
+- `pipeline_manual_backlog` 达到上限且有 manual 队列时暂停启动新翻译；已有翻译/审校可收尾。
+- strict 主要面向 pipelined；普通 `run_concurrent` 仍以 blocked 为主。
+
+### 2.3 配置项归属
 
 新工作流的默认值在 `[workflow]`：
 
 | 配置 | 作用 |
 |---|---|
 | `translation_concurrency` / `review_concurrency` | 翻译 / 审校并发请求数 |
+| `translation_mode` | `batch` 或 `pipelined`；后者允许审校滞后 |
+| `pipeline_review_backlog` | pipelined 模式下允许等待审校的批次数 |
+| `pipeline_manual_backlog` | 允许挂起的人工复核批次数 |
+| `adjudication_mode` | `normal` 或 `strict`；strict 把 unresolved major 交给人工复核 |
 | `batch_size` | 批次包含的章节数，必须与上下文容量匹配 |
 | `full_chapters` / `history_chapters` | 近期全文窗口 / 审校历史章数 |
 | `summary_every` / `summary_lag` / `reference_chunk` | 目标摘要节奏 / 参考摘要与术语分批 |
@@ -194,7 +278,7 @@ runner.run_concurrent(start=continuation, end=main_end)
 
 旧 `[sequence]` 仅用于兼容：没有 `[workflow]` 时，`translation_concurrency`、`review_concurrency` 会从旧值迁移；其他旧字段（包括 `max_revisions`）不再驱动新 runner，使用 workflow 默认值。`[limits]` 的 `max_attempts` 控制传输/截断重试；总请求/token 上限在批次边界检查（批次内可能短暂超出）。每次模型尝试（成功或失败）都写入 `events` 的 `model` 记录。配置模板见 [config.example.toml](../assets/config.example.toml)。
 
-### 2.3 输出预算与截断
+### 2.4 输出预算与截断
 
 - 端点可能把推理 token 计入 `max_tokens`。`finish_reason=length` 或 `ProviderError("truncated")` 时，先看 `usage.completion_tokens_details.reasoning_tokens`。
 - `_generate` 会在 truncated 时自动把输出预算翻倍，最多到 `capacity.max_output_tokens`。仍然截断时：
@@ -205,7 +289,7 @@ runner.run_concurrent(start=continuation, end=main_end)
 - `_generate` 只自动重试状态明确的失败：`truncated`（加预算）、`empty`/`finish_reason`、`rate_limit`（429）。`timeout`、`network`、`server`/502/524 的远端完成状态未知，不会自动重发；先查事件/产物再决定是否新建请求。重试次数由 `[limits] max_attempts` 控制。
 - 端点有约 100 秒 Cloudflare 上限时，过大的 prompt 会 524；减小上下文或改用不受该限制的端点。不要用简单重试掩盖容量问题。
 
-### 2.4 KV 前缀缓存
+### 2.5 KV 前缀缓存
 
 provider 按“从头开始的精确 token 前缀”复用缓存。任何逐章变化的字段只要出现在 prompt 前部，后面再长的参考摘要、全文和术语表都不会命中。当前约定：
 

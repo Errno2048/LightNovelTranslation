@@ -6,10 +6,16 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from translation.index.pipeline import (ReviewOutcome, TranslationRunner,
-                                        TranslationStore, _build_term_checks)
+                                        TranslationStore, _build_term_checks,
+                                        _batch_glossary_prompt,
+                                        _reference_focused_prompt,
+                                        _reference_glossary_prompt,
+                                        parse_term_records)
 from translation.index.workflow import GlossaryTerm
-from translation.providers import HTTPProvider
+from translation.providers import HTTPProvider, ProviderError
 from translation.schemas import GenerationRequest
 from lightnovel_translation.config import WorkflowConfig
 
@@ -143,6 +149,147 @@ def test_glossary_confidence_and_locked_merge():
                              "confidence": 1, "locked": True}])
         locked = next(row for row in store.glossary() if row["source"] == "ロック")
         assert locked["target"] == "固定"
+
+
+def test_glossary_count_is_not_limited_by_default_page():
+    path = Path(tempfile.mkdtemp()) / "count.sqlite"
+    with TranslationStore(path) as store:
+        store.put_glossary([
+            {"source": f"語{i:03d}", "target": f"词{i:03d}",
+             "kind": "other", "confidence": 3}
+            for i in range(205)])
+        assert store.glossary_count() == 205
+        assert len(store.glossary()) == 200
+        assert len(store.glossary(limit=1_000_000)) == 205
+
+
+def test_provisional_glossary_is_mandatory_and_wins_merges():
+    path = Path(tempfile.mkdtemp()) / "provisional.sqlite"
+    with TranslationStore(path) as store:
+        store.put_glossary([{"source": "ノア", "target": "诺亚",
+                             "kind": "person", "confidence": 3}])
+        promoted = store.promote_provisional_terms(["ノア"])
+        assert promoted and promoted[0]["target"] == "诺亚"
+        row = store.glossary()[0]
+        assert row["target"] == "诺亚"
+        assert row["confidence"] == 1
+        assert row["provisional"] is True
+        assert row["locked"] is False
+        store.put_glossary([{"source": "ノア", "target": "诺阿",
+                             "kind": "person", "confidence": 3}])
+        row = store.glossary()[0]
+        assert row["target"] == "诺亚"
+        assert row["provisional"] is True
+        term = GlossaryTerm("ノア", "诺亚", "person", 1, (), False, True)
+        checks = _build_term_checks([{"text": "ノアが来た"}],
+                                    ["诺阿来了"], [term])
+        assert checks[0]["canonical"] == "诺亚"
+        assert checks[0]["status"] == "fixed_missing"
+        assert checks[0]["provisional"] is True
+
+
+def test_review_tools_read_provisional_drafts():
+    runner = object.__new__(TranslationRunner)
+    runner.continuation_start = 1
+    runner.source_by_order = {
+        0: {"raw_title": "ch0", "text": "旅人は村を出た。"},
+        1: {"raw_title": "ch1", "text": "ノアが来た。"},
+    }
+    runner.reference_texts = {0: "旅人离开了村子。"}
+    context = {"accepted_texts": {}, "draft_texts": {1: "诺亚来了。"},
+               "glossary": [], "events": [], "buffer_events": True}
+    budget = {"max_chapters": 2, "max_terms": 5,
+              "used_chapters": set(), "used_terms": set()}
+    chapter = runner._execute_review_tool(
+        "read_chapter", json.dumps({"order": 1}), 2, budget, context)
+    assert chapter["language"] == "zh-provisional"
+    assert chapter["authority"] == "provisional_draft"
+    assert chapter["text"] == "诺亚来了。"
+    lookup = runner._execute_review_tool(
+        "lookup_term", json.dumps({"term": "诺亚"}), 2, budget, context)
+    assert lookup["hits"][0]["authority"] == "provisional_draft"
+
+
+def test_full_and_short_forms_share_entity_with_distinct_targets():
+    path = Path(tempfile.mkdtemp()) / "entity.sqlite"
+    with TranslationStore(path) as store:
+        store.put_glossary([{"source": "天津気 刹那", "target": "天津气刹那",
+                             "kind": "person", "confidence": 1,
+                             "locked": True}])
+        store.put_glossary([{"source": "セツナ", "target": "刹那",
+                             "kind": "person", "confidence": 3,
+                             "form_type": "short"}])
+        entity = store.term_entity("天津気 刹那")
+        assert entity is not None
+        linked = store.link_term_form(
+            "セツナ", entity["entity_id"], form_type="short", target="刹那")
+        assert linked["entity_id"] == entity["entity_id"]
+        forms = store.term_entity_forms(entity["entity_id"])
+        assert {form["source"] for form in forms} == {"天津気 刹那", "セツナ"}
+        targets = {form["source"]: form["target"] for form in forms}
+        assert targets == {"天津気 刹那": "天津气刹那", "セツナ": "刹那"}
+
+
+def test_target_conflict_blocks_provisional_promotion():
+    path = Path(tempfile.mkdtemp()) / "conflict.sqlite"
+    with TranslationStore(path) as store:
+        store.put_glossary([{"source": "天津気 刹那", "target": "天津气刹那",
+                             "kind": "person", "confidence": 1,
+                             "locked": True}])
+        store.put_glossary([{"source": "セツナ", "target": "天津气刹那",
+                             "kind": "person", "confidence": 3,
+                             "aliases": ["刹那"]}])
+        assert store.promote_provisional_terms(["セツナ"]) == []
+        row = next(row for row in store.glossary()
+                   if row["source"] == "セツナ")
+        assert row["confidence"] == 3
+        assert row["provisional"] is False
+        events = [json.loads(row[0]) for row in store.db.execute(
+            "SELECT payload FROM events WHERE kind='term_target_conflict'")]
+        assert events and events[0]["source"] == "セツナ"
+
+
+def test_merge_entities_preserves_each_form_target():
+    path = Path(tempfile.mkdtemp()) / "merge.sqlite"
+    with TranslationStore(path) as store:
+        store.put_glossary([{"source": "天津気 刹那", "target": "天津气刹那",
+                             "kind": "person", "confidence": 1},
+                            {"source": "セツナ", "target": "刹那",
+                             "kind": "person", "confidence": 1}])
+        merged = store.merge_term_entities("天津気 刹那", "セツナ")
+        assert merged is not None
+        forms = {form["source"]: form for form in merged["forms"]}
+        assert set(forms) == {"天津気 刹那", "セツナ"}
+        assert forms["天津気 刹那"]["target"] == "天津气刹那"
+        assert forms["セツナ"]["target"] == "刹那"
+        assert forms["天津気 刹那"]["entity_id"] == forms["セツナ"]["entity_id"]
+
+
+def test_lookup_term_returns_entity_forms():
+    path = Path(tempfile.mkdtemp()) / "lookup.sqlite"
+    with TranslationStore(path) as store:
+        store.put_glossary([{"source": "天津気 刹那", "target": "天津气刹那",
+                             "kind": "person", "confidence": 1}])
+        store.put_glossary([{"source": "セツナ", "target": "刹那",
+                             "kind": "person", "confidence": 1}])
+        entity = store.term_entity("天津気 刹那")
+        store.link_term_form("セツナ", entity["entity_id"],
+                             form_type="short", target="刹那")
+        runner = object.__new__(TranslationRunner)
+        runner.store = store
+        runner.continuation_start = 1
+        runner.reference_texts = {}
+        runner.source_by_order = {0: {"raw_title": "ch0", "text": "セツナ"}}
+        context = {"accepted_texts": {}, "draft_texts": {},
+                   "glossary": store.glossary(limit=1000),
+                   "term_conflicts": [], "events": [], "buffer_events": True}
+        budget = {"max_chapters": 2, "max_terms": 5,
+                  "used_chapters": set(), "used_terms": set()}
+        result = runner._execute_review_tool(
+            "lookup_term", json.dumps({"term": "セツナ"}), 1, budget, context)
+        forms = result["glossary"][0]["entity_forms"]
+        assert {form["source"] for form in forms} == {"天津気 刹那", "セツナ"}
+        assert {form["target"] for form in forms} == {"天津气刹那", "刹那"}
 
 
 def test_confirm_glossary_locks_candidate():
@@ -284,6 +431,195 @@ def test_review_tools_use_worker_safe_snapshot():
     assert store.db.execute(
         "SELECT COUNT(*) FROM events WHERE kind='review_tool'").fetchone()[0] == 1
     store.close()
+
+
+def test_parse_term_records_complete_and_incomplete_tail():
+    complete = """@@TERM
+source: クリシェ
+target: 庫莉茜耶
+kind: person
+confidence: 1
+aliases: 庫莉茜雅|庫莉茜耶
+@@TERM
+source: ケイオースキューブ
+target: 浑沌方块
+kind: item
+confidence: 2
+@@END
+"""
+    parsed = parse_term_records(complete)
+    assert parsed.complete is True
+    assert [row["source"] for row in parsed.records] == [
+        "クリシェ", "ケイオースキューブ"]
+    assert parsed.records[0]["aliases"] == ["庫莉茜雅"]
+    assert parsed.records[1]["aliases"] == []
+
+    truncated = """@@TERM
+source: カースドプリズン
+target: 呪狱
+kind: person
+confidence: 1
+@@TERM
+source: メグ
+target: Meg
+"""
+    parsed = parse_term_records(truncated)
+    assert parsed.complete is False
+    assert [row["source"] for row in parsed.records] == ["カースドプリズン"]
+    assert "incomplete_tail" in parsed.errors
+    assert "カースドプリズン" in parsed.trimmed
+    assert "メグ" not in parsed.trimmed
+
+    missing_end = """@@TERM
+source: A
+target: 甲
+kind: other
+confidence: 3
+"""
+    parsed = parse_term_records(missing_end)
+    assert parsed.complete is False
+    assert [row["source"] for row in parsed.records] == ["A"]
+    assert "missing_end" in parsed.errors
+
+    fullwidth = """@@TERM
+source： A
+target： 甲
+kind： role
+confidence： 1
+aliases： B|C
+@@END
+"""
+    parsed = parse_term_records(fullwidth)
+    assert parsed.records[0]["target"] == "甲"
+    assert parsed.records[0]["aliases"] == ["B", "C"]
+
+    invalid = """@@TERM
+source: A
+target: 甲
+kind: creature
+confidence: 9
+@@END
+"""
+    parsed = parse_term_records(invalid)
+    assert parsed.records[0]["kind"] == "other"
+    assert parsed.records[0]["confidence"] == 2
+    assert any(error.startswith("invalid_kind:") for error in parsed.errors)
+    assert any(error.startswith("invalid_confidence:") for error in parsed.errors)
+
+    prefixed = """@@TERMCHECK tc001
+@@TERM
+source: A
+target: 甲
+kind: person
+confidence: 1
+@@END
+"""
+    parsed = parse_term_records(prefixed)
+    assert [row["source"] for row in parsed.records] == ["A"]
+
+
+def test_glossary_cap_is_linear():
+    runner = object.__new__(TranslationRunner)
+    runner.glossary_terms_per_chapter = 5
+    runner.glossary_terms_base = 40
+    assert runner._glossary_cap(16) == 120
+    assert runner._glossary_cap(5) == 65
+    assert runner._glossary_cap(0) == 40
+
+
+def test_extract_terms_resumes_after_truncation():
+    runner = object.__new__(TranslationRunner)
+    runner.glossary_tokens = 100
+    runner.glossary_max_continuations = 4
+    calls = []
+    script = [
+        SimpleNamespace(
+            text=("@@TERM\nsource: A\ntarget: 甲\nkind: person\nconfidence: 1\n"
+                  "@@TERM\nsource: B\ntarget: 乙\n"),
+            finish_reason="length"),
+        SimpleNamespace(
+            text=("@@TERM\nsource: B\ntarget: 乙\nkind: item\nconfidence: 2\n"
+                  "@@END\n"),
+            finish_reason="stop"),
+    ]
+
+    def _generate(messages, max_tokens, task, **kwargs):
+        calls.append([dict(message) for message in messages])
+        assert kwargs.get("allow_truncated") is True
+        return script.pop(0)
+
+    runner._generate = _generate
+    rows, stats = runner._extract_terms(
+        system="system", prompt="prompt", task="glossary", max_terms=10)
+    assert [row["source"] for row in rows] == ["A", "B"]
+    assert stats["rounds"] == 1
+    assert stats["truncated"] is True
+    assert stats["complete"] is True
+    assert len(calls) == 2
+    assert "@@TERM" in calls[1][2]["content"]
+    assert "上一次输出" in calls[1][3]["content"]
+
+
+def test_extract_terms_stops_without_progress_or_at_cap():
+    runner = object.__new__(TranslationRunner)
+    runner.glossary_tokens = 100
+    runner.glossary_max_continuations = 4
+    repeated = SimpleNamespace(
+        text="@@TERM\nsource: A\ntarget: 甲\nkind: person\nconfidence: 1\n",
+        finish_reason="length")
+    runner._generate = lambda *args, **kwargs: repeated
+    rows, stats = runner._extract_terms(
+        system="system", prompt="prompt", task="glossary", max_terms=10)
+    assert [row["source"] for row in rows] == ["A"]
+    assert stats["no_progress"] is True
+    assert stats["rounds"] == 1
+
+    calls = []
+    runner._generate = lambda *args, **kwargs: (
+        calls.append(1) or SimpleNamespace(
+            text="@@TERM\nsource: A\ntarget: 甲\nkind: person\nconfidence: 1\n",
+            finish_reason="length"))
+    rows, stats = runner._extract_terms(
+        system="system", prompt="prompt", task="glossary", max_terms=1)
+    assert stats["cap_reached"] is True
+    assert len(calls) == 1
+
+
+def test_glossary_prompts_use_records_and_linear_cap():
+    general = _reference_glossary_prompt(["pair"], max_terms=120)
+    assert "@@TERM" in general
+    assert "@@END" in general
+    assert "最多 120 项" in general
+    assert "aliases 用 | 分隔" in general
+    focused = _reference_focused_prompt(["pair"], max_terms=65)
+    assert "最多 65 项" in focused
+    batch = _batch_glossary_prompt("text", [], max_terms=55)
+    assert "最多 55 项" in batch
+    assert "@@TERM" in batch
+
+
+class _LengthClient:
+    def post(self, url, headers, json):
+        return _Response({
+            "id": "r1", "model": "mock",
+            "choices": [{"finish_reason": "length", "message": {
+                "content": "@@TERM\nsource: A"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+
+def test_http_provider_returns_partial_on_length():
+    from translation.config import ModelConfig
+    provider = HTTPProvider(ModelConfig(model="mock", base_url="http://127.0.0.1:1",
+                                        api_key="x", retries=0),
+                            client=_LengthClient())
+    result = provider.generate(GenerationRequest(
+        [{"role": "user", "content": "extract"}], allow_truncated=True))
+    assert result.finish_reason == "length"
+    assert result.text.startswith("@@TERM")
+    with pytest.raises(ProviderError):
+        provider.generate(GenerationRequest(
+            [{"role": "user", "content": "extract"}]))
 
 
 def test_http_provider_returns_tool_calls():

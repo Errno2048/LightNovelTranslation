@@ -23,6 +23,10 @@ class WorkflowConfig:
     """Defaults for the resumable, batch-concurrent translation workflow."""
     translation_concurrency: int = 3
     review_concurrency: int = 4
+    translation_mode: str = "batch"
+    pipeline_review_backlog: int = 2
+    pipeline_manual_backlog: int = 2
+    adjudication_mode: str = "normal"
     batch_size: int = 30
     full_chapters: int = 5
     history_chapters: int = 3
@@ -35,6 +39,9 @@ class WorkflowConfig:
     adjudication_tokens: int = 32768
     summary_tokens: int = 16384
     glossary_tokens: int = 16384
+    glossary_terms_per_chapter: int = 5
+    glossary_terms_base: int = 40
+    glossary_max_continuations: int = 4
     lookup_chapters: int = 8
     lookup_terms: int = 50
     max_term_checks: int = 50
@@ -42,15 +49,28 @@ class WorkflowConfig:
 
     def __post_init__(self):
         for name in ('translation_concurrency', 'review_concurrency',
+                     'pipeline_review_backlog', 'pipeline_manual_backlog',
                      'batch_size', 'full_chapters', 'summary_every',
                      'reference_chunk', 'translation_tokens', 'review_tokens',
                      'adjudication_tokens', 'summary_tokens', 'glossary_tokens',
-                     'lookup_chapters', 'lookup_terms', 'max_tool_rounds'):
+                     'glossary_terms_per_chapter', 'lookup_chapters',
+                     'lookup_terms', 'max_tool_rounds'):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ConfigurationError(f'workflow.{name} must be a positive integer')
+        if self.translation_mode not in {'batch', 'pipelined'}:
+            raise ConfigurationError(
+                "workflow.translation_mode must be 'batch' or 'pipelined'")
+        if self.adjudication_mode not in {'normal', 'strict'}:
+            raise ConfigurationError(
+                "workflow.adjudication_mode must be 'normal' or 'strict'")
         if type(self.max_term_checks) is not int or self.max_term_checks < 0:
             raise ConfigurationError('workflow.max_term_checks must be a nonnegative integer')
+        if type(self.glossary_terms_base) is not int or self.glossary_terms_base < 0:
+            raise ConfigurationError('workflow.glossary_terms_base must be a nonnegative integer')
+        if (type(self.glossary_max_continuations) is not int or
+                self.glossary_max_continuations < 0):
+            raise ConfigurationError('workflow.glossary_max_continuations must be a nonnegative integer')
         if type(self.history_chapters) is not int or self.history_chapters < 0:
             raise ConfigurationError('workflow.history_chapters must be a nonnegative integer')
         if type(self.summary_lag) is not int or self.summary_lag < 0:

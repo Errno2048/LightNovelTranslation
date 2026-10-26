@@ -6,6 +6,7 @@ reintroducing the old ``translation.sequence`` engine.
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field, replace
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -31,6 +32,8 @@ from .assets import AssetIndex, load_asset_index, sniff_media_type
 from .context_plan import ContextDocument
 from .prompts import source_records_rules
 from .snapshot import IndexSnapshot
+from .titles import (parse_target_template, parse_title_pattern,
+                     render_title_template, title_pattern_key)
 from .workflow import TranslationWorkflow, GlossaryTerm
 
 
@@ -67,6 +70,19 @@ class ReviewOutcome:
     raw: str
     errors: tuple[str, ...] = ()
     term_checks: tuple[dict, ...] = ()
+
+
+@dataclass(frozen=True)
+class TermExtraction:
+    records: tuple[dict, ...]
+    complete: bool
+    trimmed: str
+    errors: tuple[str, ...] = ()
+
+
+GLOSSARY_PROTOCOL_VERSION = 2
+GLOSSARY_KINDS = {"person", "place", "organization", "title", "role",
+                  "race", "item", "skill", "other"}
 
 
 def _now() -> str:
@@ -133,6 +149,26 @@ def _normalize_aliases(value) -> list[str]:
     return sorted({str(item).strip() for item in values if str(item).strip()})
 
 
+def _json_list(value) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    try:
+        data = json.loads(value or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [str(item) for item in data] if isinstance(data, list) else []
+
+
+def _json_dict(value) -> dict:
+    if isinstance(value, Mapping):
+        return dict(value)
+    try:
+        data = json.loads(value or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return dict(data) if isinstance(data, Mapping) else {}
+
+
 def _build_term_checks(source_rows: Sequence[Mapping],
                        target_paragraphs: Sequence[str],
                        glossary: Sequence[GlossaryTerm],
@@ -174,6 +210,9 @@ def _build_term_checks(source_rows: Sequence[Mapping],
             "kind": term.kind,
             "confidence": int(term.confidence),
             "locked": bool(term.locked),
+            "provisional": bool(term.provisional),
+            "entity_id": term.entity_id,
+            "form_type": term.form_type,
             "status": "fixed_missing" if term.confidence == 1 else "needs_context",
             "occurrence_count": occurrence_count,
             "occurrences": occurrences,
@@ -252,9 +291,37 @@ class TranslationStore:
                 confidence INTEGER NOT NULL DEFAULT 2,
                 aliases TEXT NOT NULL DEFAULT '[]',
                 locked INTEGER NOT NULL DEFAULT 0,
+                provisional INTEGER NOT NULL DEFAULT 0,
                 evidence_count INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS term_entities (
+                entity_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                label TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'other',
+                status TEXT NOT NULL DEFAULT 'candidate',
+                confidence INTEGER NOT NULL DEFAULT 2,
+                locked INTEGER NOT NULL DEFAULT 0,
+                provenance TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS term_forms (
+                source TEXT PRIMARY KEY,
+                entity_id INTEGER NOT NULL REFERENCES term_entities(entity_id),
+                target TEXT NOT NULL,
+                form_type TEXT NOT NULL DEFAULT 'other',
+                target_aliases TEXT NOT NULL DEFAULT '[]',
+                metadata TEXT NOT NULL DEFAULT '{}',
+                confidence INTEGER NOT NULL DEFAULT 2,
+                provisional INTEGER NOT NULL DEFAULT 0,
+                locked INTEGER NOT NULL DEFAULT 0,
+                evidence_count INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS term_forms_entity_idx
+                ON term_forms(entity_id);
             CREATE TABLE IF NOT EXISTS events (
                 event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 edition_order INTEGER,
@@ -272,10 +339,54 @@ class TranslationStore:
         glossary_columns = {row[1] for row in self.db.execute("PRAGMA table_info(glossary)")}
         for name, definition in (("confidence", "INTEGER NOT NULL DEFAULT 2"),
                                  ("aliases", "TEXT NOT NULL DEFAULT '[]'"),
-                                 ("locked", "INTEGER NOT NULL DEFAULT 0")):
+                                 ("locked", "INTEGER NOT NULL DEFAULT 0"),
+                                 ("provisional", "INTEGER NOT NULL DEFAULT 0")):
             if name not in glossary_columns:
                 self.db.execute(f"ALTER TABLE glossary ADD COLUMN {name} {definition}")
+        self._migrate_legacy_glossary()
         self.db.commit()
+
+    def _migrate_legacy_glossary(self):
+        existing = self.db.execute(
+            "SELECT COUNT(*) FROM term_forms").fetchone()[0]
+        if existing:
+            return
+        legacy = list(self.db.execute(
+            "SELECT source,target,kind,confidence,aliases,locked,provisional,"
+            "evidence_count,updated_at FROM glossary ORDER BY rowid"))
+        if not legacy:
+            return
+        now = _now()
+        for row in legacy:
+            source = str(row["source"] or "").strip()
+            target = str(row["target"] or "").strip()
+            if not source or not target:
+                continue
+            confidence = int(row["confidence"] or 2)
+            locked = bool(row["locked"])
+            provisional = bool(row["provisional"]) and not locked
+            status = ("locked" if locked else "provisional" if provisional
+                      else "confirmed" if confidence == 1 else "candidate")
+            cursor = self.db.execute(
+                "INSERT INTO term_entities(label,kind,status,confidence,locked,"
+                "provenance,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                (source, row["kind"] or "other", status, confidence,
+                 1 if locked else 0, "legacy-glossary", now, now))
+            entity_id = cursor.lastrowid
+            self.db.execute(
+                "INSERT INTO term_forms(source,entity_id,target,form_type,"
+                "target_aliases,metadata,confidence,provisional,locked,"
+                "evidence_count,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (source, entity_id, target, "other",
+                 row["aliases"] or "[]", "{}", confidence,
+                 1 if provisional else 0, 1 if locked else 0,
+                 int(row["evidence_count"] or 1), now, now))
+        self.db.execute(
+            "INSERT INTO events(edition_order,kind,payload,created_at)"
+            " VALUES(?,?,?,?)",
+            (None, "term_registry_migrated",
+             json.dumps({"forms": len(legacy)}, ensure_ascii=False), now))
 
     def close(self):
         self.db.close()
@@ -354,14 +465,41 @@ class TranslationStore:
                 " WHERE edition_order=?",
                 (status, json.dumps(review or {}, ensure_ascii=False), _now(), order))
 
+    def set_title(self, order: int, title_zh: str):
+        with self.db:
+            self.db.execute(
+                "UPDATE chapters SET title_zh=?, updated_at=?"
+                " WHERE edition_order=?", (title_zh, _now(), order))
+
     def accepted_orders(self) -> list[int]:
         return [row["edition_order"] for row in self.db.execute(
             "SELECT edition_order FROM chapters WHERE status='accepted'"
             " ORDER BY edition_order")]
 
+    def mark_term_revisions(self, old_target: str, *, reason: str = "") -> list[int]:
+        old_target = str(old_target or "").strip()
+        if not old_target:
+            return []
+        orders = [row["edition_order"] for row in self.db.execute(
+            "SELECT edition_order FROM chapters WHERE instr(text, ?) > 0"
+            " ORDER BY edition_order", (old_target,))]
+        for order in orders:
+            self.event("term_revision_required", order=order,
+                       target=old_target, reason=reason)
+        return orders
+
     def translations(self) -> dict[int, str]:
         return {row["edition_order"]: row["text"] for row in self.db.execute(
             "SELECT edition_order, text FROM chapters WHERE status='accepted'")}
+
+    def draft_translations(self) -> dict[int, str]:
+        return {row["edition_order"]: row["text"] for row in self.db.execute(
+            "SELECT edition_order, text FROM chapters WHERE status='draft'")}
+
+    def provisional_translations(self) -> dict[int, str]:
+        return {row["edition_order"]: row["text"] for row in self.db.execute(
+            "SELECT edition_order, text FROM chapters WHERE status IN"
+            " ('draft','ready','manual_review','stale')")}
 
     def put_summary(self, scope: str, start: int, end: int, text: str):
         with self.db:
@@ -380,6 +518,192 @@ class TranslationStore:
             "SELECT scope,start_order,end_order,text FROM summaries"
             " WHERE scope=? ORDER BY start_order", (scope,))]
 
+    def _entity_row(self, entity_id: int):
+        return self.db.execute(
+            "SELECT entity_id,label,kind,status,confidence,locked,provenance"
+            " FROM term_entities WHERE entity_id=?", (entity_id,)).fetchone()
+
+    def _create_entity(self, label: str, kind: str, confidence: int,
+                       locked: bool, provisional: bool,
+                       provenance: str = "") -> int:
+        status = ("locked" if locked else "provisional" if provisional
+                  else "confirmed" if confidence == 1 else "candidate")
+        now = _now()
+        cursor = self.db.execute(
+            "INSERT INTO term_entities(label,kind,status,confidence,locked,"
+            "provenance,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+            (label, kind or "other", status, confidence,
+             1 if locked else 0, provenance, now, now))
+        return int(cursor.lastrowid)
+
+    def _refresh_entity(self, entity_id: int):
+        entity = self._entity_row(entity_id)
+        if entity is None:
+            return
+        rows = list(self.db.execute(
+            "SELECT confidence,provisional,locked FROM term_forms"
+            " WHERE entity_id=?", (entity_id,)))
+        if not rows:
+            self.db.execute("DELETE FROM term_entities WHERE entity_id=?",
+                            (entity_id,))
+            return
+        kind = str(entity["kind"] or "other")
+        locked = any(bool(row["locked"]) for row in rows)
+        provisional = any(bool(row["provisional"]) for row in rows)
+        confidence = min(int(row["confidence"]) for row in rows)
+        status = ("locked" if locked else "provisional" if provisional
+                  else "confirmed" if confidence == 1 else "candidate")
+        self.db.execute(
+            "UPDATE term_entities SET kind=?,status=?,confidence=?,locked=?,"
+            "updated_at=? WHERE entity_id=?",
+            (kind, status, confidence, 1 if locked else 0, _now(), entity_id))
+
+    def _legacy_form(self, row) -> dict:
+        return {
+            "source": row["source"], "target": row["target"],
+            "kind": row["kind"], "confidence": int(row["confidence"]),
+            "aliases": _json_list(row["target_aliases"]),
+            "locked": bool(row["locked"]),
+            "provisional": bool(row["provisional"]),
+            "evidence_count": int(row["evidence_count"]),
+            "entity_id": int(row["entity_id"]),
+            "form_type": row["form_type"],
+            "metadata": _json_dict(row["metadata"]),
+        }
+
+    def _form_row(self, source: str):
+        return self.db.execute(
+            "SELECT f.source,f.entity_id,f.target,f.form_type,f.target_aliases,"
+            "f.metadata,f.confidence,f.provisional,f.locked,f.evidence_count,"
+            "e.kind AS kind,e.label AS label"
+            " FROM term_forms f JOIN term_entities e"
+            " ON e.entity_id=f.entity_id WHERE f.source=?", (source,)).fetchone()
+
+    def term_form(self, source: str) -> dict | None:
+        row = self._form_row(str(source or "").strip())
+        return self._legacy_form(row) if row is not None else None
+
+    def term_entity(self, value) -> dict | None:
+        if isinstance(value, int):
+            row = self._entity_row(value)
+            entity_id = value
+        else:
+            form = self.db.execute(
+                "SELECT entity_id FROM term_forms WHERE source=?",
+                (str(value),)).fetchone()
+            if form is None:
+                return None
+            entity_id = int(form["entity_id"])
+            row = self._entity_row(entity_id)
+        if row is None:
+            return None
+        return {
+            "entity_id": entity_id,
+            "label": row["label"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "confidence": int(row["confidence"]),
+            "locked": bool(row["locked"]),
+            "provenance": row["provenance"],
+            "forms": self.term_entity_forms(entity_id),
+        }
+
+    def term_entity_forms(self, entity_id: int) -> list[dict]:
+        return [self._legacy_form(row) for row in self.db.execute(
+            "SELECT f.source,f.entity_id,f.target,f.form_type,f.target_aliases,"
+            "f.metadata,f.confidence,f.provisional,f.locked,f.evidence_count,"
+            "e.kind AS kind FROM term_forms f JOIN term_entities e"
+            " ON e.entity_id=f.entity_id WHERE f.entity_id=? ORDER BY f.rowid",
+            (entity_id,))]
+
+    def link_term_form(self, source: str, entity_id: int, *,
+                       form_type: str | None = None,
+                       target: str | None = None,
+                       target_aliases: Iterable[str] | None = None) -> dict:
+        form = self._form_row(source)
+        if form is None:
+            raise KeyError(f"unknown glossary form: {source}")
+        if self._entity_row(entity_id) is None:
+            raise KeyError(f"unknown term entity: {entity_id}")
+        old_entity = int(form["entity_id"])
+        new_type = form_type or form["form_type"]
+        new_target = str(target or form["target"]).strip()
+        if not new_target:
+            raise ValueError("form target must not be empty")
+        aliases = ([value for value in _normalize_aliases(target_aliases)
+                    if value != new_target]
+                   if target_aliases is not None
+                   else _json_list(form["target_aliases"]))
+        with self.db:
+            self.db.execute(
+                "UPDATE term_forms SET entity_id=?,form_type=?,target=?,"
+                "target_aliases=?,updated_at=? WHERE source=?",
+                (entity_id, new_type, new_target,
+                 json.dumps(aliases, ensure_ascii=False), _now(), source))
+            self._refresh_entity(entity_id)
+            if old_entity != entity_id:
+                self._refresh_entity(old_entity)
+        self.event("term_form_linked", source=source, entity_id=entity_id,
+                   previous_entity_id=old_entity, form_type=new_type)
+        row = self._form_row(source)
+        return self._legacy_form(row) if row else {}
+
+    def merge_term_entities(self, source_a: str, source_b: str, *,
+                            label: str | None = None) -> dict | None:
+        a = self.db.execute("SELECT entity_id FROM term_forms WHERE source=?",
+                            (source_a,)).fetchone()
+        b = self.db.execute("SELECT entity_id FROM term_forms WHERE source=?",
+                            (source_b,)).fetchone()
+        if a is None or b is None:
+            raise KeyError("both source forms must exist")
+        first, second = int(a["entity_id"]), int(b["entity_id"])
+        if first == second:
+            return self.term_entity(first)
+
+        def score(entity_id: int):
+            entity = self._entity_row(entity_id)
+            forms = list(self.db.execute(
+                "SELECT confidence,locked FROM term_forms WHERE entity_id=?",
+                (entity_id,)))
+            return (bool(entity["locked"]),
+                    -min(int(row["confidence"]) for row in forms),
+                    len(forms), -entity_id)
+
+        target, donor = ((first, second) if score(first) >= score(second)
+                         else (second, first))
+        moved = self.db.execute(
+            "SELECT COUNT(*) FROM term_forms WHERE entity_id=?",
+            (donor,)).fetchone()[0]
+        with self.db:
+            self.db.execute("UPDATE term_forms SET entity_id=? WHERE entity_id=?",
+                            (target, donor))
+            if label:
+                self.db.execute(
+                    "UPDATE term_entities SET label=?,updated_at=?"
+                    " WHERE entity_id=?", (label, _now(), target))
+            self.db.execute("DELETE FROM term_entities WHERE entity_id=?",
+                            (donor,))
+            self._refresh_entity(target)
+        self.event("term_entity_merged", entity_id=target, donor_entity_id=donor,
+                   source_a=source_a, source_b=source_b, forms=moved)
+        return self.term_entity(target)
+
+    def term_target_conflicts(self, sources: Iterable[str] | None = None) -> list[dict]:
+        wanted = {str(source) for source in sources} if sources is not None else None
+        result = []
+        for row in self.db.execute(
+                "SELECT f.source,f.target,f.entity_id,o.source AS conflict_source,"
+                "o.entity_id AS conflict_entity_id"
+                " FROM term_forms f JOIN term_forms o"
+                " ON o.target=f.target AND o.source<>f.source"
+                " WHERE f.confidence=3 AND f.locked=0 AND f.provisional=0"
+                " AND (o.locked=1 OR o.provisional=1 OR o.confidence=1)"
+                " ORDER BY f.rowid"):
+            if wanted is not None and row["source"] not in wanted:
+                continue
+            result.append(dict(row))
+        return result
+
     def put_glossary(self, rows: Iterable[Mapping]):
         now = _now()
         with self.db:
@@ -390,102 +714,176 @@ class TranslationStore:
                     continue
                 kind = str(row.get("kind") or "other")
                 confidence = _normalize_confidence(row.get("confidence"))
-                aliases = _normalize_aliases(row.get("aliases"))
+                aliases = _normalize_aliases(
+                    row.get("aliases", row.get("target_aliases")))
                 locked = bool(row.get("locked", False))
-                existing = self.db.execute(
-                    "SELECT target,kind,confidence,aliases,locked,evidence_count"
-                    " FROM glossary WHERE source=?", (source,)).fetchone()
+                provisional = bool(row.get("provisional", False)) and not locked
+                if provisional:
+                    confidence = 1
+                form_type = str(row.get("form_type") or "other")
+                metadata = _json_dict(row.get("metadata"))
+                requested = row.get("entity_id")
+                requested_entity = None
+                if requested is not None:
+                    try:
+                        requested_entity = int(requested)
+                    except (TypeError, ValueError):
+                        requested_entity = None
+                existing = self._form_row(source)
                 if existing is None:
+                    entity_id = requested_entity
+                    if entity_id is None or self._entity_row(entity_id) is None:
+                        entity_id = self._create_entity(
+                            source, kind, confidence, locked, provisional,
+                            "glossary")
                     self.db.execute(
-                        "INSERT INTO glossary(source,target,kind,confidence,aliases,"
-                        "locked,evidence_count,updated_at) VALUES(?,?,?,?,?,?,1,?)",
-                        (source, target, kind, 1 if locked else confidence,
-                         json.dumps(aliases, ensure_ascii=False), 1 if locked else 0, now))
+                        "INSERT INTO term_forms(source,entity_id,target,form_type,"
+                        "target_aliases,metadata,confidence,provisional,locked,"
+                        "evidence_count,created_at,updated_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (source, entity_id, target, form_type,
+                         json.dumps(aliases, ensure_ascii=False),
+                         json.dumps(metadata, ensure_ascii=False),
+                         1 if locked else confidence, 1 if provisional else 0,
+                         1 if locked else 0, 1, now, now))
+                    self._refresh_entity(entity_id)
                     continue
-                old_aliases = []
-                try:
-                    old_aliases = [str(value) for value in
-                                   json.loads(existing["aliases"] or "[]")]
-                except (TypeError, ValueError):
-                    old_aliases = []
+                old_entity = int(existing["entity_id"])
+                entity_id = old_entity
+                if requested_entity is not None and requested_entity != old_entity:
+                    if self._entity_row(requested_entity) is not None:
+                        entity_id = requested_entity
+                old_aliases = _json_list(existing["target_aliases"])
                 merged_aliases = set(old_aliases) | set(aliases)
+                old_provisional = bool(existing["provisional"])
                 if existing["locked"]:
                     canonical = existing["target"]
                     confidence = 1
                     locked = True
+                    provisional = False
                 elif locked:
                     canonical = target
                     confidence = 1
-                elif existing["confidence"] <= confidence:
+                    provisional = False
+                elif old_provisional and not provisional:
+                    if confidence < 3:
+                        canonical = target
+                        provisional = False
+                    else:
+                        canonical = existing["target"]
+                        confidence = 1
+                        provisional = True
+                elif provisional and not old_provisional:
+                    if int(existing["confidence"]) >= 3:
+                        canonical = target
+                        confidence = 1
+                    else:
+                        canonical = existing["target"]
+                        confidence = int(existing["confidence"])
+                        provisional = False
+                elif int(existing["confidence"]) <= confidence:
                     canonical = existing["target"]
-                    confidence = existing["confidence"]
+                    confidence = int(existing["confidence"])
+                    provisional = old_provisional or provisional
                 else:
                     canonical = target
+                    provisional = provisional
                 merged_aliases.add(existing["target"])
                 merged_aliases.add(target)
                 merged_aliases.discard(canonical)
-                new_kind = existing["kind"]
-                if new_kind == "other" and kind != "other":
-                    new_kind = kind
+                new_type = existing["form_type"]
+                if new_type == "other" and form_type != "other":
+                    new_type = form_type
+                merged_metadata = {**_json_dict(existing["metadata"]), **metadata}
                 self.db.execute(
-                    "UPDATE glossary SET target=?,kind=?,confidence=?,aliases=?,"
+                    "UPDATE term_forms SET entity_id=?,target=?,form_type=?,"
+                    "target_aliases=?,metadata=?,confidence=?,provisional=?,"
                     "locked=?,evidence_count=?,updated_at=? WHERE source=?",
-                    (canonical, new_kind, confidence,
+                    (entity_id, canonical, new_type,
                      json.dumps(sorted(merged_aliases), ensure_ascii=False),
-                     1 if locked else 0, existing["evidence_count"] + 1, now, source))
+                     json.dumps(merged_metadata, ensure_ascii=False),
+                     confidence, 1 if provisional else 0, 1 if locked else 0,
+                     int(existing["evidence_count"]) + 1, now, source))
+                if kind != "other" and existing["kind"] == "other":
+                    self.db.execute(
+                        "UPDATE term_entities SET kind=? WHERE entity_id=?",
+                        (kind, entity_id))
+                self._refresh_entity(entity_id)
+                if old_entity != entity_id:
+                    self._refresh_entity(old_entity)
 
     def confirm_glossary_term(self, source: str, *, target: str | None = None,
                               aliases: Iterable[str] | None = None,
                               confidence: int = 1,
-                              locked: bool = True) -> dict:
-        """Explicitly confirm a term; this is the only path that creates a locked canonical."""
+                              locked: bool = True,
+                              provisional: bool = False) -> dict:
+        """Explicitly confirm a term or install a provisional canonical."""
         source = str(source or "").strip()
-        existing = self.db.execute(
-            "SELECT target,kind,confidence,aliases,locked FROM glossary WHERE source=?",
-            (source,)).fetchone()
+        existing = self._form_row(source)
         if existing is None:
             raise KeyError(f"unknown glossary term: {source}")
         target = str(target or existing["target"]).strip()
         if not target:
             raise ValueError("confirmed target must not be empty")
         if aliases is None:
-            try:
-                aliases = json.loads(existing["aliases"] or "[]")
-            except ValueError:
-                aliases = []
-        clean_aliases = sorted({str(value).strip() for value in aliases
-                                if str(value).strip() and str(value).strip() != target})
+            aliases = _json_list(existing["target_aliases"])
+        clean_aliases = [value for value in _normalize_aliases(aliases)
+                         if value != target]
         level = _normalize_confidence(confidence)
         if locked:
             level = 1
+            provisional = False
+        elif provisional:
+            level = 1
         with self.db:
             self.db.execute(
-                "UPDATE glossary SET target=?,confidence=?,aliases=?,locked=?,"
-                "updated_at=? WHERE source=?",
+                "UPDATE term_forms SET target=?,confidence=?,target_aliases=?,"
+                "locked=?,provisional=?,updated_at=? WHERE source=?",
                 (target, level, json.dumps(clean_aliases, ensure_ascii=False),
-                 1 if locked else 0, _now(), source))
-        value = dict(self.db.execute(
-            "SELECT source,target,kind,confidence,aliases,locked,evidence_count"
-            " FROM glossary WHERE source=?", (source,)).fetchone())
-        value["aliases"] = json.loads(value.get("aliases") or "[]")
-        value["locked"] = bool(value.get("locked"))
-        return value
+                 1 if locked else 0, 1 if provisional else 0, _now(), source))
+            self._refresh_entity(int(existing["entity_id"]))
+        return self._legacy_form(self._form_row(source))
+
+    def promote_provisional_terms(self, sources: Iterable[str]) -> list[dict]:
+        """Promote first-seen candidate targets to mandatory provisional canonicals."""
+        updated = []
+        conflicts = []
+        with self.db:
+            for source in dict.fromkeys(str(value).strip() for value in sources):
+                if not source:
+                    continue
+                row = self._form_row(source)
+                if (row is None or row["locked"] or row["provisional"] or
+                        int(row["confidence"]) != 3):
+                    continue
+                clash = self.term_target_conflicts([source])
+                if clash:
+                    conflicts.extend(clash)
+                    continue
+                self.db.execute(
+                    "UPDATE term_forms SET confidence=1,provisional=1,locked=0,"
+                    "updated_at=? WHERE source=?", (_now(), source))
+                self._refresh_entity(int(row["entity_id"]))
+                value = self._legacy_form(self._form_row(source))
+                value["confidence"] = 1
+                value["provisional"] = True
+                value["locked"] = False
+                updated.append(value)
+        for conflict in conflicts:
+            self.event("term_target_conflict", **conflict)
+        return updated
+
+    def glossary_count(self) -> int:
+        return int(self.db.execute("SELECT COUNT(*) FROM term_forms").fetchone()[0])
 
     def glossary(self, limit: int = 200) -> list[dict]:
         # First-seen order is append-only: new terms do not move existing ones,
         # so a growing glossary keeps a reusable prompt prefix.
-        result = []
-        for row in self.db.execute(
-                "SELECT source,target,kind,confidence,aliases,locked,evidence_count"
-                " FROM glossary ORDER BY rowid LIMIT ?", (limit,)):
-            value = dict(row)
-            try:
-                value["aliases"] = json.loads(value.get("aliases") or "[]")
-            except ValueError:
-                value["aliases"] = []
-            value["locked"] = bool(value.get("locked"))
-            result.append(value)
-        return result
+        return [self._legacy_form(row) for row in self.db.execute(
+            "SELECT f.source,f.entity_id,f.target,f.form_type,f.target_aliases,"
+            "f.metadata,f.confidence,f.provisional,f.locked,f.evidence_count,"
+            "e.kind AS kind FROM term_forms f JOIN term_entities e"
+            " ON e.entity_id=f.entity_id ORDER BY f.rowid LIMIT ?", (limit,))]
 
     def stats(self) -> dict:
         return {
@@ -519,6 +917,13 @@ class TranslationRunner:
         self.main_end = main_end
         self.glossary = list(glossary)
         workflow = project.config.workflow
+        self.translation_mode = getattr(workflow, "translation_mode", "batch")
+        self.pipeline_review_backlog = getattr(
+            workflow, "pipeline_review_backlog", 2)
+        self.pipeline_manual_backlog = getattr(
+            workflow, "pipeline_manual_backlog", 2)
+        self.adjudication_mode = getattr(
+            workflow, "adjudication_mode", "normal")
         self.history_chapters = (workflow.history_chapters
                                  if history_chapters is None else history_chapters)
         self.summary_every = (workflow.summary_every
@@ -540,6 +945,11 @@ class TranslationRunner:
         self.reference_chunk = (workflow.reference_chunk
                                 if reference_chunk is None else reference_chunk)
         self.max_term_checks = getattr(workflow, "max_term_checks", 50)
+        self.glossary_terms_per_chapter = getattr(
+            workflow, "glossary_terms_per_chapter", 5)
+        self.glossary_terms_base = getattr(workflow, "glossary_terms_base", 40)
+        self.glossary_max_continuations = getattr(
+            workflow, "glossary_max_continuations", 4)
         self.lookup_chapters = getattr(workflow, "lookup_chapters", 8)
         self.lookup_terms = getattr(workflow, "lookup_terms", 50)
         self.max_tool_rounds = getattr(workflow, "max_tool_rounds", 4)
@@ -645,7 +1055,10 @@ class TranslationRunner:
                 content={"summary": reference_summary},
                 review_mode="rebuild_only",
                 quality_labels=("rebuild_only", "reference"))
-        for row in self.store.summaries("target"):
+        accepted_summaries = self.store.summaries("target")
+        accepted_ranges = [(row["start_order"], row["end_order"])
+                           for row in accepted_summaries]
+        for row in accepted_summaries:
             start, end = row["start_order"], row["end_order"]
             ids = tuple(self.source(level).get("entry_id")
                         for level in range(start, end) if level in self.source_by_order)
@@ -659,6 +1072,22 @@ class TranslationRunner:
                 content={"summary": row["text"]},
                 review_mode="rebuild_only",
                 quality_labels=("rebuild_only", "target_summary"))
+        for row in self.store.summaries("target-provisional"):
+            start, end = row["start_order"], row["end_order"]
+            if any(a_start <= start and end <= a_end
+                   for a_start, a_end in accepted_ranges):
+                continue
+            ids = tuple(self.source(level).get("entry_id")
+                        for level in range(start, end) if level in self.source_by_order)
+            if not ids:
+                continue
+            artifact_id = f"target-provisional-summary-{start}-{end}"
+            artifacts[artifact_id] = Artifact(
+                artifact_id=artifact_id, kind="block", level=2,
+                source_ids=ids, status="provisional",
+                inputs=(InputRef("target-provisional", artifact_id),),
+                content={"summary": row["text"]},
+                quality_labels=("provisional_target_summary",))
         for level in sorted(self.reference_texts):
             if level >= self.continuation_start or level not in self.source_by_order:
                 continue
@@ -706,8 +1135,12 @@ class TranslationRunner:
         terms = [GlossaryTerm(row["source"], row["target"], row["kind"],
                               int(row.get("confidence", 2)),
                               tuple(row.get("aliases") or ()),
-                              bool(row.get("locked")))
-                 for row in self.store.glossary(limit=1000)]
+                              bool(row.get("locked")),
+                              bool(row.get("provisional")),
+                              row.get("entity_id"),
+                              str(row.get("form_type") or "other"))
+                 for row in self.store.glossary(limit=1_000_000)
+                 if row.get("form_type") != "title_pattern"]
         if order is None:
             return terms
         text = self.source(order).get("text", "")
@@ -796,12 +1229,14 @@ class TranslationRunner:
                   *, attempts: int | None = None, log_event: bool = True,
                   usage_sink: list | None = None,
                   tools: list[dict] | None = None,
-                  tool_choice: str | dict | None = None):
+                  tool_choice: str | dict | None = None,
+                  allow_truncated: bool = False):
         if attempts is None:
             attempts = self.project.config.limits.max_attempts
         request = GenerationRequest(messages, max_tokens=max_tokens,
                                     temperature=0, task=task,
-                                    tools=tools, tool_choice=tool_choice)
+                                    tools=tools, tool_choice=tool_choice,
+                                    allow_truncated=allow_truncated)
         last = None
         for attempt in range(attempts):
             started = time.monotonic()
@@ -812,6 +1247,8 @@ class TranslationRunner:
                           "elapsed": result.elapsed_seconds,
                           "request_id": result.request_id,
                           "max_tokens": request.max_tokens,
+                          "finish_reason": result.finish_reason,
+                          "truncated": result.finish_reason == "length",
                           "tool_calls": len(result.tool_calls)}
                 if log_event:
                     self.store.event("model", **record)
@@ -841,7 +1278,8 @@ class TranslationRunner:
                             messages,
                             max_tokens=min(capacity, request.max_tokens * 2),
                             temperature=0, task=task,
-                            tools=tools, tool_choice=tool_choice)
+                            tools=tools, tool_choice=tool_choice,
+                            allow_truncated=allow_truncated)
                         continue
                 if exc.kind in {"empty", "finish_reason"} and attempt + 1 < attempts:
                     time.sleep(1 + attempt)
@@ -928,8 +1366,78 @@ class TranslationRunner:
                             version=0, review={"protocol": parsed["profile"]},
                             assets=assets)
 
+    def _seed_title_patterns(self, drafts: Sequence[DraftChapter]):
+        for draft in drafts:
+            parsed = parse_title_pattern(draft.ja_title)
+            if parsed is None:
+                continue
+            key = title_pattern_key(parsed)
+            if self.store.term_form(key) is not None:
+                continue
+            target = parse_target_template(draft.title_zh, parsed.ordinal)
+            if target is None:
+                self.store.event("title_pattern_unparsed", order=draft.order,
+                                 source=draft.ja_title,
+                                 target=draft.title_zh)
+                continue
+            self.store.put_glossary([{
+                "source": key, "target": target.template,
+                "kind": "title_pattern", "form_type": "title_pattern",
+                "confidence": 1, "provisional": True,
+                "metadata": {"ordinal_style": target.style,
+                             "marker": parsed.marker,
+                             "suffix": parsed.suffix},
+            }])
+            self.store.event("title_pattern_created", order=draft.order,
+                             pattern=key, target=target.template)
+
+    def _apply_title_normalization(self, draft: DraftChapter) -> DraftChapter:
+        parsed = parse_title_pattern(draft.ja_title)
+        if parsed is None:
+            return draft
+        row = self.store.term_form(title_pattern_key(parsed))
+        if row is None or row.get("form_type") != "title_pattern":
+            return draft
+        style = (row.get("metadata") or {}).get("ordinal_style", "chinese")
+        rendered = render_title_template(row["target"], parsed.ordinal, style)
+        if not rendered or rendered == draft.title_zh:
+            return draft
+        self.store.event("title_pattern_applied", order=draft.order,
+                         pattern=title_pattern_key(parsed))
+        return replace(draft, title_zh=rendered)
+
+    def update_title_pattern(self, pattern_key: str, target: str, *,
+                             style: str | None = None) -> list[int]:
+        row = self.store.term_form(pattern_key)
+        if row is None or row.get("form_type") != "title_pattern":
+            raise KeyError(f"unknown title pattern: {pattern_key}")
+        self.store.confirm_glossary_term(
+            pattern_key, target=target, aliases=row.get("aliases"),
+            confidence=row.get("confidence", 1),
+            locked=row.get("locked", False),
+            provisional=row.get("provisional", True))
+        style = style or (row.get("metadata") or {}).get(
+            "ordinal_style", "chinese")
+        updated = []
+        for order in range(self.continuation_start, self.main_end):
+            chapter = self.store.chapter(order)
+            if chapter is None:
+                continue
+            parsed = parse_title_pattern(self.source(order)["raw_title"])
+            if parsed is None or title_pattern_key(parsed) != pattern_key:
+                continue
+            rendered = render_title_template(target, parsed.ordinal, style)
+            if rendered and rendered != chapter["title_zh"]:
+                self.store.set_title(order, rendered)
+                updated.append(order)
+        self.store.event("title_pattern_updated", pattern=pattern_key,
+                         target=target, chapters=updated)
+        return updated
+
     def translate_order(self, order: int) -> DraftChapter:
         draft = self._translate_draft(order, log_event=True)
+        self._seed_title_patterns([draft])
+        draft = self._apply_title_normalization(draft)
         version = self.store.put_draft(
             order=order, source_id=draft.source_id,
             source_hash=draft.source_hash, ja_title=draft.ja_title,
@@ -1015,11 +1523,15 @@ class TranslationRunner:
         }
 
     def _prior_target_text(self, order: int,
-                           accepted_texts: Mapping[int, str] | None = None
+                           accepted_texts: Mapping[int, str] | None = None,
+                           draft_texts: Mapping[int, str] | None = None
                            ) -> tuple[str | None, str]:
         if order < self.continuation_start:
             value = self.reference_texts.get(order)
             return value, "zh-reference" if value else "ja-source"
+        if draft_texts is not None and order in draft_texts:
+            if accepted_texts is None or order not in accepted_texts:
+                return draft_texts[order], "zh-provisional"
         if accepted_texts is not None:
             value = accepted_texts.get(order)
             return (value, "zh") if value is not None else (None, "ja-source")
@@ -1030,7 +1542,8 @@ class TranslationRunner:
 
     def _read_prior_chapter(self, order: int, current_order: int, budget: dict,
                             include_source: bool = False,
-                            accepted_texts: Mapping[int, str] | None = None) -> dict:
+                            accepted_texts: Mapping[int, str] | None = None,
+                            draft_texts: Mapping[int, str] | None = None) -> dict:
         if type(order) is not int or order < 0 or order >= current_order:
             raise ValueError("only prior edition_order values can be read")
         if order not in self.source_by_order:
@@ -1040,13 +1553,19 @@ class TranslationRunner:
                 raise ValueError("chapter lookup budget exhausted")
             budget["used_chapters"].add(order)
         source = self.source(order)
-        text, language = self._prior_target_text(order, accepted_texts)
+        text, language = self._prior_target_text(
+            order, accepted_texts, draft_texts)
         if text is None:
             text = source.get("text", "")
+        authority = ("provisional_draft" if language == "zh-provisional"
+                     else "accepted_target" if language == "zh"
+                     else "reference" if language == "zh-reference"
+                     else "source")
         limit = 12000
         truncated = len(text) > limit
         result = {"order": order, "title": source.get("raw_title", ""),
-                  "language": language, "text": text[:limit],
+                  "language": language, "authority": authority,
+                  "text": text[:limit],
                   "truncated": truncated, "budget": self._budget_view(budget)}
         if include_source and language != "ja-source":
             source_text = source.get("text", "")
@@ -1057,7 +1576,8 @@ class TranslationRunner:
     def _lookup_term(self, term: str, current_order: int, budget: dict,
                      limit: int = 5,
                      glossary_rows: Iterable[Mapping] | None = None,
-                     accepted_texts: Mapping[int, str] | None = None) -> dict:
+                     accepted_texts: Mapping[int, str] | None = None,
+                     draft_texts: Mapping[int, str] | None = None) -> dict:
         term = str(term or "").strip()
         if not term:
             raise ValueError("term must not be empty")
@@ -1067,15 +1587,35 @@ class TranslationRunner:
             budget["used_terms"].add(term)
         limit = max(1, min(int(limit or 5), 10))
         rows = (glossary_rows if glossary_rows is not None
-                else self.store.glossary(limit=1000))
+                else self.store.glossary(limit=1_000_000))
+        entity_forms = {}
+        for candidate in rows:
+            entity_id = candidate.get("entity_id")
+            if entity_id is not None:
+                entity_forms.setdefault(entity_id, []).append(candidate)
         glossary = []
         for row in rows:
             aliases = [str(value) for value in (row.get("aliases") or [])]
             if term not in {row["source"], row["target"], *aliases}:
                 continue
-            glossary.append({"source": row["source"], "target": row["target"],
-                             "kind": row["kind"], "confidence": row.get("confidence", 2),
-                             "aliases": aliases, "locked": bool(row.get("locked"))})
+            value = {
+                "source": row["source"], "target": row["target"],
+                "kind": row["kind"], "confidence": row.get("confidence", 2),
+                "aliases": aliases, "locked": bool(row.get("locked")),
+                "provisional": bool(row.get("provisional")),
+                "entity_id": row.get("entity_id"),
+                "form_type": row.get("form_type", "other"),
+            }
+            entity_id = row.get("entity_id")
+            if entity_id is not None:
+                value["entity_forms"] = [
+                    {"source": form["source"], "target": form["target"],
+                     "form_type": form.get("form_type", "other"),
+                     "confidence": form.get("confidence", 2),
+                     "provisional": bool(form.get("provisional")),
+                     "locked": bool(form.get("locked"))}
+                    for form in entity_forms.get(entity_id, [])[:20]]
+            glossary.append(value)
         reference_orders = list(range(0, min(self.continuation_start, current_order)))
         if accepted_texts is not None:
             accepted_orders = sorted(
@@ -1084,13 +1624,24 @@ class TranslationRunner:
         else:
             accepted_orders = [order for order in self.store.accepted_orders()
                                if self.continuation_start <= order < current_order]
+        accepted_set = set(accepted_orders)
+        draft_orders = sorted(
+            order for order in (draft_texts or {})
+            if self.continuation_start <= order < current_order
+            and order not in accepted_set)
+        groups = (
+            ("reference", reference_orders),
+            ("accepted_target", list(reversed(accepted_orders))),
+            ("provisional_draft", list(reversed(draft_orders))),
+        )
         hits = []
-        for group in (reference_orders, list(reversed(accepted_orders))):
+        for authority, group in groups:
             for order in group:
                 if len(hits) >= limit:
                     break
                 source_text = str(self.source(order).get("text", ""))
-                target_text, language = self._prior_target_text(order, accepted_texts)
+                target_text, language = self._prior_target_text(
+                    order, accepted_texts, draft_texts)
                 if term not in source_text and (not target_text or term not in target_text):
                     continue
                 source_paragraph = next(
@@ -1107,6 +1658,7 @@ class TranslationRunner:
                     "order": order,
                     "title": self.source(order).get("raw_title", ""),
                     "language": language,
+                    "authority": authority,
                     "source": source_paragraph[:500],
                     "target": target_paragraph[:1000],
                 })
@@ -1121,6 +1673,8 @@ class TranslationRunner:
         safe_args = {}
         accepted_texts = (tool_context.get("accepted_texts")
                           if tool_context is not None else None)
+        draft_texts = (tool_context.get("draft_texts")
+                       if tool_context is not None else None)
         glossary_rows = (tool_context.get("glossary")
                          if tool_context is not None else None)
         try:
@@ -1134,12 +1688,14 @@ class TranslationRunner:
                 result = self._read_prior_chapter(
                     args.get("order"), current_order, budget,
                     include_source=bool(args.get("include_source", False)),
-                    accepted_texts=accepted_texts)
+                    accepted_texts=accepted_texts,
+                    draft_texts=draft_texts)
             elif name == "lookup_term":
                 result = self._lookup_term(args.get("term", ""), current_order,
                                            budget, limit=args.get("limit", 5),
                                            glossary_rows=glossary_rows,
-                                           accepted_texts=accepted_texts)
+                                           accepted_texts=accepted_texts,
+                                           draft_texts=draft_texts)
             else:
                 result = {"error": "unknown tool", "name": name,
                           "budget": self._budget_view(budget)}
@@ -1177,7 +1733,8 @@ class TranslationRunner:
             # read-only snapshot so they never touch the SQLite connection.
             tool_context = {
                 "accepted_texts": self.store.translations(),
-                "glossary": self.store.glossary(limit=1000),
+                "draft_texts": self.store.draft_translations(),
+                "glossary": self.store.glossary(limit=1_000_000),
                 "events": [],
                 "buffer_events": False,
             }
@@ -1185,17 +1742,28 @@ class TranslationRunner:
         # that changes between review/revision rounds, so it goes last.
         glossary_cards = [{"source": term.source, "target": term.target,
                            "kind": term.kind, "confidence": term.confidence,
-                           "aliases": list(term.aliases), "locked": term.locked}
+                           "aliases": list(term.aliases), "locked": term.locked,
+                           "provisional": term.provisional,
+                           "entity_id": term.entity_id,
+                           "form_type": term.form_type}
                           for term in glossary]
         term_checks = _build_term_checks(rows, draft.paragraphs, glossary,
                                          getattr(self, "max_term_checks", 50))
         expected_checks = {check["id"]: check for check in term_checks}
+        source_text = "\n".join(row["text"] for row in rows)
+        if tool_context is None:
+            term_conflicts = self.store.term_target_conflicts(
+                [term.source for term in glossary
+                 if term.source in source_text])[:20]
+        else:
+            term_conflicts = list(tool_context.get("term_conflicts") or ())[:20]
         budget = {"max_chapters": self.lookup_chapters,
                   "max_terms": self.lookup_terms,
                   "used_chapters": set(), "used_terms": set()}
         context = {
             "glossary": glossary_cards,
             "term_checks": term_checks,
+            "term_conflicts": term_conflicts,
             "lookup_budget": self._budget_view(budget),
             "chapter": {"order": draft.order, "ja_title": draft.ja_title,
                         "zh_title": draft.title_zh},
@@ -1216,6 +1784,8 @@ class TranslationRunner:
              "最后独占一行@@END。没有问题时也必须输出SUMMARY。"
              "可使用 read_chapter / lookup_term 工具核对既往译名，预算见 lookup_budget；"
              "不要用 needs_lookup 字段代替实际工具调用。"
+             + (("term_conflicts 是程序检测到的候选形式与其它形式 canonical 冲突；"
+                 "必须逐项核对并输出 term FINDING，不得直接替换正文。") if term_conflicts else "")
              + (("term_checks 非空时，必须为每个 id 输出一条 @@TERMCHECK：\n"
                  "@@TERMCHECK tc001\ncheck: tc001\nverdict: ok|violation|uncertain\n"
                  "reason: 具体依据\n"
@@ -1388,6 +1958,9 @@ class TranslationRunner:
                 "aliases": list(expected_row.get("aliases") or []),
                 "confidence": expected_row.get("confidence"),
                 "locked": bool(expected_row.get("locked")),
+                "provisional": bool(expected_row.get("provisional")),
+                "entity_id": expected_row.get("entity_id"),
+                "form_type": expected_row.get("form_type"),
                 "status": expected_row.get("status", ""),
                 "occurrence_count": expected_row.get("occurrence_count", 0),
                 "occurrences": list(expected_row.get("occurrences") or []),
@@ -1419,6 +1992,9 @@ class TranslationRunner:
             "aliases": check.get("aliases") or [],
             "status": check.get("status"), "confidence": check.get("confidence"),
             "locked": check.get("locked"),
+            "provisional": check.get("provisional"),
+            "entity_id": check.get("entity_id"),
+            "form_type": check.get("form_type"),
             "occurrence_count": check.get("occurrence_count"),
             "verdict": check.get("verdict"),
             "source_ref": check.get("source_ref"),
@@ -1509,7 +2085,8 @@ class TranslationRunner:
             "term_checks": [
                 {key: check.get(key) for key in (
                     "id", "term", "canonical", "aliases", "status", "confidence",
-                    "locked", "occurrence_count", "verdict")}
+                    "locked", "provisional", "entity_id", "form_type",
+                    "occurrence_count", "verdict")}
                 for check in review.term_checks
                 if check.get("verdict") == "violation"],
             "confirmed_findings": [
@@ -1704,11 +2281,14 @@ class TranslationRunner:
         if tool_context is None:
             tool_context = {
                 "accepted_texts": {},
+                "draft_texts": {},
                 "glossary": [{
                     "source": term.source, "target": term.target,
                     "kind": term.kind, "confidence": term.confidence,
                     "aliases": list(term.aliases), "locked": term.locked,
+                    "provisional": term.provisional,
                 } for term in glossary],
+                "term_conflicts": [],
                 "events": [],
                 "buffer_events": True,
             }
@@ -1747,7 +2327,10 @@ class TranslationRunner:
                          if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
             major = self._revision_findings(confirmed, review)
             rounds += 1
-        return {"status": "blocked" if major else "accepted",
+        status = ("accepted" if not major else
+                  "manual_review" if self.adjudication_mode == "strict"
+                  else "blocked")
+        return {"status": status,
                 "draft": draft, "review": review, "decisions": decisions,
                 "rounds": rounds, "usages": usages,
                 "tool_events": tool_context.get("events", []),
@@ -1766,6 +2349,448 @@ class TranslationRunner:
             "accepted_with_major": result.get("major", []),
             "text_hash": digest(result["draft"].text),
         }
+
+    def _translate_pipeline_batch(
+            self, batch: Sequence[int], trans_pool: ThreadPoolExecutor,
+            *, prior_drafts: Mapping[int, str]):
+        self._check_limits()
+        documents = self.documents(max(batch) + 1,
+                                   provisional=prior_drafts)
+        snapshot = self.snapshot(batch[0], documents,
+                                 provisional_orders=prior_drafts.keys())
+        glossary = self.ensure_batch_glossary(batch, provisional=True)
+        unresolved = self._unresolved()
+        jobs = {}
+
+        def submit(order):
+            usages = []
+            return (trans_pool.submit(
+                self._translate_draft, order,
+                documents=documents, snapshot=snapshot,
+                batch_orders=batch, glossary=glossary,
+                unresolved_prior=unresolved, provisional=prior_drafts,
+                log_event=False, usage_sink=usages), usages)
+
+        if len(batch) > 1:
+            warm = submit(batch[-1])
+            jobs[batch[-1]] = warm
+            try:
+                warm[0].result()
+            except Exception:
+                pass
+        for order in batch:
+            if order not in jobs:
+                jobs[order] = submit(order)
+        drafts, error = [], None
+        for order in batch:
+            job, usages = jobs[order]
+            try:
+                draft = job.result()
+            except Exception as exc:
+                for usage in usages:
+                    self.store.event("model", **usage)
+                if error is None:
+                    error = (order, type(exc).__name__, str(exc))
+                continue
+            for usage in usages:
+                self.store.event("model", **usage)
+            drafts.append(draft)
+        self._seed_title_patterns(drafts)
+        written = []
+        for draft in drafts:
+            draft = self._apply_title_normalization(draft)
+            version = self.store.put_draft(
+                order=draft.order, source_id=draft.source_id,
+                source_hash=draft.source_hash, ja_title=draft.ja_title,
+                title_zh=draft.title_zh, text=draft.text,
+                status="draft", review=draft.review, assets=draft.assets)
+            draft = replace(draft, version=version)
+            self.store.event("translate", order=draft.order, version=version,
+                             paragraphs=len(draft.paragraphs))
+            written.append(draft)
+        if error:
+            order, reason, message = error
+            row = self.store.chapter(order)
+            if row:
+                self.store.set_status(order, "blocked",
+                                      {"error": reason, "message": message})
+            self.store.event("blocked", order=order,
+                             reason="translation_" + reason)
+            raise ChapterBlocked(
+                reason, f"chapter {order} translation failed",
+                details={"order": order, "batch": list(batch)})
+        return written, glossary, unresolved
+
+    def _start_pipeline_reviews(self, drafts, review_pool,
+                                *, accepted_texts, glossary, unresolved):
+        all_drafts = self.store.provisional_translations()
+        batch_source = "\n".join(self.source(draft.order)["text"]
+                                 for draft in drafts)
+        conflict_sources = [
+            row["source"] for row in self.store.glossary(limit=1_000_000)
+            if row["source"] in batch_source]
+        term_conflicts = self.store.term_target_conflicts(
+            conflict_sources)[:20]
+        jobs = []
+        for draft in drafts:
+            draft_texts = {order: text for order, text in all_drafts.items()
+                           if order < draft.order}
+            history = self._history_pairs(draft.order,
+                                          provisional=draft_texts)
+            context = {
+                "accepted_texts": accepted_texts,
+                "draft_texts": draft_texts,
+                "glossary": self.store.glossary(limit=1_000_000),
+                "term_conflicts": term_conflicts,
+                "events": [],
+                "buffer_events": True,
+            }
+            jobs.append((draft, review_pool.submit(
+                self._process_draft, draft, history=history,
+                glossary=glossary, unresolved_prior=unresolved,
+                max_revisions=self.max_revisions,
+                tool_context=context)))
+        return jobs
+
+    def _drain_review_jobs(self, jobs, start: int = 0):
+        for _, job in jobs[start:]:
+            try:
+                result = job.result()
+            except Exception:
+                continue
+            for event in result.get("tool_events") or []:
+                self.store.event("review_tool", **event)
+            for usage in result.get("usages") or []:
+                self.store.event("model", **usage)
+
+    def _write_pipeline_result(self, draft, result, status, results):
+        review_data = (result.get("review") and self._review_data(result)) or {
+            "error": status, "message": result.get("message", "")}
+        final = result["draft"]
+        if final.text == draft.text and status in {"accepted", "ready",
+                                                   "manual_review"}:
+            self.store.set_status(final.order, status, review_data)
+            version = draft.version
+        else:
+            version = self.store.put_draft(
+                order=final.order, source_id=final.source_id,
+                source_hash=final.source_hash,
+                ja_title=final.ja_title, title_zh=final.title_zh,
+                text=final.text, status=status,
+                review=review_data, assets=final.assets)
+        if status == "accepted":
+            self.store.event("accept", order=final.order, version=version,
+                             rounds=result.get("rounds", 0),
+                             findings=len(result.get("review").findings)
+                             if result.get("review") else 0)
+        elif status == "ready":
+            self.store.event("ready", order=final.order, version=version,
+                             rounds=result.get("rounds", 0))
+        elif status == "manual_review":
+            self.store.event(
+                "manual_review_required", order=final.order, version=version,
+                major=result.get("major") or [],
+                findings=len(result.get("review").findings)
+                if result.get("review") else 0)
+        else:
+            self.store.event("blocked", order=final.order, reason=status)
+        results.append({
+            "order": final.order, "status": status,
+            "rounds": result.get("rounds", 0),
+            "findings": len(result.get("review").findings)
+            if result.get("review") else 0})
+        return version
+
+    def _finish_pipeline_reviews(self, drafts, jobs, results, *,
+                                 accept: bool = True):
+        collected = []
+        for draft, job in jobs:
+            try:
+                result = job.result()
+            except Exception as exc:
+                result = {"status": "error", "draft": draft,
+                          "usages": [], "message": str(exc),
+                          "review": None, "decisions": {}, "rounds": 0}
+            for event in result.get("tool_events") or []:
+                self.store.event("review_tool", **event)
+            for usage in result.get("usages", []):
+                self.store.event("model", **usage)
+            collected.append((draft, result))
+        hard = [(draft, result) for draft, result in collected
+                if result["status"] not in {"accepted", "manual_review"}]
+        manual = any(result["status"] == "manual_review"
+                     for _, result in collected)
+        hold = manual or not accept
+        for draft, result in collected:
+            status = result["status"]
+            if status in {"accepted", "manual_review"} and not hard:
+                target = ("manual_review" if status == "manual_review"
+                          else "ready" if hold else "accepted")
+            elif status == "manual_review":
+                target = "manual_review"
+            elif status == "accepted":
+                target = "ready"
+            else:
+                target = "blocked"
+            self._write_pipeline_result(draft, result, target, results)
+        if hard:
+            return {"blocked": (hard[0][0].order, hard[0][1]["status"]),
+                    "manual": manual, "hold": hold}
+        return {"blocked": None, "manual": manual, "hold": hold}
+
+    def _finish_oldest_pipeline_batch(self, pending, results, *,
+                                      hold_acceptance: bool = False):
+        if not pending:
+            return None
+        batch, drafts, jobs = pending.popleft()
+        outcome = self._finish_pipeline_reviews(
+            drafts, jobs, results, accept=not hold_acceptance)
+        status = ("blocked" if outcome["blocked"] else
+                  "manual_review" if outcome["manual"] else
+                  "ready" if hold_acceptance else "accepted")
+        self.store.event(
+            "pipeline_batch", start=batch[0], end=batch[-1] + 1,
+            status=status)
+        return outcome
+
+    def _drain_pending_pipeline_batches(self, pending):
+        while pending:
+            _, _, jobs = pending.popleft()
+            self._drain_review_jobs(jobs)
+
+    def manual_review_queue(self) -> list[dict]:
+        result = []
+        for row in self.store.db.execute(
+                "SELECT * FROM chapters WHERE status='manual_review'"
+                " ORDER BY edition_order"):
+            review = _json_dict(row["review"])
+            result.append({
+                "order": row["edition_order"],
+                "title": row["title_zh"],
+                "version": row["version"],
+                "findings": review.get("findings") or [],
+                "major": review.get("accepted_with_major") or [],
+                "review": review,
+            })
+        return result
+
+    def accept_ready_prefix(self) -> list[int]:
+        accepted = []
+        for order in range(self.continuation_start, self.main_end):
+            row = self.store.chapter(order)
+            if row is None:
+                break
+            if row["status"] == "accepted":
+                continue
+            if row["status"] != "ready":
+                break
+            review = _json_dict(row["review"])
+            self.store.set_status(order, "accepted", review)
+            self.store.event("accept_ready", order=order,
+                             version=row["version"])
+            accepted.append(order)
+        return accepted
+
+    def resolve_manual_review(self, order: int, *, decision: str,
+                              text: str | None = None,
+                              notes: str = "",
+                              term_changes=None) -> dict | None:
+        row = self.store.chapter(order)
+        if row is None:
+            raise KeyError(f"unknown chapter: {order}")
+        if decision not in {"accept", "revise", "blocked"}:
+            raise ValueError("decision must be accept, revise or blocked")
+        review = _json_dict(row["review"])
+        if decision == "accept":
+            review["manual_override"] = True
+            review["manual_notes"] = notes
+            if text is not None and text != row["text"]:
+                version = self.store.put_draft(
+                    order=order, source_id=row["source_id"],
+                    source_hash=row["source_hash"], ja_title=row["ja_title"],
+                    title_zh=row["title_zh"], text=text, status="accepted",
+                    review=review, assets=_json_dict(row["assets"]))
+            else:
+                self.store.set_status(order, "accepted", review)
+                version = row["version"]
+            self.store.event("manual_review_resolved", order=order,
+                             decision="accept", notes=notes,
+                             version=version)
+            self.accept_ready_prefix()
+        elif decision == "revise":
+            if text is not None:
+                version = self.store.put_draft(
+                    order=order, source_id=row["source_id"],
+                    source_hash=row["source_hash"], ja_title=row["ja_title"],
+                    title_zh=row["title_zh"], text=text, status="draft",
+                    review=review, assets=_json_dict(row["assets"]))
+            else:
+                self.store.set_status(order, "draft", review)
+                version = row["version"]
+            self.store.event("manual_review_resolved", order=order,
+                             decision="revise", notes=notes, version=version)
+        else:
+            self.store.set_status(order, "blocked", review)
+            self.store.event("manual_review_resolved", order=order,
+                             decision="blocked", notes=notes,
+                             version=row["version"])
+        if term_changes:
+            if isinstance(term_changes, Mapping):
+                changes = term_changes.items()
+            else:
+                changes = ((item.get("source"), item) for item in term_changes)
+            for source, change in changes:
+                if not source or not isinstance(change, Mapping):
+                    continue
+                old = self.store.term_form(str(source))
+                old_target = old["target"] if old else None
+                target = change.get("target")
+                if not target:
+                    continue
+                if old and old.get("form_type") == "title_pattern":
+                    self.update_title_pattern(str(source), str(target))
+                    continue
+                self.store.confirm_glossary_term(
+                    str(source), target=str(target),
+                    aliases=change.get("aliases"),
+                    confidence=int(change.get("confidence", 1)),
+                    locked=bool(change.get("locked", False)),
+                    provisional=bool(change.get("provisional", False)))
+                if old_target and old_target != target:
+                    self.store.mark_term_revisions(
+                        old_target, reason="manual term change")
+        return self.store.chapter(order)
+
+    def run_pipelined(self, start: int | None = None,
+                      end: int | None = None, *,
+                      translation_concurrency: int | None = None,
+                      review_concurrency: int | None = None,
+                      batch_size: int | None = None,
+                      pipeline_review_backlog: int | None = None,
+                      pipeline_manual_backlog: int | None = None,
+                      update_summaries: bool = True) -> dict:
+        """Translate ahead of review using draft-based provisional indexes."""
+        workflow = self.project.config.workflow
+        translation_concurrency = (
+            workflow.translation_concurrency
+            if translation_concurrency is None else translation_concurrency)
+        review_concurrency = (workflow.review_concurrency
+                              if review_concurrency is None else review_concurrency)
+        batch_size = workflow.batch_size if batch_size is None else batch_size
+        backlog = (self.pipeline_review_backlog
+                   if pipeline_review_backlog is None
+                   else pipeline_review_backlog)
+        manual_backlog = (self.pipeline_manual_backlog
+                          if pipeline_manual_backlog is None
+                          else pipeline_manual_backlog)
+        if (translation_concurrency < 1 or review_concurrency < 1 or
+                batch_size < 1 or backlog < 1 or manual_backlog < 1):
+            raise ValueError(
+                "concurrency, batch_size and pipeline backlogs must be positive")
+        start = self.continuation_start if start is None else start
+        end = self.main_end if end is None else end
+        if self.adjudication_mode == "strict":
+            self.accept_ready_prefix()
+        statuses = {row["edition_order"]: row["status"]
+                    for row in self.store.db.execute(
+                        "SELECT edition_order,status FROM chapters")}
+        orders = [order for order in range(max(start, self.continuation_start), end)
+                  if order in self.source_by_order
+                  and not _is_extra_title(self.source(order)["raw_title"])
+                  and statuses.get(order) not in
+                  {"accepted", "manual_review", "ready", "stale"}]
+        batches = [orders[index:index + batch_size]
+                   for index in range(0, len(orders), batch_size)]
+        results = []
+        pending = deque()
+        blocked = None
+        hold_acceptance = any(
+            status == "manual_review" for status in statuses.values())
+        manual_holds = sum(1 for status in statuses.values()
+                           if status == "manual_review")
+        waiting_manual = False
+        with ThreadPoolExecutor(max_workers=max(1, translation_concurrency)) as trans_pool, \
+                ThreadPoolExecutor(max_workers=max(1, review_concurrency)) as review_pool:
+            for batch in batches:
+                if blocked:
+                    break
+                while len(pending) >= backlog:
+                    outcome = self._finish_oldest_pipeline_batch(
+                        pending, results,
+                        hold_acceptance=hold_acceptance)
+                    if outcome is None:
+                        break
+                    if outcome["blocked"]:
+                        blocked = outcome["blocked"]
+                        break
+                    if outcome["manual"]:
+                        manual_holds += 1
+                    hold_acceptance = hold_acceptance or outcome["manual"]
+                if blocked:
+                    break
+                if manual_holds >= manual_backlog and self.manual_review_queue():
+                    waiting_manual = True
+                    break
+                accepted_now = set(self.store.accepted_orders())
+                prior_drafts = {
+                    order: text for order, text in
+                    self.store.provisional_translations().items()
+                    if order < batch[0] and order not in accepted_now}
+                try:
+                    drafts, glossary, unresolved = self._translate_pipeline_batch(
+                        batch, trans_pool, prior_drafts=prior_drafts)
+                except ChapterBlocked as exc:
+                    blocked = (exc.details.get("order"), exc.code)
+                    break
+                accepted_texts = self.store.translations()
+                jobs = self._start_pipeline_reviews(
+                    drafts, review_pool, accepted_texts=accepted_texts,
+                    glossary=glossary, unresolved=unresolved)
+                self.materialize_provisional_index(
+                    batch, {draft.order: draft.text for draft in drafts})
+                pending.append((batch, drafts, jobs))
+            if blocked:
+                self._drain_pending_pipeline_batches(pending)
+            else:
+                while pending:
+                    outcome = self._finish_oldest_pipeline_batch(
+                        pending, results,
+                        hold_acceptance=hold_acceptance)
+                    if outcome is None:
+                        break
+                    if outcome["blocked"]:
+                        blocked = outcome["blocked"]
+                        self._drain_pending_pipeline_batches(pending)
+                        break
+                    if outcome["manual"]:
+                        manual_holds += 1
+                    hold_acceptance = hold_acceptance or outcome["manual"]
+            if update_summaries and not blocked:
+                self.update_target_summary()
+        if blocked:
+            order, reason = blocked
+            raise ChapterBlocked(
+                str(reason), f"chapter {order} blocked in pipelined mode",
+                details={"order": order})
+        ready = int(self.store.db.execute(
+            "SELECT COUNT(*) FROM chapters WHERE status='ready'").fetchone()[0])
+        return {"mode": "pipelined", "start": start, "end": end,
+                "chapters": len(results),
+                "accepted": len(self.store.accepted_orders()),
+                "manual_review": len(self.manual_review_queue()),
+                "ready": ready, "waiting_manual": waiting_manual,
+                "results": results, "review_backlog": backlog,
+                "manual_backlog": manual_backlog,
+                "stats": self.store.stats()}
+
+    def run_mode(self, start: int | None = None, end: int | None = None,
+                 *, mode: str | None = None, **kwargs) -> dict:
+        selected = mode or self.translation_mode
+        if selected == "pipelined":
+            return self.run_pipelined(start=start, end=end, **kwargs)
+        if selected == "batch":
+            return self.run_concurrent(start=start, end=end, **kwargs)
+        raise ValueError(f"unknown translation mode: {selected}")
 
     def run_concurrent(self, start: int | None = None, end: int | None = None,
                        *, translation_concurrency: int | None = None,
@@ -1814,9 +2839,17 @@ class TranslationRunner:
                 unresolved = self._unresolved()
                 # Read-only snapshot for review tools. Workers must not use
                 # the store connection, which belongs to the main thread.
+                batch_source = "\n".join(
+                    self.source(order)["text"] for order in batch)
+                conflict_sources = [
+                    row["source"] for row in self.store.glossary(limit=1_000_000)
+                    if row["source"] in batch_source]
                 tool_snapshot = {
                     "accepted_texts": self.store.translations(),
-                    "glossary": self.store.glossary(limit=1000),
+                    "draft_texts": {},
+                    "glossary": self.store.glossary(limit=1_000_000),
+                    "term_conflicts": self.store.term_target_conflicts(
+                        conflict_sources)[:20],
                 }
                 translation_jobs = {}
 
@@ -1855,15 +2888,22 @@ class TranslationRunner:
                         continue
                     for usage in usages:
                         self.store.event("model", **usage)
+                    drafts.append(draft)
+                self._seed_title_patterns(drafts)
+                written = []
+                for draft in drafts:
+                    draft = self._apply_title_normalization(draft)
                     version = self.store.put_draft(
-                        order=order, source_id=draft.source_id,
+                        order=draft.order, source_id=draft.source_id,
                         source_hash=draft.source_hash, ja_title=draft.ja_title,
                         title_zh=draft.title_zh, text=draft.text,
                         status="draft", review=draft.review, assets=draft.assets)
                     draft = replace(draft, version=version)
-                    self.store.event("translate", order=order, version=version,
+                    self.store.event("translate", order=draft.order,
+                                     version=version,
                                      paragraphs=len(draft.paragraphs))
-                    drafts.append(draft)
+                    written.append(draft)
+                drafts = written
                 if translation_error:
                     order, reason, message = translation_error
                     row = self.store.chapter(order)
@@ -1963,6 +3003,43 @@ class TranslationRunner:
             return order
         return self.main_end
 
+    def materialize_provisional_index(
+            self, batch_orders: Sequence[int],
+            drafts: Mapping[int, str]) -> str:
+        """Materialize a draft-based index block for downstream batches."""
+        orders = sorted(order for order in batch_orders
+                        if order in drafts and order in self.source_by_order)
+        if not orders:
+            return ""
+        start, end = orders[0], orders[-1] + 1
+        blocks = [f"### {self.source(order)['raw_title']}\n{drafts[order]}"
+                  for order in orders]
+        text = "\n\n".join(blocks)
+        fallback = "\n".join(
+            f"- {self.source(order)['raw_title']}: {drafts[order][:300]}"
+            for order in orders)
+        try:
+            result = self._generate([
+                {"role": "system", "content":
+                 "你是严谨的轻小说资料整理员，只输出中文摘要。"},
+                {"role": "user", "content":
+                 "下面是同一批次尚未审校的中文草稿。请输出用于后续续译的"
+                 "连续摘要，覆盖人物、地点、事件、专有名词、术语用词、关系和"
+                 "未决线索；不得编造原文没有的内容。\n\n" + text},
+            ], self.summary_tokens, f"provisional_summary_{start}_{end}")
+            summary = result.text
+            used_fallback = False
+        except (PipelineError, ProviderError, ValueError):
+            summary = fallback
+            used_fallback = True
+        self.store.put_summary("target-provisional", start, end, summary)
+        self.store.event("index_block", start=start, end=end,
+                         scope="target-provisional", status="provisional",
+                         chars=len(summary), fallback=used_fallback)
+        self.store.event("batch_indexed", start=start, end=end,
+                         scope="target-provisional")
+        return summary
+
     def update_target_summary(self, *, force: bool = False) -> str | None:
         end = self.contiguous_accepted_end() - self.summary_lag
         if end <= self._last_summary_end:
@@ -2043,20 +3120,104 @@ class TranslationRunner:
                              end=self.continuation_start)
         return previous or None
 
+    def _glossary_cap(self, chapter_count: int) -> int:
+        """Linear term budget: w * effective chapters + b."""
+        return (self.glossary_terms_per_chapter * max(0, int(chapter_count)) +
+                self.glossary_terms_base)
+
+    def _extract_terms(self, *, system: str, prompt: str, task: str,
+                       max_terms: int, max_tokens: int | None = None,
+                       log_event: bool = True) -> tuple[list[dict], dict]:
+        """Extract @@TERM records, continuing after truncated responses."""
+        max_terms = max(1, int(max_terms))
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt},
+        ]
+        records: dict[str, dict] = {}
+        rounds = 0
+        truncated = complete = missing_end = cap_reached = no_progress = False
+        errors: list[str] = []
+        while True:
+            result = self._generate(
+                messages, max_tokens or self.glossary_tokens, task,
+                log_event=log_event, allow_truncated=True)
+            parsed = parse_term_records(result.text)
+            new_records = 0
+            for row in parsed.records:
+                if row["source"] in records:
+                    continue
+                records[row["source"]] = row
+                new_records += 1
+            errors.extend(parsed.errors)
+            if parsed.complete:
+                complete = True
+                cap_reached = len(records) >= max_terms
+                break
+            if len(records) >= max_terms:
+                cap_reached = True
+                break
+            if result.finish_reason != "length":
+                missing_end = True
+                break
+            truncated = True
+            if new_records == 0:
+                no_progress = True
+                break
+            if rounds >= self.glossary_max_continuations:
+                break
+            remaining = max(0, max_terms - len(records))
+            if parsed.trimmed.strip():
+                messages.append({"role": "assistant",
+                                 "content": parsed.trimmed})
+                instruction = (
+                    "上一次输出在记录中途被截断。请丢弃未完成的最后一条记录，"
+                    "从下一条记录继续；不要重复已经给出的记录。只输出 @@TERM "
+                    "记录，全部完成后单独一行输出 @@END。"
+                    f"已有 {len(records)} 条，剩余最多 {remaining} 条。")
+            else:
+                instruction = (
+                    "上一次输出在第一条记录中途被截断。请丢弃未完成的记录，"
+                    "从该条记录的开头重新输出完整记录，然后继续；不要解释，"
+                    "也不要重复已经给出的记录。"
+                    f"本批最多 {max_terms} 项，全部完成后单独一行输出 @@END。")
+            messages.append({"role": "user", "content": instruction})
+            rounds += 1
+        stats = {
+            "records": len(records), "cap": max_terms, "rounds": rounds,
+            "truncated": truncated, "complete": complete,
+            "missing_end": missing_end, "cap_reached": cap_reached,
+            "no_progress": no_progress,
+            "errors": list(dict.fromkeys(errors))[:12],
+        }
+        return list(records.values()), stats
+
     def ensure_glossary(self, *, force: bool = False) -> list[dict]:
         complete = self.store.db.execute(
-            "SELECT 1 FROM events WHERE kind='glossary_complete' LIMIT 1").fetchone()
+            "SELECT payload FROM events WHERE kind='glossary_complete'"
+            " ORDER BY event_id DESC LIMIT 1").fetchone()
         if complete and not force:
-            return self.store.glossary()
+            try:
+                value = json.loads(complete[0])
+            except (TypeError, ValueError):
+                value = {}
+            if value.get("version") == GLOSSARY_PROTOCOL_VERSION:
+                return self.store.glossary(limit=1_000_000)
         done = set()
         if not force:
             for (payload,) in self.store.db.execute(
                     "SELECT payload FROM events WHERE kind='glossary_chunk'"):
-                value = json.loads(payload)
+                try:
+                    value = json.loads(payload)
+                except ValueError:
+                    continue
+                if value.get("version") != GLOSSARY_PROTOCOL_VERSION:
+                    continue
                 done.add((value.get("start"), value.get("end")))
         chunk = self.reference_chunk
         expected = {(start, min(start + chunk, self.continuation_start))
                     for start in range(0, self.continuation_start, chunk)}
+        truncated_chunks = incomplete_chunks = 0
         for start in range(0, self.continuation_start, chunk):
             self._check_limits()
             stop = min(start + chunk, self.continuation_start)
@@ -2071,47 +3232,72 @@ class TranslationRunner:
                         f"### JA {source['raw_title']}\n{source['text']}\n"
                         f"### ZH {text}")
             if not pairs:
+                done.add((start, stop))
                 continue
+            max_terms = self._glossary_cap(len(pairs))
             style_hint = self._target_style_hint()
-            prompt = _reference_glossary_prompt(pairs, style_hint)
+            prompt = _reference_glossary_prompt(
+                pairs, style_hint, max_terms=max_terms)
             try:
-                result = self._generate([
-                    {"role": "system", "content": "你是严谨的日中对照术语整理员。"},
-                    {"role": "user", "content": prompt},
-                ], self.glossary_tokens, f"glossary_{start}_{stop}")
-                rows = _parse_json_array(result.text)
+                rows, stats = self._extract_terms(
+                    system="你是严谨的日中对照术语整理员。",
+                    prompt=prompt, task=f"glossary_{start}_{stop}",
+                    max_terms=max_terms)
                 self.store.put_glossary(rows)
-                self.store.event("glossary_chunk", start=start, end=stop,
-                                 terms=len(rows))
+                self.store.event(
+                    "glossary_chunk", start=start, end=stop,
+                    terms=len(rows), version=GLOSSARY_PROTOCOL_VERSION,
+                    **stats)
+                if stats["truncated"]:
+                    truncated_chunks += 1
+                if not (stats["complete"] or stats["cap_reached"]):
+                    incomplete_chunks += 1
+                    self.store.event(
+                        "glossary_chunk_incomplete", start=start, end=stop,
+                        version=GLOSSARY_PROTOCOL_VERSION, **stats)
                 try:
-                    focused = self._generate([
-                        {"role": "system", "content": "你是严谨的日中对照术语整理员。"},
-                        {"role": "user", "content":
-                         _reference_focused_prompt(pairs, style_hint)},
-                    ], self.glossary_tokens, f"glossary_focus_{start}_{stop}")
-                    focused_rows = _parse_json_array(focused.text)
+                    focused_max = self._glossary_cap(len(pairs))
+                    focused_prompt = _reference_focused_prompt(
+                        pairs, style_hint, max_terms=focused_max)
+                    focused_rows, focused_stats = self._extract_terms(
+                        system="你是严谨的日中对照术语整理员。",
+                        prompt=focused_prompt,
+                        task=f"glossary_focus_{start}_{stop}",
+                        max_terms=focused_max)
                     self.store.put_glossary(focused_rows)
-                    self.store.event("glossary_focus_chunk", start=start,
-                                     end=stop, terms=len(focused_rows))
+                    self.store.event(
+                        "glossary_focus_chunk", start=start, end=stop,
+                        terms=len(focused_rows),
+                        version=GLOSSARY_PROTOCOL_VERSION, **focused_stats)
                 except (PipelineError, ProviderError, ValueError):
                     self.store.event("glossary_focus_failed", start=start,
                                      end=stop)
-                done.add((start, stop))
+                if stats["complete"] or stats["cap_reached"]:
+                    done.add((start, stop))
             except (PipelineError, ProviderError, ValueError):
                 self.store.event("glossary_failed", start=start, end=stop)
         if expected <= done:
-            self.store.event("glossary_complete", terms=len(self.store.glossary()))
+            self.store.event(
+                "glossary_complete", version=GLOSSARY_PROTOCOL_VERSION,
+                terms=self.store.glossary_count(), chunks=len(expected),
+                truncated_chunks=truncated_chunks,
+                incomplete_chunks=incomplete_chunks)
         else:
-            self.store.event("glossary_incomplete",
-                             missing=sorted(expected - done))
-        return self.store.glossary()
+            self.store.event(
+                "glossary_incomplete", version=GLOSSARY_PROTOCOL_VERSION,
+                missing=sorted(expected - done),
+                truncated_chunks=truncated_chunks,
+                incomplete_chunks=incomplete_chunks)
+        return self.store.glossary(limit=1_000_000)
 
-    def ensure_batch_glossary(self, batch_orders: Sequence[int]) -> list[GlossaryTerm]:
+    def ensure_batch_glossary(self, batch_orders: Sequence[int], *,
+                              provisional: bool = False) -> list[GlossaryTerm]:
         """Extract one shared term table for a concurrently translated batch.
 
         The extraction sees the batch's Japanese source and the existing
         glossary, so all workers use the same target forms even though they do
-        not see each other's translations.
+        not see each other's translations. In pipelined mode new no-reference
+        terms become mandatory provisional canonicals.
         """
         orders = [order for order in batch_orders
                   if order in self.source_by_order
@@ -2121,18 +3307,20 @@ class TranslationRunner:
         text = "\n\n".join(
             f"### {self.source(order)['raw_title']}\n{self.source(order)['text']}"
             for order in orders)
-        existing = self.store.glossary(limit=1000)
+        existing = self.store.glossary(limit=1_000_000)
         relevant = [row for row in existing
                     if str(row.get("source", "")).strip() in text]
         self._check_limits()
         rows = []
-        prompt = _batch_glossary_prompt(text, relevant, self._target_style_hint())
+        max_terms = self._glossary_cap(len(orders))
+        prompt = _batch_glossary_prompt(
+            text, relevant, self._target_style_hint(), max_terms=max_terms)
         try:
-            result = self._generate([
-                {"role": "system", "content": "你是严谨的日中轻小说术语整理员。"},
-                {"role": "user", "content": prompt},
-            ], self.glossary_tokens, f"batch_glossary_{orders[0]}_{orders[-1]}")
-            parsed_rows = _parse_json_array(result.text)
+            parsed_rows, stats = self._extract_terms(
+                system="你是严谨的日中轻小说术语整理员。",
+                prompt=prompt,
+                task=f"batch_glossary_{orders[0]}_{orders[-1]}",
+                max_terms=max_terms)
             deduped = {}
             for row in parsed_rows:
                 source = str(row.get("source", "")).strip()
@@ -2141,111 +3329,232 @@ class TranslationRunner:
                     deduped[source] = {**row, "source": source, "target": target}
             rows = [deduped[source] for source in sorted(deduped)]
             # A term never observed in the aligned reference cannot be a fixed
-            # canonical form; keep the first continuation sighting a candidate.
+            # canonical form. In batch mode it stays a candidate; in pipelined
+            # mode the first continuation sighting becomes mandatory.
             reference_source = "\n".join(
                 self.source(order).get("text", "")
                 for order in range(0, self.continuation_start)
                 if order in self.source_by_order)
+            no_reference = [row["source"] for row in rows
+                            if row["source"] not in reference_source]
             for row in rows:
-                if row["source"] not in reference_source:
+                if row["source"] in no_reference:
                     row["confidence"] = 3
+                    row["provisional"] = False
+                    row["locked"] = False
             self.store.put_glossary(rows)
-            self.store.event("batch_glossary", start=orders[0], end=orders[-1] + 1,
-                             terms=len(rows))
+            promoted = []
+            if provisional:
+                candidates = {
+                    row["source"] for row in relevant
+                    if row["source"] not in reference_source
+                    and int(row.get("confidence", 3)) == 3}
+                candidates.update(no_reference)
+                promoted = self.store.promote_provisional_terms(candidates)
+            self.store.event(
+                "batch_glossary", start=orders[0], end=orders[-1] + 1,
+                terms=len(rows), version=GLOSSARY_PROTOCOL_VERSION,
+                provisional_terms=(sum(1 for row in rows
+                                       if row.get("provisional")) +
+                                   len(promoted)), **stats)
+            if not (stats["complete"] or stats["cap_reached"]):
+                self.store.event(
+                    "batch_glossary_incomplete", start=orders[0],
+                    end=orders[-1] + 1, version=GLOSSARY_PROTOCOL_VERSION,
+                    **stats)
         except (PipelineError, ProviderError, ValueError):
             self.store.event("batch_glossary_failed", start=orders[0],
                              end=orders[-1] + 1)
         merged = {}
         # Preserve the existing first-seen order and append new terms; sorting
         # a growing table would move old entries and break cached prefixes.
-        for row in relevant:
-            source = str(row.get("source", "")).strip()
-            target = str(row.get("target", "")).strip()
-            if source and target:
-                merged[source] = GlossaryTerm(
-                    source, target, str(row.get("kind") or "other"),
-                    int(row.get("confidence", 2)),
-                    tuple(row.get("aliases") or ()),
-                    bool(row.get("locked")))
-        for row in rows:
-            source = row["source"]
-            if source in merged:
+        source_order = [str(row.get("source", "")).strip() for row in relevant]
+        source_order.extend(row["source"] for row in rows
+                            if row["source"] not in source_order)
+        current = {row["source"]: row for row in
+                   self.store.glossary(limit=1_000_000)}
+        for source in source_order:
+            row = current.get(source)
+            if not row:
                 continue
             merged[source] = GlossaryTerm(
                 source, row["target"], str(row.get("kind") or "other"),
-                _normalize_confidence(row.get("confidence")),
-                tuple(_normalize_aliases(row.get("aliases"))),
-                bool(row.get("locked", False)))
+                int(row.get("confidence", 2)),
+                tuple(row.get("aliases") or ()),
+                bool(row.get("locked")),
+                bool(row.get("provisional")),
+                row.get("entity_id"),
+                str(row.get("form_type") or "other"))
         return list(merged.values())
 
 
-def _reference_glossary_prompt(pairs: Sequence[str], style_hint: str = "") -> str:
+def _reference_glossary_prompt(pairs: Sequence[str], style_hint: str = "",
+                               *, max_terms: int = 40) -> str:
     return (
         "下面是同一部Web小说相邻章节的日文原文和官方中文译文。请提取在两版中"
         "稳定对应的专名：人名、地名、组织、称号、职务、种族/族裔、物品、技能。"
-        "不要提取普通名词、整句或只在单侧出现的词。只输出JSON数组，不要解释或代码块：\n"
-        '[{"source":"クリシェ","target":"庫莉茜耶","kind":"person","confidence":1,"aliases":[]}]'
+        "不要提取普通名词、整句或只在单侧出现的词。"
+        "只输出 @@TERM 记录，不要解释、不要代码块、不要 JSON 数组。"
+        "每条记录按下列格式输出，字段各占一行：\n"
+        "@@TERM\n"
+        "source: クリシェ\n"
+        "target: 庫莉茜耶\n"
+        "kind: person\n"
+        "confidence: 1\n"
+        "aliases: 庫莉茜雅\n"
         "\nkind只能是person、place、organization、title、role、race、item、skill、other。"
         "\nconfidence只能是：1=已固定译名（参考译文明确且稳定，必须沿用）；"
         "2=需要根据语境判断（参考有候选，但可能随语境变化，可在aliases给出允许变体）；"
         "3=仅候选（首次出现或证据不足，后续确认）。没有参考中文支持时不得使用1。"
         "\ntarget必须与参考中文正文的字形一致（参考为繁体时不得输出简体）；"
         "同一源词有多个中文写法时 confidence=2 并把其它写法放入 aliases。"
-        "\naliases是同一对象可接受的其它中文写法数组；没有就写[]。最多40项。"
+        "\naliases 用 | 分隔；没有就省略 aliases 行。"
+        f"\n本批最多 {max_terms} 项。全部记录输出完毕后，单独一行输出 @@END。"
         + (f"\n【目标字形参考】{style_hint}" if style_hint else "")
         + "\n\n" + "\n\n".join(pairs))
 
 
-def _reference_focused_prompt(pairs: Sequence[str], style_hint: str = "") -> str:
+def _reference_focused_prompt(pairs: Sequence[str], style_hint: str = "",
+                              *, max_terms: int = 60) -> str:
     return (
         "下面是同一部Web小说相邻章节的日文原文和官方中文译文。只提取在两版中稳定对应的："
         "职务、称号、组织职位、种族/族裔、组织/团体称谓。即使不是专有名词，只要反复出现并稳定对应也要提取；"
-        "忽略人名、地名、物品、技能和普通叙述。只输出JSON数组，不要解释或代码块：\n"
-        '[{"source":"組合長","target":"公會長","kind":"role","confidence":2,"aliases":["會長"]}]'
+        "忽略人名、地名、物品、技能和普通叙述。"
+        "只输出 @@TERM 记录，不要解释、不要代码块、不要 JSON 数组。"
+        "每条记录按下列格式输出，字段各占一行：\n"
+        "@@TERM\n"
+        "source: 組合長\n"
+        "target: 公會長\n"
+        "kind: role\n"
+        "confidence: 2\n"
+        "aliases: 會長\n"
         "\nkind只能是title、role、race、organization、other。"
         "\nconfidence只能是：1=两版稳定且无歧义；2=同一源词在不同语境有多个中文写法，必须在aliases列出；"
         "3=首次出现或证据不足。没有参考中文支持时不得使用1。"
-        "\ntarget必须与参考中文正文的字形一致（参考为繁体时不得输出简体）。最多60项。"
+        "\ntarget必须与参考中文正文的字形一致（参考为繁体时不得输出简体）。"
+        "\naliases 用 | 分隔；没有就省略 aliases 行。"
+        f"\n本批最多 {max_terms} 项。全部记录输出完毕后，单独一行输出 @@END。"
         + (f"\n【目标字形参考】{style_hint}" if style_hint else "")
         + "\n\n" + "\n\n".join(pairs))
 
 
 def _batch_glossary_prompt(text: str, relevant: Sequence[Mapping],
-                           style_hint: str = "") -> str:
+                           style_hint: str = "", *,
+                           max_terms: int = 80) -> str:
     return (
         "下面是本批次相邻章节的日文原文和已有术语表。请补充本批次出现的专名："
         "人名、地名、组织、称号、职务、种族/族裔、物品、技能。已有术语必须沿用已有规范译名，"
-        "不要改写；只输出需要新增或确认的项，不要输出普通名词或整句。只输出JSON数组，不要解释"
-        "或代码块：\n"
-        '[{"source":"クリシェ","target":"庫莉茜耶","kind":"person","confidence":1,"aliases":[]}]\n'
-        "kind只能是person、place、organization、title、role、race、item、skill、other。"
+        "不要改写；只输出需要新增或确认的项，不要输出普通名词或整句。"
+        "只输出 @@TERM 记录，不要解释、不要代码块、不要 JSON 数组。"
+        "每条记录按下列格式输出，字段各占一行：\n"
+        "@@TERM\n"
+        "source: クリシェ\n"
+        "target: 庫莉茜耶\n"
+        "kind: person\n"
+        "confidence: 1\n"
+        "aliases: 庫莉茜雅\n"
+        "\nkind只能是person、place、organization、title、role、race、item、skill、other。"
         "confidence只能是：1=已固定译名；2=需要根据语境判断；3=仅候选。"
         "没有参考中文支持的首次出现必须使用3，不得标1。"
         "target必须与已有术语表和项目参考译文的字形一致（参考为繁体时不得输出简体）。"
-        "aliases是允许的其它写法数组。最多80项。"
+        "aliases 用 | 分隔；没有就省略 aliases 行。"
+        f"\n本批最多 {max_terms} 项。全部记录输出完毕后，单独一行输出 @@END。"
         + (f"\n【目标字形参考】{style_hint}" if style_hint else "")
         + "\n\n【已有术语表】\n"
         + json.dumps(list(relevant), ensure_ascii=False, separators=(",", ":"))
         + "\n\n【本批次原文】\n" + text)
 
 
-def _parse_json_array(text: str) -> list[dict]:
-    value = text.strip()
+_TERM_HEADER = re.compile(r"(?im)^[ \t]*@@TERM\b[^\r\n]*$")
+_TERM_END = re.compile(r"(?im)^[ \t]*@@END\b[^\r\n]*$")
+
+
+def _parse_aliases(value: str) -> list[str]:
+    value = (value or "").strip()
+    if not value or value in {"[]", "{}"}:
+        return []
+    value = value.strip("[]{}")
+    parts = re.split(r"[|,、，;；]", value)
+    result = []
+    for part in parts:
+        part = part.strip().strip('"').strip("'").strip()
+        if part and part not in result:
+            result.append(part)
+    return result
+
+
+def parse_term_records(text: str) -> TermExtraction:
+    """Parse self-delimiting @@TERM records and drop an incomplete tail."""
+    value = (text or "").strip()
     if value.startswith("```"):
         value = re.sub(r"^```[a-zA-Z]*\s*", "", value)
         value = re.sub(r"\s*```$", "", value)
-    try:
-        data = json.loads(value)
-    except ValueError:
-        match = re.search(r"\[[\s\S]*\]", value)
-        if not match:
-            raise ValueError("no JSON array in response")
-        data = json.loads(match.group(0))
-    if not isinstance(data, list):
-        raise ValueError("expected a JSON array")
-    return [row for row in data if isinstance(row, dict)
-            and isinstance(row.get("source"), str)
-            and isinstance(row.get("target"), str)]
+    end_match = _TERM_END.search(value)
+    complete = end_match is not None
+    body = value[:end_match.start()] if end_match else value
+    headers = list(_TERM_HEADER.finditer(body))
+    errors = []
+    if not complete:
+        errors.append("missing_end")
+    if not headers:
+        if body.strip():
+            errors.append("no_term_records")
+        return TermExtraction((), complete, "", tuple(errors))
+
+    records = []
+    seen = set()
+    trimmed_end = 0
+    for index, header in enumerate(headers):
+        block_end = (headers[index + 1].start()
+                     if index + 1 < len(headers) else len(body))
+        block = body[header.end():block_end]
+        fields = {}
+        for line in block.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line = line.replace("：", ":", 1)
+            if ":" not in line:
+                continue
+            key, raw = line.split(":", 1)
+            key = key.strip().lower()
+            if key in {"source", "target", "kind", "confidence", "aliases"}:
+                fields[key] = raw.strip()
+        if not {"source", "target", "kind", "confidence"} <= fields.keys():
+            if index == len(headers) - 1 and not complete:
+                errors.append("incomplete_tail")
+                break
+            errors.append(f"malformed_term:{index + 1}")
+            continue
+        source = fields["source"].strip().strip('"').strip("'")
+        target = fields["target"].strip().strip('"').strip("'")
+        if not source or not target:
+            errors.append(f"empty_term:{index + 1}")
+            continue
+        kind = fields["kind"].strip().lower()
+        if kind not in GLOSSARY_KINDS:
+            errors.append(f"invalid_kind:{kind}")
+            kind = "other"
+        try:
+            confidence = int(fields["confidence"].strip())
+        except ValueError:
+            errors.append(f"invalid_confidence:{fields['confidence']}")
+            confidence = 2
+        if confidence not in {1, 2, 3}:
+            errors.append(f"invalid_confidence:{confidence}")
+            confidence = 2
+        aliases = [alias for alias in _parse_aliases(fields.get("aliases", ""))
+                   if alias != target]
+        if source not in seen:
+            seen.add(source)
+            records.append({"source": source, "target": target, "kind": kind,
+                            "confidence": confidence, "aliases": aliases})
+        trimmed_end = block_end
+
+    trimmed = body[:trimmed_end].strip()
+    return TermExtraction(tuple(records), complete, trimmed, tuple(errors))
+
+
 
 
 # -- reference alignment ---------------------------------------------------

@@ -20,4 +20,4 @@ Python 代码采用 [Python Packaging User Guide 的 src layout](https://packagi
 
 旧版 `sequence` 引擎的历史设计、索引修复和实体目录文档（`sequence-index-repair-plan.md`、`token-index-entity-catalog-design.md`）仅作 legacy 参考；它们对应的实现位于 `legacy-sequence` 分支。
 
-main 的当前自动化边界：新索引、lazy 参考规划、ContextPlan、TaskStore/指针、批次并发翻译、章节审校/裁决/修订/accepted 提交、滚动摘要和 EPUB 导出已实现（`translation.index.pipeline`）。仍需人工判断：跨版本目录锚点、实体/线程目录、单章超长拆分、blocked 章节的局部修复。旧完整管线在 `legacy-sequence` 分支。公开行为变更同时维护 README、使用说明和新架构技能文档。
+main 的当前自动化边界：新索引、lazy 参考规划、ContextPlan、TaskStore/指针、批次并发翻译、pipelined 流水线、实体/形式术语表、标题模式归一化、章节审校/裁决/修订、accepted 提交、滚动摘要和 EPUB 导出已实现（`translation.index.pipeline` / `translation.index.titles`）。strict 模式下的 unresolved major 进入 `manual_review` 队列，`resolve_manual_review()` 负责人工接受/修订/阻塞；翻译可以继续，但 manual hold 之后的批次保持 `ready`，不会自动 accepted 或导出。仍需人工判断：跨版本目录锚点、实体合并/短名关系、target 冲突、单章超长拆分、blocked 章节的局部修复。旧完整管线在 `legacy-sequence` 分支。公开行为变更同时维护 README、使用说明、pipelined 计划和新架构技能文档。

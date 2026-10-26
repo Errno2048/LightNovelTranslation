@@ -68,6 +68,21 @@ class RevisionProvider:
         return GenerationResult(text, "stop", "scripted", str(len(self.requests)), {}, 0)
 
 
+def test_pipelined_mode_config_validation():
+    from lightnovel_translation.errors import ConfigurationError
+    assert WorkflowConfig().translation_mode == "batch"
+    assert WorkflowConfig(translation_mode="pipelined").pipeline_review_backlog == 2
+    assert WorkflowConfig(adjudication_mode="strict").adjudication_mode == "strict"
+    with pytest.raises(ConfigurationError):
+        WorkflowConfig(translation_mode="unknown")
+    with pytest.raises(ConfigurationError):
+        WorkflowConfig(pipeline_review_backlog=0)
+    with pytest.raises(ConfigurationError):
+        WorkflowConfig(pipeline_manual_backlog=0)
+    with pytest.raises(ConfigurationError):
+        WorkflowConfig(adjudication_mode="unknown")
+
+
 def test_runner_accepts_a_clean_review(tmp_path: Path):
     japanese = tmp_path / "ja.txt"
     chinese = tmp_path / "zh.txt"
@@ -125,6 +140,225 @@ class ConcurrentProvider:
                 "semantic_coverage_complete: yes\nzero_findings: yes\n@@END",
                 "stop", "scripted", request.task, {}, 0)
         raise AssertionError("unexpected task " + request.task)
+
+
+class PipelinedProvider:
+    def __init__(self):
+        self.requests = []
+        self.lock = threading.Lock()
+
+    def generate(self, request):
+        with self.lock:
+            self.requests.append(request)
+        task = request.task
+        if task.startswith("batch_glossary_"):
+            target = "诺阿" if task == "batch_glossary_3_3" else "诺亚"
+            text = (f"@@TERM\nsource: ノア\ntarget: {target}\n"
+                    "kind: person\nconfidence: 3\n@@END\n")
+            return GenerationResult(text, "stop", "scripted", task, {}, 0)
+        if task.startswith("provisional_summary_"):
+            return GenerationResult("未审摘要：诺亚继续旅行。", "stop",
+                                    "scripted", task, {}, 0)
+        if task.startswith("translate_"):
+            content = "\n".join(message["content"]
+                                for message in request.messages)
+            match = re.search(
+                r'"name":\["ノア"\].*?"target_form":\["([^"]+)"\].*?'
+                r'"provisional":true', content, re.S)
+            if match:
+                target = match.group(1)
+            elif task == "translate_3":
+                target = "诺阿"
+            else:
+                target = "诺亚"
+            aliases = list(dict.fromkeys(re.findall(r"\[(S\d{3})\]", content)))
+            body = "\n".join(
+                f"@@TRANSLATION {alias}\ntext: {target}段落{index + 1}。"
+                for index, alias in enumerate(aliases))
+            return GenerationResult(
+                f"@@TITLE\ntext: 归来\n{body}\n@@END", "stop",
+                "scripted", task, {}, 0)
+        if task.startswith("review_"):
+            return GenerationResult(
+                "@@SUMMARY\nreviewed_all: yes\n"
+                "semantic_coverage_complete: yes\nzero_findings: yes\n@@END",
+                "stop", "scripted", task, {}, 0)
+        raise AssertionError("unexpected task " + task)
+
+
+def test_run_mode_dispatches_by_configuration():
+    runner = object.__new__(TranslationRunner)
+    runner.translation_mode = "pipelined"
+    runner.run_pipelined = lambda **kwargs: {"mode": "pipelined"}
+    runner.run_concurrent = lambda **kwargs: {"mode": "batch"}
+    assert runner.run_mode()["mode"] == "pipelined"
+    assert runner.run_mode(mode="batch")["mode"] == "batch"
+
+
+class StrictProvider:
+    def __init__(self):
+        self.requests = []
+        self.lock = threading.Lock()
+
+    def _translation(self, request):
+        content = "\n".join(message["content"]
+                            for message in request.messages)
+        aliases = list(dict.fromkeys(
+            re.findall(r"\[(S\d{3})\]", content) +
+            ["S" + value for value in re.findall(r"\bS(\d{3})\b", content)]))
+        body = "\n".join(f"@@TRANSLATION {alias}\ntext: 诺亚没有回到村子。"
+                         for alias in aliases)
+        return f"@@TITLE\ntext: 归来\n{body}\n@@END"
+
+    def generate(self, request):
+        with self.lock:
+            self.requests.append(request)
+        task = request.task
+        if task.startswith("batch_glossary_"):
+            return GenerationResult("@@END", "stop", "scripted", task, {}, 0)
+        if task.startswith("provisional_summary_"):
+            return GenerationResult("未审摘要。", "stop", "scripted", task, {}, 0)
+        if task.startswith("translate_"):
+            return GenerationResult(self._translation(request), "stop",
+                                    "scripted", task, {}, 0)
+        if task.startswith("revise_"):
+            return GenerationResult(self._translation(request), "stop",
+                                    "scripted", task, {}, 0)
+        if task == "review_1":
+            return GenerationResult(
+                "@@FINDING f1\ncategory: negation\nseverity: major\n"
+                "basis: source_meaning\nsource_ref: S001\ntarget_ref: T001\n"
+                "claim: 原文是肯定，草稿加入否定。\n"
+                "suggestion: 改为“诺亚回到了村子。”\nconfidence: high\n"
+                "@@SUMMARY\nreviewed_all: yes\n"
+                "semantic_coverage_complete: yes\nzero_findings: no\n@@END",
+                "stop", "scripted", task, {}, 0)
+        if task.startswith("review_"):
+            return GenerationResult(
+                "@@SUMMARY\nreviewed_all: yes\n"
+                "semantic_coverage_complete: yes\nzero_findings: yes\n@@END",
+                "stop", "scripted", task, {}, 0)
+        if task.startswith("adjudicate_"):
+            return GenerationResult(
+                "@@DECISION f1\nfinding: f1\ndecision: confirmed\n"
+                "reason: 原文明确为肯定，草稿加入否定。\n@@END",
+                "stop", "scripted", task, {}, 0)
+        raise AssertionError("unexpected task " + task)
+
+
+def test_strict_mode_holds_review_but_keeps_translating(tmp_path: Path):
+    japanese = tmp_path / "ja.txt"
+    chinese = tmp_path / "zh.txt"
+    japanese.write_text(
+        "第1話 序\n\nノアは村に帰った。\n\n皆は旅の話を聞いた。\n\n"
+        "第2話 到着\n\nノアは町に着いた。\n\n皆は迎えた。\n\n"
+        "第3話 再会\n\nノアは友に会った。\n\n皆は喜んだ。\n\n"
+        "第4話 出発\n\nノアは港へ向かった。\n\n皆は見送った。\n",
+        encoding="utf-8")
+    chinese.write_text(
+        "第1章 序\n\n诺亚回到了村子。\n\n众人听他讲述旅途。\n\n"
+        "第2章 到达\n\n诺亚抵达了城镇。\n\n众人迎接他。\n\n"
+        "第3章 再会\n\n诺亚见到了朋友。\n\n众人十分高兴。\n\n"
+        "第4章 出发\n\n诺亚前往港口。\n\n众人为他送行。\n",
+        encoding="utf-8")
+    provider = StrictProvider()
+    config = TranslationConfig(
+        workflow=WorkflowConfig(adjudication_mode="strict"))
+    with TranslationProject(tmp_path / "project", config, provider=provider,
+                            provider_id="strict-v1") as project:
+        project.import_book(japanese, edition_id="ja", language="ja",
+                            paragraph_policy="blank_line")
+        project.import_book(chinese, edition_id="zh", language="zh",
+                            paragraph_policy="blank_line")
+        flow = TranslationWorkflow(project, "ja", "zh",
+                                   levels=LevelConfig((2, 2), (1, 1)),
+                                   full_chapters=1)
+        with TranslationStore(tmp_path / "translation.sqlite") as store:
+            runner = TranslationRunner(
+                project, flow, store, continuation_start=1, main_end=4,
+                reference_texts={0: "诺亚回到了村子。\n\n众人听他讲述旅途。"},
+                translation_tokens=512, review_tokens=512,
+                adjudication_tokens=512, max_revisions=1)
+            result = runner.run_pipelined(
+                translation_concurrency=1, review_concurrency=1,
+                batch_size=1, pipeline_review_backlog=2,
+                pipeline_manual_backlog=2, update_summaries=False)
+            assert result["manual_review"] == 1
+            assert result["ready"] == 2
+            assert result["accepted"] == 0
+            assert runner.manual_review_queue()[0]["order"] == 1
+            tasks = [request.task for request in provider.requests]
+            assert "translate_2" in tasks and "translate_3" in tasks
+            assert store.chapter(1)["status"] == "manual_review"
+            assert store.chapter(2)["status"] == "ready"
+            assert store.chapter(3)["status"] == "ready"
+            runner.resolve_manual_review(
+                1, decision="accept", notes="人工复核接受")
+            assert set(store.translations()) == {1, 2, 3}
+            review = json.loads(store.chapter(1)["review"])
+            assert review["manual_override"] is True
+            assert runner.manual_review_queue() == []
+
+
+def test_pipelined_runner_uses_prior_drafts_and_provisional_terms(tmp_path: Path):
+    japanese = tmp_path / "ja.txt"
+    chinese = tmp_path / "zh.txt"
+    japanese.write_text(
+        "第1話 序\n\n旅人は村を出た。\n\n道は長かった。\n\n"
+        "第2話 到着\n\nノアは町に着いた。\n\n皆は迎えた。\n\n"
+        "第3話 再会\n\nノアは友に会った。\n\n皆は喜んだ。\n\n"
+        "第4話 出発\n\nノアは港へ向かった。\n\n皆は見送った。\n",
+        encoding="utf-8")
+    chinese.write_text(
+        "第1章 序\n\n旅人离开了村子。\n\n道路很漫长。\n\n"
+        "第2章 到达\n\n诺亚抵达了城镇。\n\n众人迎接他。\n\n"
+        "第3章 再会\n\n诺亚见到了朋友。\n\n众人十分高兴。\n\n"
+        "第4章 出发\n\n诺亚前往港口。\n\n众人为他送行。\n",
+        encoding="utf-8")
+    provider = PipelinedProvider()
+    with TranslationProject(tmp_path / "project",
+                            TranslationConfig(), provider=provider,
+                            provider_id="pipelined-v1") as project:
+        project.import_book(japanese, edition_id="ja", language="ja",
+                            paragraph_policy="blank_line")
+        project.import_book(chinese, edition_id="zh", language="zh",
+                            paragraph_policy="blank_line")
+        flow = TranslationWorkflow(project, "ja", "zh",
+                                   levels=LevelConfig((2, 2), (1, 1)),
+                                   full_chapters=2)
+        with TranslationStore(tmp_path / "translation.sqlite") as store:
+            runner = TranslationRunner(
+                project, flow, store, continuation_start=1, main_end=4,
+                reference_texts={0: "旅人离开了村子。\n\n道路很漫长。"},
+                translation_tokens=512, review_tokens=512,
+                adjudication_tokens=512)
+            result = runner.run_pipelined(
+                translation_concurrency=1, review_concurrency=1,
+                batch_size=2, pipeline_review_backlog=2,
+                update_summaries=False)
+            assert result["mode"] == "pipelined"
+            assert result["chapters"] == 3
+            translations = store.translations()
+            assert set(translations) == {1, 2, 3}
+            assert all("诺亚" in text for text in translations.values())
+            assert all("诺阿" not in text for text in translations.values())
+            term = next(row for row in store.glossary(limit=1000)
+                        if row["source"] == "ノア")
+            assert term["target"] == "诺亚"
+            assert term["confidence"] == 1
+            assert term["provisional"] is True
+            assert store.summaries("target-provisional")
+            assert len([request for request in provider.requests
+                        if request.task.startswith("provisional_summary_")]) >= 1
+            translated = {request.task: "\n".join(
+                message["content"] for message in request.messages)
+                for request in provider.requests
+                if request.task.startswith("translate_")}
+            assert '"provisional":true' in translated["translate_3"]
+            assert "未审草稿" in translated["translate_3"]
+            events = [json.loads(row[0]) for row in store.db.execute(
+                "SELECT payload FROM events WHERE kind='pipeline_batch'")]
+            assert len(events) == 2
 
 
 def test_concurrent_runner_accepts_a_window(tmp_path: Path):
