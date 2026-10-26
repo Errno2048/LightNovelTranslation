@@ -48,16 +48,34 @@ class Chapter:
 
 @dataclass
 class GenerationRequest:
-    messages: list[dict[str, str]]
+    messages: list[dict[str, Any]]
     max_tokens: int = 8192
     temperature: float = 0.2
     task: str = "translation"
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: str | dict[str, Any] | None = None
 
     def __post_init__(self):
         if self.max_tokens <= 0 or not self.messages:
             raise ValueError("positive output budget and messages required")
-        if any(m.get("role") not in {"system", "user", "assistant"} or not isinstance(m.get("content"), str) for m in self.messages):
-            raise ValueError("invalid message")
+        for message in self.messages:
+            role = message.get("role")
+            if role not in {"system", "user", "assistant", "tool"}:
+                raise ValueError("invalid message role")
+            content = message.get("content")
+            if role == "assistant":
+                if content is not None and not isinstance(content, str):
+                    raise ValueError("invalid assistant content")
+                tool_calls = message.get("tool_calls")
+                if tool_calls is not None and not isinstance(tool_calls, list):
+                    raise ValueError("invalid assistant tool_calls")
+                if content is None and not tool_calls:
+                    raise ValueError("assistant message needs content or tool_calls")
+            else:
+                if not isinstance(content, str):
+                    raise ValueError("invalid message content")
+                if role == "tool" and not isinstance(message.get("tool_call_id"), str):
+                    raise ValueError("tool message needs tool_call_id")
 
 
 @dataclass
@@ -68,6 +86,7 @@ class GenerationResult:
     request_id: str | None
     usage: dict[str, Any]
     elapsed_seconds: float
+    tool_calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass

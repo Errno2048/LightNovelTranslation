@@ -43,3 +43,9 @@ review_tokens = 65536
 adjudication_tokens = 32768
 summary_tokens = 16384
 glossary_tokens = 16384
+# Per-review native tool-call budgets. The review model may request prior
+# chapters or term usages; the remaining budget is shown in its context.
+lookup_chapters = 8
+lookup_terms = 50
+max_term_checks = 50 # Deterministic glossary mismatches sent to the reviewer.
+max_tool_rounds = 4

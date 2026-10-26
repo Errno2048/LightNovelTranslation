@@ -6,6 +6,7 @@ FIELDS = {
     "MAP": {"source", "target", "status"},
     "FINDING": {"category", "severity", "source_ref", "target_ref", "claim", "suggestion", "confidence", "needs_lookup", "evidence_ref"},
     "UNRESOLVED": {"text", "needs_lookup"},
+    "TERMCHECK": {"check", "verdict", "reason", "source_ref", "target_ref"},
     "SUMMARY": {"reviewed_all", "semantic_coverage_complete", "zero_findings"},
     "DECISION": {"finding", "decision", "reason"},
     "PATCH": {"start", "end", "expected_text_hash", "findings", "replacement"},
@@ -25,6 +26,7 @@ _CLOSED_ENUMS = {
     "semantic_coverage_complete": {"yes", "no"},
     "zero_findings": {"yes", "no"},
     "status": {"mapped"},
+    "verdict": {"ok", "violation", "uncertain"},
 }
 _ENUM_ALIASES = {
     "decision": {

@@ -10,9 +10,10 @@ AUDIT_TASK = """【审校协议 chapter-review】
 
 知识权威分级：
 - source_meaning：本章含义、内部指代或客观形式缺陷。
+- confirmed_term：term_checks 中 confidence=1 或 locked 的术语规范；必须按规则结果核对，不能直接替换正文。
 - observed_usage：有R/L原段支持的历史译法；只是本章保持一致的候选，不是已审定或全书固定规范。
 - style_preference：正确表达之间的偏好，不计作错译，不得要求强制修复。
-本次没有任何已审定译名规则。摘要和实体描述只能帮助寻找线索；历史译法建议必须定位到实际R/L正文。
+除 term_checks 中的固定术语外，摘要和实体描述只能帮助寻找线索；历史译法建议必须定位到实际R/L正文或工具返回的正文。
 
 每条FINDING只定位一个S段和一个T段。同类错误若出现在多个T段，分别输出多条；不得只修举例段。
 source_ref、target_ref、evidence_ref只写提供的一个标签。程序将绑定对应完整段落，不必复制引文。
@@ -36,6 +37,14 @@ needs_lookup: 可选chapter:main:章号或node:节点ID，没有就省略整行
 @@UNRESOLVED u1
 text: 不确定原因及尚缺什么证据
 needs_lookup: 可选查询，没有就省略整行
+
+规则术语结果必须逐项核对；每个给定 check id 输出一条：
+@@TERMCHECK tc001
+check: tc001
+verdict: ok|violation|uncertain
+reason: 具体依据
+verdict=violation 时必须同时输出一个 category: term 的 FINDING，不得直接按规则替换文本。
+可使用 read_chapter / lookup_term 工具查证；工具预算见上下文 lookup_budget，不要用 needs_lookup 代替实际工具调用。
 
 最后逐项复查全文是否仍有同类出现位置，输出且只输出一个SUMMARY：
 @@SUMMARY
@@ -66,7 +75,10 @@ AUDIT_ADJUDICATION = """【裁决协议 chapter-review】
 逐项核对审校意见和程序绑定的完整原段，不要默认接受审校员的说法。
 只对确有含义差异、内部矛盾或客观残留确认；正常意译、可替换措辞和style_preference应dismissed。
 observed_usage只能支持局部一致性的建议。核对绑定的历史原段是否真的出现对应人/物及译名；
-摘要、实体候选没有审定权威，不得称已审/固定/全书规范。证据不足则unresolved。
+摘要、未确认的实体候选没有审定权威，不得称已审/固定/全书规范。证据不足则unresolved。
+term_checks 是程序对词表的确定性检查，不属于实体候选。status=fixed_missing 表示 canonical
+（及给定 aliases）应在正文出现而缺失，该 canonical 具有规范权威；绑定段确实使用其他写法时应
+confirmed。status=needs_context 只说明有候选，仍须结合语境判断，不能仅凭规则确认。
 需特别核对动作主体/受益者、对象、条件分支和译文额外增加的细节。
 引文/标签存在只代表可定位；意见解释和修复方向也必须得到原文支持。
 每个finding恰好输出一条：

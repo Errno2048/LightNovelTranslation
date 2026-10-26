@@ -26,6 +26,9 @@ class GlossaryTerm:
     source: str
     target: str
     kind: str = "other"
+    confidence: int = 2
+    aliases: tuple[str, ...] = ()
+    locked: bool = False
 
 
 @dataclass
@@ -187,13 +190,13 @@ class TranslationWorkflow:
         if output_profile == "source-records":
             system = (
                 "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
-                "日文原文是事实依据。术语优先使用候选 target_form。按源段记录协议输出，"
-                "不要解释、不要代码块。")
+                "日文原文是事实依据。实体卡中 confidence=1 或 locked 的 target_form 必须使用；"
+                "其余术语为候选。按源段记录协议输出，不要解释、不要代码块。")
         else:
             system = (
                 "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
-                "日文原文是事实依据。术语优先使用候选 target_form。只输出正文，不输出标题、"
-                "段落定位ID或解释。")
+                "日文原文是事实依据。实体卡中 confidence=1 或 locked 的 target_form 必须使用；"
+                "其余术语为候选。只输出正文，不输出标题、段落定位ID或解释。")
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content":
@@ -273,7 +276,11 @@ def _entity_card(index: int, term: GlossaryTerm) -> dict:
         "id": f"E{index:02d}", "type": "ENTITY",
         "fields": {"name": [term.source], "kind": [term.kind],
                    "description": [f"参考译名候选：{term.target}"],
-                   "target_form": [term.target], "ambiguity": []},
+                   "target_form": [term.target],
+                   "confidence": [term.confidence],
+                   "aliases": list(term.aliases),
+                   "locked": term.locked,
+                   "ambiguity": []},
         "authority": "candidate_unreviewed",
         "semantic_status": "candidate_unreviewed",
         "prompt_projection": "entity-card-v1",

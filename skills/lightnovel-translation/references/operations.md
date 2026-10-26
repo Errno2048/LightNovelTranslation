@@ -117,6 +117,48 @@ runner.ensure_glossary()           # 双语对照抽词，按 chunk 记录 gloss
 | 摘要 / 术语输出 | 16,384 / 16,384 |
 | 翻译批大小 | 30 章/批；`translation_concurrency` 个请求并发 |
 
+### 1.5 术语置信度、确定性检查与 lookup 工具
+
+术语表现在带 `confidence` / `aliases` / `locked`：
+
+- `confidence=1`：已固定译名，确定性检查会视为必须使用的 canonical；
+- `confidence=2`：需要根据语境判断，检查会标记但由审校模型决定；
+- `confidence=3`：仅候选，不进入强制检查。
+
+`ensure_glossary` 现在对每个参考块运行两次抽取：
+
+1. 通用抽取：人名、地名、组织、称号、职务、种族、物品、技能；
+2. 专项抽取：只提职务、称号、组织职位、种族/族裔、组织称谓，避免 40 项名额被人名占满。
+
+专项结果写入 `glossary_focus_chunk` 事件；失败写 `glossary_focus_failed`，不阻断翻译。两次抽取都要求 `confidence`、`aliases`，并使用参考译文的前 160 字作为目标字形提示，避免输出简体。`ensure_batch_glossary` 对从未在参考日文中出现的新词强制 `confidence=3`。
+
+`put_glossary` 保留更权威的 canonical，并把其它写法放入 aliases。`locked` 词条不会被后续批次改写。
+
+审校前会运行确定性术语检查：
+
+- 对源文中出现的 `confidence<=2` 词条，若对应译文段落没有 canonical/alias，生成 `term_checks`；
+- 结果写入 review context，**不会直接替换正文**；
+- 审校模型必须为每个 check id 输出 `@@TERMCHECK`，`verdict=violation` 时还必须输出 `category: term` 的 FINDING；
+- 同一词条的多处出现合并为一个 check，`occurrences` 列出最多 8 个位置；
+- 裁决阶段会收到同一批 `term_checks`；`status=fixed_missing`（confidence=1 或 locked）的 canonical 具有规范权威，不能当作“未确认实体候选”驳回；
+- 已确认的 fixed_missing 术语 FINDING 即使标为 minor 也会触发修订，因为它破坏已固定的译名一致性。
+
+审校模型可使用原生工具：
+
+- `read_chapter(order, include_source=false)`：读取当前章之前的参考/已接受内容；
+- `lookup_term(term, limit=5)`：查询规范译名和之前章节的实际用法。
+
+预算来自 `[workflow]`：
+
+```toml
+lookup_chapters = 8
+lookup_terms = 50
+max_term_checks = 50
+max_tool_rounds = 4
+```
+
+预算和已用数量写入 review context 的 `lookup_budget`，每次工具结果也返回剩余预算。工具调用写入 `review_tool` 事件；模型调用事件包含 `tool_calls` 数量。`needs_lookup` 字段仍保留，但有工具时应优先实际调用工具。
+
 ## 2. 并发运行参数
 
 ### 2.1 `run_concurrent` 的真实语义
@@ -245,7 +287,8 @@ for finding in review.get("findings") or []:
 裁决策略（当前 runner）：
 
 - confirmed 的 `critical` / `major` 触发完整重译修订；
-- confirmed 的 minor / `source_meaning` 可能保留到事后质量复查（第 5 节）；
+- confirmed 的 `category: term` FINDING 若对应 `fixed_missing` 术语检查，即使为 minor 也触发修订；
+- confirmed 的其它 minor / `source_meaning` 可能保留到事后质量复查（第 5 节）；
 - `unresolved` 不触发修订；若它是 major，需要人工读原文/上下文判断，不能仅因为“未确认”就当成正确。
 
 ### 4.3 精确修补一个已确认段落

@@ -35,15 +35,22 @@ class WorkflowConfig:
     adjudication_tokens: int = 32768
     summary_tokens: int = 16384
     glossary_tokens: int = 16384
+    lookup_chapters: int = 8
+    lookup_terms: int = 50
+    max_term_checks: int = 50
+    max_tool_rounds: int = 4
 
     def __post_init__(self):
         for name in ('translation_concurrency', 'review_concurrency',
                      'batch_size', 'full_chapters', 'summary_every',
                      'reference_chunk', 'translation_tokens', 'review_tokens',
-                     'adjudication_tokens', 'summary_tokens', 'glossary_tokens'):
+                     'adjudication_tokens', 'summary_tokens', 'glossary_tokens',
+                     'lookup_chapters', 'lookup_terms', 'max_tool_rounds'):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ConfigurationError(f'workflow.{name} must be a positive integer')
+        if type(self.max_term_checks) is not int or self.max_term_checks < 0:
+            raise ConfigurationError('workflow.max_term_checks must be a nonnegative integer')
         if type(self.history_chapters) is not int or self.history_chapters < 0:
             raise ConfigurationError('workflow.history_chapters must be a nonnegative integer')
         if type(self.summary_lag) is not int or self.summary_lag < 0:

@@ -66,6 +66,7 @@ class ReviewOutcome:
     zero_findings: bool
     raw: str
     errors: tuple[str, ...] = ()
+    term_checks: tuple[dict, ...] = ()
 
 
 def _now() -> str:
@@ -73,6 +74,28 @@ def _now() -> str:
 
 
 _IMAGE_MARKER = re.compile(r"\[\[IMG:([A-Za-z0-9_.:-]+)\]\]")
+
+REVIEW_TOOLS = [
+    {"type": "function", "function": {
+        "name": "read_chapter",
+        "description": ("读取当前审校章之前的某一章中文内容（优先官方参考译文，其次已接受译文；"
+                        "没有中文时返回日文原文）。只能读取 order 小于当前章的内容。"),
+        "parameters": {"type": "object", "properties": {
+            "order": {"type": "integer", "description": "edition_order（0 基）；当前章会给出"},
+            "include_source": {"type": "boolean",
+                               "description": "同时返回日文原文（占用更多上下文）"}},
+            "required": ["order"]},
+    }},
+    {"type": "function", "function": {
+        "name": "lookup_term",
+        "description": ("查询专名的规范译名、别名以及之前章节中的日文/中文实际用法。"
+                        "返回官方参考优先，其次为已接受译文。"),
+        "parameters": {"type": "object", "properties": {
+            "term": {"type": "string", "description": "日文专名或已知中文写法"},
+            "limit": {"type": "integer", "description": "最多返回多少个历史命中，默认 5"}},
+            "required": ["term"]},
+    }},
+]
 
 
 def _strip_markers(value: str) -> tuple[str, list[tuple[str, int]]]:
@@ -88,6 +111,76 @@ def _strip_markers(value: str) -> tuple[str, list[tuple[str, int]]]:
         cursor = match.end()
     parts.append(value[cursor:])
     return "".join(parts), positions
+
+
+def _normalize_confidence(value) -> int:
+    if isinstance(value, bool):
+        return 2
+    if isinstance(value, int):
+        return value if value in {1, 2, 3} else 2
+    text = str(value or "").strip().lower()
+    return {"1": 1, "fixed": 1, "high": 1, "2": 2, "contextual": 2,
+            "medium": 2, "3": 3, "candidate": 3, "low": 3}.get(text, 2)
+
+
+def _normalize_aliases(value) -> list[str]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, (list, tuple)):
+        values = value
+    else:
+        values = []
+    return sorted({str(item).strip() for item in values if str(item).strip()})
+
+
+def _build_term_checks(source_rows: Sequence[Mapping],
+                       target_paragraphs: Sequence[str],
+                       glossary: Sequence[GlossaryTerm],
+                       limit: int = 50) -> list[dict]:
+    """One deterministic check per term, covering every missing occurrence."""
+    checks = []
+    for term in glossary:
+        if int(term.confidence) > 2 or not term.source or not term.target:
+            continue
+        forms = [term.target, *term.aliases]
+        occurrences = []
+        occurrence_count = 0
+        for index, source_row in enumerate(source_rows):
+            if index >= len(target_paragraphs):
+                break
+            source_text = str(source_row.get("text", ""))
+            if term.source not in source_text:
+                continue
+            target_text = str(target_paragraphs[index])
+            if any(form and form in target_text for form in forms):
+                continue
+            occurrence_count += 1
+            if len(occurrences) < 8:
+                occurrences.append({
+                    "source_ref": f"S{index + 1:03d}",
+                    "target_ref": f"T{index + 1:03d}",
+                    "source_text": source_text[:300],
+                    "target_text": target_text[:300],
+                })
+        if not occurrences:
+            continue
+        checks.append({
+            "id": f"tc{len(checks) + 1:03d}",
+            "source_ref": occurrences[0]["source_ref"],
+            "target_ref": occurrences[0]["target_ref"],
+            "term": term.source,
+            "canonical": term.target,
+            "aliases": list(term.aliases),
+            "kind": term.kind,
+            "confidence": int(term.confidence),
+            "locked": bool(term.locked),
+            "status": "fixed_missing" if term.confidence == 1 else "needs_context",
+            "occurrence_count": occurrence_count,
+            "occurrences": occurrences,
+        })
+        if len(checks) >= limit:
+            break
+    return checks
 
 
 def _clean_ref(value: str) -> str:
@@ -156,6 +249,9 @@ class TranslationStore:
                 source TEXT PRIMARY KEY,
                 target TEXT NOT NULL,
                 kind TEXT NOT NULL,
+                confidence INTEGER NOT NULL DEFAULT 2,
+                aliases TEXT NOT NULL DEFAULT '[]',
+                locked INTEGER NOT NULL DEFAULT 0,
                 evidence_count INTEGER NOT NULL DEFAULT 1,
                 updated_at TEXT NOT NULL
             );
@@ -173,6 +269,12 @@ class TranslationStore:
             if "assets" not in columns:
                 self.db.execute(
                     f"ALTER TABLE {table} ADD COLUMN assets TEXT NOT NULL DEFAULT '{{}}'")
+        glossary_columns = {row[1] for row in self.db.execute("PRAGMA table_info(glossary)")}
+        for name, definition in (("confidence", "INTEGER NOT NULL DEFAULT 2"),
+                                 ("aliases", "TEXT NOT NULL DEFAULT '[]'"),
+                                 ("locked", "INTEGER NOT NULL DEFAULT 0")):
+            if name not in glossary_columns:
+                self.db.execute(f"ALTER TABLE glossary ADD COLUMN {name} {definition}")
         self.db.commit()
 
     def close(self):
@@ -287,20 +389,103 @@ class TranslationStore:
                 if len(source) < 2 or not target:
                     continue
                 kind = str(row.get("kind") or "other")
+                confidence = _normalize_confidence(row.get("confidence"))
+                aliases = _normalize_aliases(row.get("aliases"))
+                locked = bool(row.get("locked", False))
+                existing = self.db.execute(
+                    "SELECT target,kind,confidence,aliases,locked,evidence_count"
+                    " FROM glossary WHERE source=?", (source,)).fetchone()
+                if existing is None:
+                    self.db.execute(
+                        "INSERT INTO glossary(source,target,kind,confidence,aliases,"
+                        "locked,evidence_count,updated_at) VALUES(?,?,?,?,?,?,1,?)",
+                        (source, target, kind, 1 if locked else confidence,
+                         json.dumps(aliases, ensure_ascii=False), 1 if locked else 0, now))
+                    continue
+                old_aliases = []
+                try:
+                    old_aliases = [str(value) for value in
+                                   json.loads(existing["aliases"] or "[]")]
+                except (TypeError, ValueError):
+                    old_aliases = []
+                merged_aliases = set(old_aliases) | set(aliases)
+                if existing["locked"]:
+                    canonical = existing["target"]
+                    confidence = 1
+                    locked = True
+                elif locked:
+                    canonical = target
+                    confidence = 1
+                elif existing["confidence"] <= confidence:
+                    canonical = existing["target"]
+                    confidence = existing["confidence"]
+                else:
+                    canonical = target
+                merged_aliases.add(existing["target"])
+                merged_aliases.add(target)
+                merged_aliases.discard(canonical)
+                new_kind = existing["kind"]
+                if new_kind == "other" and kind != "other":
+                    new_kind = kind
                 self.db.execute(
-                    "INSERT INTO glossary(source,target,kind,evidence_count,updated_at)"
-                    " VALUES(?,?,?,1,?) ON CONFLICT(source) DO UPDATE SET"
-                    " evidence_count=glossary.evidence_count+1,"
-                    " target=CASE WHEN glossary.evidence_count=1 THEN excluded.target"
-                    " ELSE glossary.target END, updated_at=excluded.updated_at",
-                    (source, target, kind, now))
+                    "UPDATE glossary SET target=?,kind=?,confidence=?,aliases=?,"
+                    "locked=?,evidence_count=?,updated_at=? WHERE source=?",
+                    (canonical, new_kind, confidence,
+                     json.dumps(sorted(merged_aliases), ensure_ascii=False),
+                     1 if locked else 0, existing["evidence_count"] + 1, now, source))
+
+    def confirm_glossary_term(self, source: str, *, target: str | None = None,
+                              aliases: Iterable[str] | None = None,
+                              confidence: int = 1,
+                              locked: bool = True) -> dict:
+        """Explicitly confirm a term; this is the only path that creates a locked canonical."""
+        source = str(source or "").strip()
+        existing = self.db.execute(
+            "SELECT target,kind,confidence,aliases,locked FROM glossary WHERE source=?",
+            (source,)).fetchone()
+        if existing is None:
+            raise KeyError(f"unknown glossary term: {source}")
+        target = str(target or existing["target"]).strip()
+        if not target:
+            raise ValueError("confirmed target must not be empty")
+        if aliases is None:
+            try:
+                aliases = json.loads(existing["aliases"] or "[]")
+            except ValueError:
+                aliases = []
+        clean_aliases = sorted({str(value).strip() for value in aliases
+                                if str(value).strip() and str(value).strip() != target})
+        level = _normalize_confidence(confidence)
+        if locked:
+            level = 1
+        with self.db:
+            self.db.execute(
+                "UPDATE glossary SET target=?,confidence=?,aliases=?,locked=?,"
+                "updated_at=? WHERE source=?",
+                (target, level, json.dumps(clean_aliases, ensure_ascii=False),
+                 1 if locked else 0, _now(), source))
+        value = dict(self.db.execute(
+            "SELECT source,target,kind,confidence,aliases,locked,evidence_count"
+            " FROM glossary WHERE source=?", (source,)).fetchone())
+        value["aliases"] = json.loads(value.get("aliases") or "[]")
+        value["locked"] = bool(value.get("locked"))
+        return value
 
     def glossary(self, limit: int = 200) -> list[dict]:
         # First-seen order is append-only: new terms do not move existing ones,
         # so a growing glossary keeps a reusable prompt prefix.
-        return [dict(row) for row in self.db.execute(
-            "SELECT source,target,kind,evidence_count FROM glossary"
-            " ORDER BY rowid LIMIT ?", (limit,))]
+        result = []
+        for row in self.db.execute(
+                "SELECT source,target,kind,confidence,aliases,locked,evidence_count"
+                " FROM glossary ORDER BY rowid LIMIT ?", (limit,)):
+            value = dict(row)
+            try:
+                value["aliases"] = json.loads(value.get("aliases") or "[]")
+            except ValueError:
+                value["aliases"] = []
+            value["locked"] = bool(value.get("locked"))
+            result.append(value)
+        return result
 
     def stats(self) -> dict:
         return {
@@ -354,6 +539,10 @@ class TranslationRunner:
                                 if glossary_tokens is None else glossary_tokens)
         self.reference_chunk = (workflow.reference_chunk
                                 if reference_chunk is None else reference_chunk)
+        self.max_term_checks = getattr(workflow, "max_term_checks", 50)
+        self.lookup_chapters = getattr(workflow, "lookup_chapters", 8)
+        self.lookup_terms = getattr(workflow, "lookup_terms", 50)
+        self.max_tool_rounds = getattr(workflow, "max_tool_rounds", 4)
         self.source_by_order = {doc["edition_order"]: doc
                                 for doc in flow._source_docs}
         source_edition = getattr(flow, "source_edition", "")
@@ -501,13 +690,73 @@ class TranslationRunner:
         return IndexSnapshot(snapshot_id=f"run-{order}", generation="hierarchical",
                              levels=self.flow.levels, artifacts=artifacts)
 
-    def _glossary_cards(self) -> list[GlossaryTerm]:
+    def _target_style_hint(self) -> str:
+        for order in sorted(self.reference_texts):
+            text = str(self.reference_texts.get(order) or "").strip()
+            if text:
+                return text[:160]
+        return ""
+
+    def _glossary_cards(self, order: int | None = None) -> list[GlossaryTerm]:
         if self.glossary:
             return list(self.glossary)
-        # Do not filter per chapter: a chapter-dependent subset changes the
-        # prompt prefix on every call. First-seen order is append-only.
-        return [GlossaryTerm(row["source"], row["target"], row["kind"])
-                for row in self.store.glossary(limit=200)]
+        # Batch translation keeps a stable broad list. Single-chapter reviews
+        # additionally filter to terms that occur in that chapter, plus fixed
+        # terms, so newly confirmed entries are not hidden by the limit.
+        terms = [GlossaryTerm(row["source"], row["target"], row["kind"],
+                              int(row.get("confidence", 2)),
+                              tuple(row.get("aliases") or ()),
+                              bool(row.get("locked")))
+                 for row in self.store.glossary(limit=1000)]
+        if order is None:
+            return terms
+        text = self.source(order).get("text", "")
+        return [term for term in terms
+                if term.source in text or int(term.confidence) <= 1]
+
+    def pending_glossary_confirmation(self, orders: Iterable[int]) -> list[dict]:
+        orders = [int(order) for order in orders]
+        target_text = "\n".join(self.source(order).get("text", "") for order in orders
+                                if order in self.source_by_order)
+        reference_text = "\n".join(
+            self.source(order).get("text", "")
+            for order in range(0, self.continuation_start)
+            if order in self.source_by_order)
+        accepted_text = "\n".join(
+            row.get("text", "") for row in
+            (self.store.chapter(order) for order in self.store.accepted_orders())
+            if row and row.get("status") == "accepted")
+        pending = []
+        for row in self.store.glossary(limit=1000):
+            if int(row.get("confidence", 3)) != 3:
+                continue
+            source = row["source"]
+            if source not in target_text:
+                continue
+            pending.append({
+                "source": source, "target": row["target"],
+                "kind": row["kind"], "aliases": row.get("aliases") or [],
+                "reference_hits": reference_text.count(source),
+                "accepted_hits": accepted_text.count(source),
+            })
+        return pending
+
+    def confirm_glossary(self, decisions: Mapping[str, Mapping]) -> list[dict]:
+        confirmed = []
+        for source, decision in decisions.items():
+            if not isinstance(decision, Mapping):
+                raise ValueError("each glossary decision must be an object")
+            row = self.store.confirm_glossary_term(
+                source,
+                target=decision.get("target"),
+                aliases=decision.get("aliases"),
+                confidence=int(decision.get("confidence", 1)),
+                locked=bool(decision.get("locked", True)))
+            self.store.event("glossary_confirmed", source=source,
+                             target=row["target"], aliases=row["aliases"],
+                             confidence=row["confidence"], locked=row["locked"])
+            confirmed.append(row)
+        return confirmed
 
     def _history_pairs(self, order: int,
                        provisional: Mapping[int, str] | None = None) -> list[dict]:
@@ -545,11 +794,14 @@ class TranslationRunner:
     # -- model calls --------------------------------------------------------
     def _generate(self, messages: list[dict], max_tokens: int, task: str,
                   *, attempts: int | None = None, log_event: bool = True,
-                  usage_sink: list | None = None):
+                  usage_sink: list | None = None,
+                  tools: list[dict] | None = None,
+                  tool_choice: str | dict | None = None):
         if attempts is None:
             attempts = self.project.config.limits.max_attempts
         request = GenerationRequest(messages, max_tokens=max_tokens,
-                                    temperature=0, task=task)
+                                    temperature=0, task=task,
+                                    tools=tools, tool_choice=tool_choice)
         last = None
         for attempt in range(attempts):
             started = time.monotonic()
@@ -559,7 +811,8 @@ class TranslationRunner:
                           "usage": result.usage,
                           "elapsed": result.elapsed_seconds,
                           "request_id": result.request_id,
-                          "max_tokens": request.max_tokens}
+                          "max_tokens": request.max_tokens,
+                          "tool_calls": len(result.tool_calls)}
                 if log_event:
                     self.store.event("model", **record)
                 if usage_sink is not None:
@@ -587,7 +840,8 @@ class TranslationRunner:
                         request = GenerationRequest(
                             messages,
                             max_tokens=min(capacity, request.max_tokens * 2),
-                            temperature=0, task=task)
+                            temperature=0, task=task,
+                            tools=tools, tool_choice=tool_choice)
                         continue
                 if exc.kind in {"empty", "finish_reason"} and attempt + 1 < attempts:
                     time.sleep(1 + attempt)
@@ -748,9 +1002,164 @@ class TranslationRunner:
                     values.append(item)
         return values[-8:]
 
+    def _budget_view(self, budget: dict) -> dict:
+        used_chapters = sorted(budget["used_chapters"])
+        used_terms = sorted(budget["used_terms"])
+        return {
+            "max_chapters": budget["max_chapters"],
+            "max_terms": budget["max_terms"],
+            "used_chapters": used_chapters,
+            "used_terms": used_terms,
+            "remaining_chapters": budget["max_chapters"] - len(used_chapters),
+            "remaining_terms": budget["max_terms"] - len(used_terms),
+        }
+
+    def _prior_target_text(self, order: int,
+                           accepted_texts: Mapping[int, str] | None = None
+                           ) -> tuple[str | None, str]:
+        if order < self.continuation_start:
+            value = self.reference_texts.get(order)
+            return value, "zh-reference" if value else "ja-source"
+        if accepted_texts is not None:
+            value = accepted_texts.get(order)
+            return (value, "zh") if value is not None else (None, "ja-source")
+        row = self.store.chapter(order)
+        if row and row.get("status") == "accepted":
+            return row.get("text"), "zh"
+        return None, "ja-source"
+
+    def _read_prior_chapter(self, order: int, current_order: int, budget: dict,
+                            include_source: bool = False,
+                            accepted_texts: Mapping[int, str] | None = None) -> dict:
+        if type(order) is not int or order < 0 or order >= current_order:
+            raise ValueError("only prior edition_order values can be read")
+        if order not in self.source_by_order:
+            raise ValueError("unknown edition_order")
+        if order not in budget["used_chapters"]:
+            if len(budget["used_chapters"]) >= budget["max_chapters"]:
+                raise ValueError("chapter lookup budget exhausted")
+            budget["used_chapters"].add(order)
+        source = self.source(order)
+        text, language = self._prior_target_text(order, accepted_texts)
+        if text is None:
+            text = source.get("text", "")
+        limit = 12000
+        truncated = len(text) > limit
+        result = {"order": order, "title": source.get("raw_title", ""),
+                  "language": language, "text": text[:limit],
+                  "truncated": truncated, "budget": self._budget_view(budget)}
+        if include_source and language != "ja-source":
+            source_text = source.get("text", "")
+            result["source_text"] = source_text[:6000]
+            result["source_truncated"] = len(source_text) > 6000
+        return result
+
+    def _lookup_term(self, term: str, current_order: int, budget: dict,
+                     limit: int = 5,
+                     glossary_rows: Iterable[Mapping] | None = None,
+                     accepted_texts: Mapping[int, str] | None = None) -> dict:
+        term = str(term or "").strip()
+        if not term:
+            raise ValueError("term must not be empty")
+        if term not in budget["used_terms"]:
+            if len(budget["used_terms"]) >= budget["max_terms"]:
+                raise ValueError("term lookup budget exhausted")
+            budget["used_terms"].add(term)
+        limit = max(1, min(int(limit or 5), 10))
+        rows = (glossary_rows if glossary_rows is not None
+                else self.store.glossary(limit=1000))
+        glossary = []
+        for row in rows:
+            aliases = [str(value) for value in (row.get("aliases") or [])]
+            if term not in {row["source"], row["target"], *aliases}:
+                continue
+            glossary.append({"source": row["source"], "target": row["target"],
+                             "kind": row["kind"], "confidence": row.get("confidence", 2),
+                             "aliases": aliases, "locked": bool(row.get("locked"))})
+        reference_orders = list(range(0, min(self.continuation_start, current_order)))
+        if accepted_texts is not None:
+            accepted_orders = sorted(
+                order for order in accepted_texts
+                if self.continuation_start <= order < current_order)
+        else:
+            accepted_orders = [order for order in self.store.accepted_orders()
+                               if self.continuation_start <= order < current_order]
+        hits = []
+        for group in (reference_orders, list(reversed(accepted_orders))):
+            for order in group:
+                if len(hits) >= limit:
+                    break
+                source_text = str(self.source(order).get("text", ""))
+                target_text, language = self._prior_target_text(order, accepted_texts)
+                if term not in source_text and (not target_text or term not in target_text):
+                    continue
+                source_paragraph = next(
+                    (paragraph for paragraph in source_text.split("\n\n")
+                     if term in paragraph), "")
+                target_paragraph = ""
+                if target_text:
+                    target_paragraph = next(
+                        (paragraph for paragraph in target_text.split("\n\n")
+                         if term in paragraph), "")
+                if not target_paragraph and target_text:
+                    target_paragraph = target_text[:1000]
+                hits.append({
+                    "order": order,
+                    "title": self.source(order).get("raw_title", ""),
+                    "language": language,
+                    "source": source_paragraph[:500],
+                    "target": target_paragraph[:1000],
+                })
+            if len(hits) >= limit:
+                break
+        return {"term": term, "glossary": glossary, "hits": hits,
+                "budget": self._budget_view(budget)}
+
+    def _execute_review_tool(self, name: str, arguments: str, current_order: int,
+                             budget: dict,
+                             tool_context: Mapping | None = None) -> dict:
+        safe_args = {}
+        accepted_texts = (tool_context.get("accepted_texts")
+                          if tool_context is not None else None)
+        glossary_rows = (tool_context.get("glossary")
+                         if tool_context is not None else None)
+        try:
+            args = json.loads(arguments or "{}")
+            if not isinstance(args, dict):
+                raise ValueError("tool arguments must be an object")
+            safe_args = {key: args.get(key) for key in
+                         ("order", "term", "limit", "include_source")
+                         if key in args}
+            if name == "read_chapter":
+                result = self._read_prior_chapter(
+                    args.get("order"), current_order, budget,
+                    include_source=bool(args.get("include_source", False)),
+                    accepted_texts=accepted_texts)
+            elif name == "lookup_term":
+                result = self._lookup_term(args.get("term", ""), current_order,
+                                           budget, limit=args.get("limit", 5),
+                                           glossary_rows=glossary_rows,
+                                           accepted_texts=accepted_texts)
+            else:
+                result = {"error": "unknown tool", "name": name,
+                          "budget": self._budget_view(budget)}
+        except (ValueError, TypeError, KeyError) as exc:
+            result = {"error": str(exc), "budget": self._budget_view(budget)}
+        record = {
+            "order": current_order, "tool": name, "arguments": safe_args,
+            "budget": self._budget_view(budget), "error": result.get("error"),
+            "hit_count": len(result.get("hits") or ()) if name == "lookup_term" else None}
+        if (tool_context is not None and
+                tool_context.get("buffer_events", True)):
+            tool_context.setdefault("events", []).append(record)
+        else:
+            self.store.event("review_tool", **record)
+        return result
+
     def _review_draft(self, draft: DraftChapter, *, history=None, glossary=None,
                       unresolved_prior=None, log_event: bool = False,
-                      usage_sink: list | None = None) -> ReviewOutcome:
+                      usage_sink: list | None = None,
+                      tool_context: dict | None = None) -> ReviewOutcome:
         rows = self.source_rows(draft.order)
         source = [{"ref": f"S{index:03d}", "text": row["text"]}
                   for index, row in enumerate(rows, 1)]
@@ -759,15 +1168,35 @@ class TranslationRunner:
         source_by_ref = {row["ref"]: row["text"] for row in source}
         target_by_ref = {row["ref"]: row["text"] for row in target}
         history = list(history) if history is not None else self._history_pairs(draft.order)
-        glossary = list(glossary) if glossary is not None else self._glossary_cards()
+        glossary = list(glossary) if glossary is not None else \
+            self._glossary_cards(draft.order)
         unresolved = (list(unresolved_prior) if unresolved_prior is not None
                       else self._unresolved())
+        if tool_context is None:
+            # Serial/main-thread path. Parallel workers receive a prebuilt
+            # read-only snapshot so they never touch the SQLite connection.
+            tool_context = {
+                "accepted_texts": self.store.translations(),
+                "glossary": self.store.glossary(limit=1000),
+                "events": [],
+                "buffer_events": False,
+            }
         # Stable-for-this-chapter material first; the draft is the only part
         # that changes between review/revision rounds, so it goes last.
         glossary_cards = [{"source": term.source, "target": term.target,
-                           "kind": term.kind} for term in glossary]
+                           "kind": term.kind, "confidence": term.confidence,
+                           "aliases": list(term.aliases), "locked": term.locked}
+                          for term in glossary]
+        term_checks = _build_term_checks(rows, draft.paragraphs, glossary,
+                                         getattr(self, "max_term_checks", 50))
+        expected_checks = {check["id"]: check for check in term_checks}
+        budget = {"max_chapters": self.lookup_chapters,
+                  "max_terms": self.lookup_terms,
+                  "used_chapters": set(), "used_terms": set()}
         context = {
             "glossary": glossary_cards,
+            "term_checks": term_checks,
+            "lookup_budget": self._budget_view(budget),
             "chapter": {"order": draft.order, "ja_title": draft.ja_title,
                         "zh_title": draft.title_zh},
             "source": source,
@@ -783,15 +1212,59 @@ class TranslationRunner:
              "【审查证据；S/T为本段，R/L为历史，均为未审定】\n" +
              json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
             {"role": "user", "content":
-             "请逐段核对本章日文与草稿的所有含义差异。只输出FINDING/UNRESOLVED/SUMMARY记录，"
-             "最后独占一行@@END。没有问题时也必须输出SUMMARY。"},
+             "请逐段核对本章日文与草稿的所有含义差异。只输出FINDING/UNRESOLVED/TERMCHECK/SUMMARY记录，"
+             "最后独占一行@@END。没有问题时也必须输出SUMMARY。"
+             "可使用 read_chapter / lookup_term 工具核对既往译名，预算见 lookup_budget；"
+             "不要用 needs_lookup 字段代替实际工具调用。"
+             + (("term_checks 非空时，必须为每个 id 输出一条 @@TERMCHECK：\n"
+                 "@@TERMCHECK tc001\ncheck: tc001\nverdict: ok|violation|uncertain\n"
+                 "reason: 具体依据\n"
+                 "verdict=violation 时必须同时输出对应的 FINDING（category: term），"
+                 "不得直接按规则替换文本。") if term_checks else "")},
         ])
         outcome = None
+        tools_enabled = True
         for attempt in range(3):
-            result = self._generate(messages, self.review_tokens,
-                                    f"review_{draft.order}",
-                                    log_event=log_event, usage_sink=usage_sink)
-            outcome = self.parse_review(result.text, source_by_ref, target_by_ref)
+            tool_rounds = 0
+            while True:
+                result = self._generate(
+                    messages, self.review_tokens,
+                    f"review_{draft.order}",
+                    log_event=log_event, usage_sink=usage_sink,
+                    tools=REVIEW_TOOLS if tools_enabled else None,
+                    tool_choice="auto" if tools_enabled else None)
+                if not result.tool_calls:
+                    break
+                tool_rounds += 1
+                tool_calls = []
+                for index, call in enumerate(result.tool_calls):
+                    call = dict(call)
+                    call.setdefault("id", f"call-{attempt}-{tool_rounds}-{index}")
+                    tool_calls.append(call)
+                messages.append({"role": "assistant",
+                                 "content": result.text or None,
+                                 "tool_calls": tool_calls})
+                for call in tool_calls:
+                    function = call.get("function") or {}
+                    value = self._execute_review_tool(
+                        function.get("name", ""), function.get("arguments", "{}"),
+                        draft.order, budget, tool_context)
+                    messages.append({
+                        "role": "tool", "tool_call_id": call["id"],
+                        "content": json.dumps(value, ensure_ascii=False)})
+                if tool_rounds >= self.max_tool_rounds:
+                    tools_enabled = False
+                    messages.append({
+                        "role": "user",
+                        "content": "工具调用轮次已用尽。请立即基于已有证据输出最终审校记录，"
+                                   "不要再调用工具。"})
+                    result = self._generate(messages, self.review_tokens,
+                                            f"review_{draft.order}",
+                                            log_event=log_event,
+                                            usage_sink=usage_sink)
+                    break
+            outcome = self.parse_review(result.text, source_by_ref, target_by_ref,
+                                        expected_checks=expected_checks)
             if not outcome.errors:
                 break
             messages.extend([
@@ -799,7 +1272,7 @@ class TranslationRunner:
                 {"role": "user", "content":
                  "上次审校输出未通过协议校验。错误：" + "; ".join(outcome.errors) +
                  "\n请重新输出完整审校记录；只能引用已提供的S/T/R/L标签，"
-                 "最后独占一行@@END。"},
+                 "最后逐项输出 TERMCHECK，最后独占一行@@END。"},
             ])
         if outcome is None or outcome.errors:
             raise ChapterBlocked("review_protocol", "review output is invalid",
@@ -811,9 +1284,10 @@ class TranslationRunner:
         return self._review_draft(draft, log_event=True)
 
     def parse_review(self, text: str, source_by_ref: Mapping[str, str],
-                     target_by_ref: Mapping[str, str]) -> ReviewOutcome:
+                     target_by_ref: Mapping[str, str], *,
+                     expected_checks: Mapping[str, Mapping] | None = None) -> ReviewOutcome:
         parsed = parse_records(
-            text, {"FINDING", "UNRESOLVED", "SUMMARY"},
+            text, {"FINDING", "UNRESOLVED", "TERMCHECK", "SUMMARY"},
             field_schema={**FIELDS, "FINDING": FIELDS["FINDING"] | {"basis"}},
             syntax_profile="tolerant-records", allow_inline_end=True,
             allow_preamble=True)
@@ -867,11 +1341,66 @@ class TranslationRunner:
                       for row in parsed["records"]
                       if row["record"] == "UNRESOLVED" and
                       row["fields"].get("text", "").strip()]
+        expected = dict(expected_checks or {})
+        seen_checks = set()
+        term_checks = []
+        for row in parsed["records"]:
+            if row["record"] != "TERMCHECK":
+                continue
+            fields = row["fields"]
+            check_id = str(fields.get("check") or row["id"]).strip()
+            if check_id not in expected:
+                errors.append("unknown_termcheck:" + (check_id or "empty"))
+                continue
+            if check_id in seen_checks:
+                errors.append("duplicate_termcheck:" + check_id)
+                continue
+            seen_checks.add(check_id)
+            verdict = fields.get("verdict")
+            if verdict not in {"ok", "violation", "uncertain"}:
+                errors.append("invalid_termcheck_verdict:" + check_id)
+            if not str(fields.get("reason", "")).strip():
+                errors.append("missing_termcheck_reason:" + check_id)
+            expected_row = expected[check_id]
+            occurrences = expected_row.get("occurrences") or [{
+                "source_ref": expected_row.get("source_ref", ""),
+                "target_ref": expected_row.get("target_ref", ""),
+            }]
+            allowed_refs = {(row.get("source_ref"), row.get("target_ref"))
+                            for row in occurrences}
+            source_ref = _clean_ref(fields.get("source_ref", "")) or \
+                expected_row.get("source_ref", "")
+            target_ref = _clean_ref(fields.get("target_ref", "")) or \
+                expected_row.get("target_ref", "")
+            if (source_ref, target_ref) not in allowed_refs:
+                errors.append("termcheck_ref_mismatch:" + check_id)
+            if verdict == "violation" and not any(
+                    finding.get("category") == "term" and
+                    (finding.get("source_ref"), finding.get("target_ref")) in allowed_refs
+                    for finding in findings):
+                errors.append("termcheck_violation_requires_finding:" + check_id)
+            term_checks.append({
+                "id": check_id, "verdict": verdict,
+                "reason": fields.get("reason", ""),
+                "source_ref": source_ref, "target_ref": target_ref,
+                "term": expected_row.get("term", ""),
+                "canonical": expected_row.get("canonical", ""),
+                "aliases": list(expected_row.get("aliases") or []),
+                "confidence": expected_row.get("confidence"),
+                "locked": bool(expected_row.get("locked")),
+                "status": expected_row.get("status", ""),
+                "occurrence_count": expected_row.get("occurrence_count", 0),
+                "occurrences": list(expected_row.get("occurrences") or []),
+            })
+        missing_checks = sorted(set(expected) - seen_checks)
+        if missing_checks:
+            errors.append("missing_termchecks:" + ",".join(missing_checks))
         return ReviewOutcome(findings=tuple(findings),
                              unresolved=tuple(unresolved),
                              coverage_complete=coverage == "yes",
                              zero_findings=zero == "yes", raw=text,
-                             errors=tuple(errors))
+                             errors=tuple(errors),
+                             term_checks=tuple(term_checks))
 
     # -- adjudication and revision -----------------------------------------
     def adjudicate(self, draft: DraftChapter, review: ReviewOutcome, *,
@@ -884,12 +1413,26 @@ class TranslationRunner:
             findings.append({key: finding.get(key) for key in (
                 "id", "category", "severity", "basis", "source_ref", "target_ref",
                 "claim", "suggestion", "confidence", "source_text", "target_text")})
+        term_checks = [{
+            "id": check.get("id"), "term": check.get("term"),
+            "canonical": check.get("canonical"),
+            "aliases": check.get("aliases") or [],
+            "status": check.get("status"), "confidence": check.get("confidence"),
+            "locked": check.get("locked"),
+            "occurrence_count": check.get("occurrence_count"),
+            "verdict": check.get("verdict"),
+            "source_ref": check.get("source_ref"),
+            "target_ref": check.get("target_ref"),
+            "occurrences": check.get("occurrences") or [],
+        } for check in review.term_checks]
         messages = [{"role": "system", "content": AUDIT_ADJUDICATION}]
         messages.extend(AUDIT_ADJUDICATION_FEWSHOT)
         messages.extend([
             {"role": "user", "content":
              "【候选审校意见与绑定原段；逐项裁决】\n" +
-             json.dumps(findings, ensure_ascii=False, separators=(",", ":"))},
+             json.dumps(findings, ensure_ascii=False, separators=(",", ":")) +
+             "\n【程序术语检查；fixed_missing 的 canonical 为已确认规范译名】\n" +
+             json.dumps(term_checks, ensure_ascii=False, separators=(",", ":"))},
             {"role": "user", "content":
              "每个finding恰好输出一条DECISION；最后输出@@END。"
              "不要新增finding、重写正文。"},
@@ -963,6 +1506,12 @@ class TranslationRunner:
         evidence = {
             "chapter": {"order": draft.order, "ja_title": draft.ja_title},
             "source": source,
+            "term_checks": [
+                {key: check.get(key) for key in (
+                    "id", "term", "canonical", "aliases", "status", "confidence",
+                    "locked", "occurrence_count", "verdict")}
+                for check in review.term_checks
+                if check.get("verdict") == "violation"],
             "confirmed_findings": [
                 {**{key: finding.get(key) for key in (
                     "id", "category", "severity", "source_ref", "target_ref",
@@ -1054,8 +1603,7 @@ class TranslationRunner:
         decisions = self.adjudicate(draft, review)
         confirmed = {finding["id"]: finding for finding in review.findings
                      if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
-        major = {ident: finding for ident, finding in confirmed.items()
-                 if finding.get("severity") in {"critical", "major"}}
+        major = self._revision_findings(confirmed, review)
         rounds = 0
         while major and rounds < self.max_revisions:
             draft = self.revise(draft, review, decisions)
@@ -1067,8 +1615,7 @@ class TranslationRunner:
             decisions = self.adjudicate(draft, review)
             confirmed = {finding["id"]: finding for finding in review.findings
                          if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
-            major = {ident: finding for ident, finding in confirmed.items()
-                     if finding.get("severity") in {"critical", "major"}}
+            major = self._revision_findings(confirmed, review)
             rounds += 1
         review_data = {
             "profile": "chapter-review",
@@ -1076,6 +1623,7 @@ class TranslationRunner:
             "findings": review.findings,
             "decisions": decisions,
             "unresolved": review.unresolved,
+            "term_checks": review.term_checks,
             "semantic_coverage_complete": review.coverage_complete,
             "accepted_with_major": sorted(major),
             "text_hash": digest(draft.text),
@@ -1110,39 +1658,77 @@ class TranslationRunner:
         return {"start": start, "end": end, "chapters": len(results),
                 "results": results, "stats": self.store.stats()}
 
+    def _revision_findings(self, confirmed: Mapping[str, Mapping],
+                           review: ReviewOutcome) -> dict[str, Mapping]:
+        fixed_refs = set()
+        for check in review.term_checks:
+            if (check.get("verdict") != "violation" or
+                    check.get("status") != "fixed_missing"):
+                continue
+            occurrences = check.get("occurrences") or ()
+            if occurrences:
+                fixed_refs.update(
+                    (item.get("source_ref"), item.get("target_ref"))
+                    for item in occurrences)
+            else:
+                fixed_refs.add((check.get("source_ref"), check.get("target_ref")))
+        result = {}
+        for ident, finding in confirmed.items():
+            refs = (finding.get("source_ref"), finding.get("target_ref"))
+            if (finding.get("severity") in {"critical", "major"} or
+                    (finding.get("category") == "term" and refs in fixed_refs)):
+                result[ident] = finding
+        return result
+
     def _process_draft(self, draft: DraftChapter, *, history, glossary,
-                       unresolved_prior, max_revisions: int) -> dict:
+                       unresolved_prior, max_revisions: int,
+                       tool_context: dict | None = None) -> dict:
         usages = []
         try:
             return self._process_draft_inner(
                 draft, history=history, glossary=glossary,
                 unresolved_prior=unresolved_prior,
-                max_revisions=max_revisions, usages=usages)
+                max_revisions=max_revisions, usages=usages,
+                tool_context=tool_context)
         except Exception as exc:
             return {"status": "error", "draft": draft, "review": None,
                     "decisions": {}, "rounds": 0, "usages": usages,
+                    "tool_events": (tool_context or {}).get("events", []),
                     "message": str(exc)}
 
     def _process_draft_inner(self, draft: DraftChapter, *, history, glossary,
                              unresolved_prior, max_revisions: int,
-                             usages: list) -> dict:
+                             usages: list,
+                             tool_context: dict | None = None) -> dict:
         """Pure worker: model calls only, no SQLite or mutable runner state."""
+        if tool_context is None:
+            tool_context = {
+                "accepted_texts": {},
+                "glossary": [{
+                    "source": term.source, "target": term.target,
+                    "kind": term.kind, "confidence": term.confidence,
+                    "aliases": list(term.aliases), "locked": term.locked,
+                } for term in glossary],
+                "events": [],
+                "buffer_events": True,
+            }
         review = self._review_draft(
             draft, history=history, glossary=glossary,
             unresolved_prior=unresolved_prior, log_event=False,
-            usage_sink=usages)
+            usage_sink=usages, tool_context=tool_context)
         if review.errors:
             return {"status": "error", "draft": draft, "review": review,
-                    "decisions": {}, "rounds": 0, "usages": usages}
+                    "decisions": {}, "rounds": 0, "usages": usages,
+                    "tool_events": tool_context.get("events", [])}
         if not review.coverage_complete:
             return {"status": "incomplete", "draft": draft, "review": review,
-                    "decisions": {}, "rounds": 0, "usages": usages}
+                    "decisions": {}, "rounds": 0, "usages": usages,
+                    "tool_events": tool_context.get("events", [])}
         decisions = self.adjudicate(draft, review, log_event=False,
                                     usage_sink=usages)
         confirmed = {finding["id"]: finding for finding in review.findings
                      if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
-        major = {ident: finding for ident, finding in confirmed.items()
-                 if finding.get("severity") in {"critical", "major"}}
+        major = self._revision_findings(confirmed, review)
         rounds = 0
         while major and rounds < max_revisions:
             draft = self._revise_draft(draft, review, decisions, log_event=False,
@@ -1150,20 +1736,21 @@ class TranslationRunner:
             review = self._review_draft(
                 draft, history=history, glossary=glossary,
                 unresolved_prior=unresolved_prior, log_event=False,
-                usage_sink=usages)
+                usage_sink=usages, tool_context=tool_context)
             if review.errors:
                 return {"status": "error", "draft": draft, "review": review,
-                        "decisions": {}, "rounds": rounds, "usages": usages}
+                        "decisions": {}, "rounds": rounds, "usages": usages,
+                        "tool_events": tool_context.get("events", [])}
             decisions = self.adjudicate(draft, review, log_event=False,
                                         usage_sink=usages)
             confirmed = {finding["id"]: finding for finding in review.findings
                          if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
-            major = {ident: finding for ident, finding in confirmed.items()
-                     if finding.get("severity") in {"critical", "major"}}
+            major = self._revision_findings(confirmed, review)
             rounds += 1
         return {"status": "blocked" if major else "accepted",
                 "draft": draft, "review": review, "decisions": decisions,
                 "rounds": rounds, "usages": usages,
+                "tool_events": tool_context.get("events", []),
                 "major": sorted(major)}
 
     def _review_data(self, result: Mapping) -> dict:
@@ -1174,6 +1761,7 @@ class TranslationRunner:
             "findings": review.findings,
             "decisions": result["decisions"],
             "unresolved": review.unresolved,
+            "term_checks": review.term_checks,
             "semantic_coverage_complete": review.coverage_complete,
             "accepted_with_major": result.get("major", []),
             "text_hash": digest(result["draft"].text),
@@ -1224,6 +1812,12 @@ class TranslationRunner:
                 snapshot = self.snapshot(batch[0], documents)
                 glossary = self.ensure_batch_glossary(batch)
                 unresolved = self._unresolved()
+                # Read-only snapshot for review tools. Workers must not use
+                # the store connection, which belongs to the main thread.
+                tool_snapshot = {
+                    "accepted_texts": self.store.translations(),
+                    "glossary": self.store.glossary(limit=1000),
+                }
                 translation_jobs = {}
 
                 def submit_translation(order):
@@ -1287,10 +1881,13 @@ class TranslationRunner:
                         draft.order,
                         provisional={o: t for o, t in provisional.items()
                                      if o < draft.order})
+                    tool_context = {**tool_snapshot, "events": [],
+                                    "buffer_events": True}
                     review_jobs.append((draft, review_pool.submit(
                         self._process_draft, draft, history=history,
                         glossary=glossary, unresolved_prior=unresolved,
-                        max_revisions=self.max_revisions)))
+                        max_revisions=self.max_revisions,
+                        tool_context=tool_context)))
                 blocked = None
                 for draft, job in review_jobs:
                     try:
@@ -1299,6 +1896,8 @@ class TranslationRunner:
                         result = {"status": "error", "draft": draft,
                                   "usages": [], "message": str(exc),
                                   "review": None, "decisions": {}, "rounds": 0}
+                    for event in result.get("tool_events") or []:
+                        self.store.event("review_tool", **event)
                     for usage in result.get("usages", []):
                         self.store.event("model", **usage)
                     status = result["status"]
@@ -1473,13 +2072,8 @@ class TranslationRunner:
                         f"### ZH {text}")
             if not pairs:
                 continue
-            prompt = (
-                "下面是同一部Web小说相邻章节的日文原文和官方中文译文。请提取在两版中"
-                "稳定对应的专有名词：人名、地名、组织、称号、物品、技能。不要提取普通"
-                "名词、整句或只在单侧出现的词。只输出JSON数组，不要解释或代码块：\n"
-                '[{"source":"クリシェ","target":"库莉茜耶","kind":"person","confidence":"high"}]'
-                "\nkind只能是person、place、organization、title、item、skill、other。"
-                "最多40项。\n\n" + "\n\n".join(pairs))
+            style_hint = self._target_style_hint()
+            prompt = _reference_glossary_prompt(pairs, style_hint)
             try:
                 result = self._generate([
                     {"role": "system", "content": "你是严谨的日中对照术语整理员。"},
@@ -1489,6 +2083,19 @@ class TranslationRunner:
                 self.store.put_glossary(rows)
                 self.store.event("glossary_chunk", start=start, end=stop,
                                  terms=len(rows))
+                try:
+                    focused = self._generate([
+                        {"role": "system", "content": "你是严谨的日中对照术语整理员。"},
+                        {"role": "user", "content":
+                         _reference_focused_prompt(pairs, style_hint)},
+                    ], self.glossary_tokens, f"glossary_focus_{start}_{stop}")
+                    focused_rows = _parse_json_array(focused.text)
+                    self.store.put_glossary(focused_rows)
+                    self.store.event("glossary_focus_chunk", start=start,
+                                     end=stop, terms=len(focused_rows))
+                except (PipelineError, ProviderError, ValueError):
+                    self.store.event("glossary_focus_failed", start=start,
+                                     end=stop)
                 done.add((start, stop))
             except (PipelineError, ProviderError, ValueError):
                 self.store.event("glossary_failed", start=start, end=stop)
@@ -1519,16 +2126,7 @@ class TranslationRunner:
                     if str(row.get("source", "")).strip() in text]
         self._check_limits()
         rows = []
-        prompt = (
-            "下面是本批次相邻章节的日文原文和已有术语表。请补充本批次出现的专有名词："
-            "人名、地名、组织、称号、物品、技能。已有术语必须原样沿用已有译名，不要改写；"
-            "只输出需要新增或确认的项，不要输出普通名词或整句。只输出JSON数组，不要解释"
-            "或代码块：\n"
-            '[{"source":"クリシェ","target":"库莉茜耶","kind":"person","confidence":"high"}]\n'
-            "kind只能是person、place、organization、title、item、skill、other。最多80项。\n\n"
-            "【已有术语表】\n" +
-            json.dumps(relevant, ensure_ascii=False, separators=(",", ":")) +
-            "\n\n【本批次原文】\n" + text)
+        prompt = _batch_glossary_prompt(text, relevant, self._target_style_hint())
         try:
             result = self._generate([
                 {"role": "system", "content": "你是严谨的日中轻小说术语整理员。"},
@@ -1542,6 +2140,15 @@ class TranslationRunner:
                 if source and target and source not in deduped:
                     deduped[source] = {**row, "source": source, "target": target}
             rows = [deduped[source] for source in sorted(deduped)]
+            # A term never observed in the aligned reference cannot be a fixed
+            # canonical form; keep the first continuation sighting a candidate.
+            reference_source = "\n".join(
+                self.source(order).get("text", "")
+                for order in range(0, self.continuation_start)
+                if order in self.source_by_order)
+            for row in rows:
+                if row["source"] not in reference_source:
+                    row["confidence"] = 3
             self.store.put_glossary(rows)
             self.store.event("batch_glossary", start=orders[0], end=orders[-1] + 1,
                              terms=len(rows))
@@ -1555,13 +2162,71 @@ class TranslationRunner:
             source = str(row.get("source", "")).strip()
             target = str(row.get("target", "")).strip()
             if source and target:
-                merged[source] = GlossaryTerm(source, target,
-                                              str(row.get("kind") or "other"))
+                merged[source] = GlossaryTerm(
+                    source, target, str(row.get("kind") or "other"),
+                    int(row.get("confidence", 2)),
+                    tuple(row.get("aliases") or ()),
+                    bool(row.get("locked")))
         for row in rows:
-            merged.setdefault(row["source"],
-                              GlossaryTerm(row["source"], row["target"],
-                                           str(row.get("kind") or "other")))
+            source = row["source"]
+            if source in merged:
+                continue
+            merged[source] = GlossaryTerm(
+                source, row["target"], str(row.get("kind") or "other"),
+                _normalize_confidence(row.get("confidence")),
+                tuple(_normalize_aliases(row.get("aliases"))),
+                bool(row.get("locked", False)))
         return list(merged.values())
+
+
+def _reference_glossary_prompt(pairs: Sequence[str], style_hint: str = "") -> str:
+    return (
+        "下面是同一部Web小说相邻章节的日文原文和官方中文译文。请提取在两版中"
+        "稳定对应的专名：人名、地名、组织、称号、职务、种族/族裔、物品、技能。"
+        "不要提取普通名词、整句或只在单侧出现的词。只输出JSON数组，不要解释或代码块：\n"
+        '[{"source":"クリシェ","target":"庫莉茜耶","kind":"person","confidence":1,"aliases":[]}]'
+        "\nkind只能是person、place、organization、title、role、race、item、skill、other。"
+        "\nconfidence只能是：1=已固定译名（参考译文明确且稳定，必须沿用）；"
+        "2=需要根据语境判断（参考有候选，但可能随语境变化，可在aliases给出允许变体）；"
+        "3=仅候选（首次出现或证据不足，后续确认）。没有参考中文支持时不得使用1。"
+        "\ntarget必须与参考中文正文的字形一致（参考为繁体时不得输出简体）；"
+        "同一源词有多个中文写法时 confidence=2 并把其它写法放入 aliases。"
+        "\naliases是同一对象可接受的其它中文写法数组；没有就写[]。最多40项。"
+        + (f"\n【目标字形参考】{style_hint}" if style_hint else "")
+        + "\n\n" + "\n\n".join(pairs))
+
+
+def _reference_focused_prompt(pairs: Sequence[str], style_hint: str = "") -> str:
+    return (
+        "下面是同一部Web小说相邻章节的日文原文和官方中文译文。只提取在两版中稳定对应的："
+        "职务、称号、组织职位、种族/族裔、组织/团体称谓。即使不是专有名词，只要反复出现并稳定对应也要提取；"
+        "忽略人名、地名、物品、技能和普通叙述。只输出JSON数组，不要解释或代码块：\n"
+        '[{"source":"組合長","target":"公會長","kind":"role","confidence":2,"aliases":["會長"]}]'
+        "\nkind只能是title、role、race、organization、other。"
+        "\nconfidence只能是：1=两版稳定且无歧义；2=同一源词在不同语境有多个中文写法，必须在aliases列出；"
+        "3=首次出现或证据不足。没有参考中文支持时不得使用1。"
+        "\ntarget必须与参考中文正文的字形一致（参考为繁体时不得输出简体）。最多60项。"
+        + (f"\n【目标字形参考】{style_hint}" if style_hint else "")
+        + "\n\n" + "\n\n".join(pairs))
+
+
+def _batch_glossary_prompt(text: str, relevant: Sequence[Mapping],
+                           style_hint: str = "") -> str:
+    return (
+        "下面是本批次相邻章节的日文原文和已有术语表。请补充本批次出现的专名："
+        "人名、地名、组织、称号、职务、种族/族裔、物品、技能。已有术语必须沿用已有规范译名，"
+        "不要改写；只输出需要新增或确认的项，不要输出普通名词或整句。只输出JSON数组，不要解释"
+        "或代码块：\n"
+        '[{"source":"クリシェ","target":"庫莉茜耶","kind":"person","confidence":1,"aliases":[]}]\n'
+        "kind只能是person、place、organization、title、role、race、item、skill、other。"
+        "confidence只能是：1=已固定译名；2=需要根据语境判断；3=仅候选。"
+        "没有参考中文支持的首次出现必须使用3，不得标1。"
+        "target必须与已有术语表和项目参考译文的字形一致（参考为繁体时不得输出简体）。"
+        "aliases是允许的其它写法数组。最多80项。"
+        + (f"\n【目标字形参考】{style_hint}" if style_hint else "")
+        + "\n\n【已有术语表】\n"
+        + json.dumps(list(relevant), ensure_ascii=False, separators=(",", ":"))
+        + "\n\n【本批次原文】\n" + text)
 
 
 def _parse_json_array(text: str) -> list[dict]:

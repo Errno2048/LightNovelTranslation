@@ -85,6 +85,10 @@ class HTTPProvider:
     def generate(self, request: GenerationRequest) -> GenerationResult:
         payload = {"model": self.config.model, "messages": request.messages, "max_tokens": request.max_tokens,
                    "temperature": request.temperature, "stream": False}
+        if request.tools is not None:
+            payload["tools"] = request.tools
+        if request.tool_choice is not None:
+            payload["tool_choice"] = request.tool_choice
         if type(self.config.thinking) is bool:
             payload["thinking"] = {"type": "enabled" if self.config.thinking else "disabled"}
         if self.config.reasoning_effort is not None:
@@ -95,8 +99,11 @@ class HTTPProvider:
             choice = data["choices"][0]
             message = choice["message"]
             text, reason = message.get("content"), choice.get("finish_reason")
+            tool_calls = message.get("tool_calls") or []
         except (KeyError, TypeError, IndexError):
             raise ProviderError("invalid_response", "missing completion choice") from None
+        if not isinstance(tool_calls, list):
+            raise ProviderError("invalid_response", "tool_calls must be a list")
         if message.get("refusal") or reason in {"content_filter", "sensitive"}:
             raise ProviderError("refusal", "generation was refused/filtered")
         if reason == "length":
@@ -105,6 +112,16 @@ class HTTPProvider:
                 "usage": data.get("usage") if isinstance(data.get("usage"), dict) else {},
                 "text": text if isinstance(text, str) else "",
             })
+        if tool_calls:
+            if text is not None and not isinstance(text, str):
+                raise ProviderError("invalid_response", "content must be text")
+            if data.get("usage") is not None and not isinstance(data["usage"], dict):
+                raise ProviderError("invalid_response", "usage must be an object")
+            return GenerationResult((text or "").strip(), reason or "tool_calls",
+                                    data.get("model"), data.get("id"),
+                                    data.get("usage") or {},
+                                    round(time.monotonic() - started, 3),
+                                    tool_calls=tool_calls)
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("empty", "no output text")
         if reason != "stop":
@@ -143,6 +160,12 @@ class MockProvider:
         value = self.script.pop(0) if self.script else "离线模拟译文。"
         if isinstance(value, Exception):
             raise value
+        if isinstance(value, dict):
+            tool_calls = value.get("tool_calls") or []
+            return GenerationResult(value.get("text", ""),
+                                    "tool_calls" if tool_calls else "stop",
+                                    "mock", f"mock-{self.requests_made}", {}, 0,
+                                    tool_calls=tool_calls)
         return GenerationResult(value, "stop", "mock", f"mock-{self.requests_made}", {}, 0)
 
     def embed(self, texts: list[str]) -> dict:
