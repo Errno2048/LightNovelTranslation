@@ -3695,9 +3695,16 @@ def _render_image(href: str, alt: str) -> str:
 
 
 def _render_paragraph(text: str, placements: Sequence[Mapping],
-                      asset_files: Mapping[str, Mapping]) -> str:
+                      asset_files: Mapping[str, Mapping], *,
+                      class_name: str = "", language: str = "") -> str:
+    attributes = ""
+    if class_name:
+        attributes += f' class="{html.escape(class_name, quote=True)}"'
+    if language:
+        value = html.escape(language, quote=True)
+        attributes += f' lang="{value}" xml:lang="{value}"'
     if not placements:
-        return f"<p>{html.escape(text)}</p>"
+        return f"<p{attributes}>{html.escape(text)}</p>"
     pieces: list[str] = []
     cursor = 0
     for item in sorted(placements, key=lambda value: int(value.get("offset", 0))):
@@ -3710,7 +3717,7 @@ def _render_paragraph(text: str, placements: Sequence[Mapping],
                                     asset.get("alt", "")))
         cursor = offset
     pieces.append(html.escape(text[cursor:]))
-    return "<p>" + "".join(pieces) + "</p>"
+    return f"<p{attributes}>" + "".join(pieces) + "</p>"
 
 
 def _render_block_image(asset_id: str, asset_files: Mapping[str, Mapping]) -> str:
@@ -3723,12 +3730,17 @@ def _render_block_image(asset_id: str, asset_files: Mapping[str, Mapping]) -> st
 def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
                language: str = "zh-CN",
                assets: Mapping[str, Mapping] | None = None,
-               cover_asset: str | None = None) -> Path:
+               cover_asset: str | None = None,
+               bilingual: bool = False,
+               source_language: str = "ja") -> Path:
     """Write an EPUB 3 from ordered chapter rows, optionally with image assets.
 
     ``assets`` maps asset_id to ``{data: bytes, media_type: str, alt: str}``.
     Chapter assets use ``inline`` (paragraph/offset) and ``block``
-    (before_paragraph/after_paragraph) placements.
+    (before_paragraph/after_paragraph) placements. When ``bilingual`` is true,
+    chapters carrying ``source_paragraphs`` render the translation first and
+    the original below it, using the same paragraph-position pairing as the
+    HTML review export.
     """
     output = Path(output)
     if output.exists():
@@ -3764,9 +3776,24 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
 
     manifest, spine, nav = [], [], []
     files: dict[str, str | bytes] = {}
+    language_attr = html.escape(str(language), quote=True)
+    source_language_attr = html.escape(str(source_language), quote=True)
     for index, chapter in enumerate(chapters, 1):
         name = f"chapter-{index:04d}.xhtml"
         chapter_title = html.escape(chapter["title"] or f"第{index}章")
+        source_title = str(chapter.get("source_title") or
+                           chapter.get("ja_title") or "").strip()
+        source_paragraphs = [str(text).strip() for text in
+                             (chapter.get("source_paragraphs") or [])
+                             if str(text).strip()]
+        bilingual_chapter = bool(bilingual and source_paragraphs)
+        if bilingual_chapter:
+            pairs, source_count, target_count = _bilingual_pairs(
+                source_paragraphs, chapter["paragraphs"])
+        else:
+            pairs = [(None, text) for text in chapter["paragraphs"]
+                     if str(text).strip()]
+            source_count = target_count = 0
         chapter_assets = chapter.get("assets") or {}
         inline_by_paragraph: dict[int, list[Mapping]] = {}
         for item in chapter_assets.get("inline") or []:
@@ -3780,25 +3807,51 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
             else:
                 after.setdefault(int(item.get("after_paragraph", -1)), []).append(rendered)
         parts: list[str] = list(after.get(-1, []))
+        if bilingual_chapter and source_count != target_count:
+            parts.append(
+                f'<p class="bl-mismatch" lang="{language_attr}"'
+                f' xml:lang="{language_attr}">段落数不一致：原文 {source_count} 段，'
+                f'译文 {target_count} 段；未配对内容按顺序保留。</p>')
         paragraph_index = 0
-        for text in chapter["paragraphs"]:
-            if not text.strip():
-                continue
+        for source_text, target_text in pairs:
             parts.extend(before.get(paragraph_index, []))
-            parts.append(_render_paragraph(text,
-                                           inline_by_paragraph.get(paragraph_index, []),
-                                           asset_files))
+            if bilingual_chapter:
+                translation = _render_paragraph(
+                    target_text or "（无译文）",
+                    inline_by_paragraph.get(paragraph_index, []),
+                    asset_files,
+                    class_name=("bl-translation" if target_text
+                                else "bl-translation bl-missing"),
+                    language=language_attr)
+                original = _render_paragraph(
+                    source_text or "（无原文）", [], asset_files,
+                    class_name=("bl-original" if source_text
+                                else "bl-original bl-missing"),
+                    language=source_language_attr)
+                parts.append(f'<div class="bl-pair">{translation}{original}</div>')
+            elif target_text is not None:
+                parts.append(_render_paragraph(
+                    target_text,
+                    inline_by_paragraph.get(paragraph_index, []),
+                    asset_files))
             parts.extend(after.get(paragraph_index, []))
             paragraph_index += 1
         for extra in sorted(index for index in after if index >= paragraph_index):
             parts.extend(after[extra])
+        source_heading = ""
+        if bilingual and source_title and source_title != str(chapter["title"]):
+            source_heading = (
+                f'<p class="source-title" lang="{source_language_attr}"'
+                f' xml:lang="{source_language_attr}">原文标题：'
+                f'{html.escape(source_title)}</p>')
         body = "\n".join(parts)
         files[f"OEBPS/text/{name}"] = f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{language}">
+<html xmlns="http://www.w3.org/1999/xhtml" lang="{language_attr}" xml:lang="{language_attr}">
 <head><meta charset="utf-8"/><title>{chapter_title}</title>
 <link rel="stylesheet" type="text/css" href="../style.css"/></head>
 <body><h1>{chapter_title}</h1>
+{source_heading}
 {body}
 </body></html>"""
         manifest.append(f'<item id="c{index:04d}" href="text/{name}" media-type="application/xhtml+xml"/>')
@@ -3812,11 +3865,22 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
 <body><nav epub:type="toc" id="toc"><h1>{toc_title}</h1><ol>
 {''.join(nav)}
 </ol></nav></body></html>"""
-    files["OEBPS/style.css"] = ("body{font-family:serif;line-height:1.8;margin:1.2em;}"
-                                "h1{font-size:1.4em;margin:1.2em 0;}"
-                                "p{text-indent:2em;margin:0.35em 0;}"
-                                "p.image{text-align:center;text-indent:0;}"
-                                "p.image img{max-width:100%;height:auto;}")
+    files["OEBPS/style.css"] = (
+        "body{font-family:serif;line-height:1.8;margin:1.2em;}"
+        "h1{font-size:1.4em;margin:1.2em 0;}"
+        "p{text-indent:2em;margin:0.35em 0;}"
+        "p.image{text-align:center;text-indent:0;}"
+        "p.image img{max-width:100%;height:auto;}"
+        "div.bl-pair{margin:0 0 1.1em;break-inside:avoid;page-break-inside:avoid;}"
+        "p.bl-translation{text-indent:2em;margin:0;}"
+        "p.bl-original{text-indent:0;margin:0.3em 0 0;padding-left:0.6em;"
+        "border-left:2px solid currentColor;font-size:0.86em;line-height:1.6;"
+        "opacity:0.7;}"
+        "p.bl-missing{font-style:italic;opacity:0.55;}"
+        "p.bl-mismatch{text-indent:0;font-size:0.86em;opacity:0.7;"
+        "border-left:3px solid currentColor;padding-left:0.6em;}"
+        "p.source-title{text-indent:0;font-size:0.86em;opacity:0.65;"
+        "margin:0 0 1em;}")
     cover_meta = ('<meta name="cover" content="cover-image"/>'
                   if cover_asset else "")
     files["OEBPS/content.opf"] = f"""<?xml version="1.0" encoding="utf-8"?>
@@ -3915,10 +3979,19 @@ def verify_epub(path: str | Path) -> dict:
                 "size": path.stat().st_size}
 
 
+def _source_paragraphs(runner: TranslationRunner, order: int) -> list[str]:
+    if order not in runner.source_by_order:
+        return []
+    return [str(source_row.get("text", "")).strip()
+            for source_row in runner.source_rows(order)
+            if str(source_row.get("text", "")).strip()]
+
+
 def collect_epub_chapters(*, runner: TranslationRunner,
                           reference_chapters: Sequence[dict],
                           end: int | None = None,
-                          reference_assets: Mapping[int, Mapping] | None = None) -> list[dict]:
+                          reference_assets: Mapping[int, Mapping] | None = None,
+                          bilingual: bool = False) -> list[dict]:
     """Collect the main line in reading order, preferring accepted target text."""
     end = runner.main_end if end is None else end
     reference_assets = reference_assets or {}
@@ -3927,6 +4000,12 @@ def collect_epub_chapters(*, runner: TranslationRunner,
         chapter = dict(row)
         chapter.setdefault("assets", reference_assets.get(chapter.get("order")) or
                            {"inline": [], "block": []})
+        order = chapter.get("order")
+        if bilingual and isinstance(order, int) and order in runner.source_by_order:
+            chapter.setdefault("source_paragraphs",
+                               _source_paragraphs(runner, order))
+            chapter.setdefault("source_title",
+                               runner.source(order)["raw_title"])
         chapters.append(chapter)
     for order in range(runner.continuation_start, end):
         source = runner.source_by_order.get(order)
@@ -3936,8 +4015,291 @@ def collect_epub_chapters(*, runner: TranslationRunner,
         if not row or row["status"] != "accepted":
             raise PipelineError("missing_accepted",
                                 f"chapter {order} is not accepted")
-        chapters.append({"title": row["title_zh"],
-                         "paragraphs": row["text"].split("\n\n"),
-                         "order": order, "source": "target",
-                         "assets": row.get("assets") or {"inline": [], "block": []}})
+        chapter = {"title": row["title_zh"],
+                   "paragraphs": row["text"].split("\n\n"),
+                   "order": order, "source": "target",
+                   "assets": row.get("assets") or {"inline": [], "block": []}}
+        if bilingual:
+            chapter["source_paragraphs"] = _source_paragraphs(runner, order)
+            chapter["source_title"] = source["raw_title"]
+        chapters.append(chapter)
     return chapters
+
+
+_BILINGUAL_CSS = """
+:root { color-scheme: light dark; }
+* { box-sizing: border-box; }
+html { font-size: 100%; }
+body {
+  max-width: 52em;
+  margin: 0 auto;
+  padding: 2.4em 1.25em 4em;
+  font-family: Georgia, "Noto Serif CJK SC", "Source Han Serif SC",
+               "Songti SC", "Yu Mincho", serif;
+  line-height: 1.75;
+  color: #1f1f1f;
+  background: #fbfaf7;
+  overflow-wrap: anywhere;
+}
+.document-header {
+  margin: 0 0 2.4em;
+  padding: 0 0 1.4em;
+  border-bottom: 1px solid rgba(127, 127, 127, 0.28);
+}
+.eyebrow {
+  margin: 0 0 0.35em;
+  font-size: 0.76em;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  opacity: 0.62;
+}
+.document-header h1 {
+  margin: 0 0 0.35em;
+  font-size: 1.9em;
+  line-height: 1.28;
+}
+.lede {
+  margin: 0;
+  font-size: 0.9em;
+  opacity: 0.68;
+}
+.toc {
+  margin: 0 0 2.8em;
+  padding: 1.2em 1.4em;
+  border: 1px solid rgba(127, 127, 127, 0.22);
+  border-radius: 0.35em;
+  background: rgba(127, 127, 127, 0.045);
+}
+.toc h2 {
+  margin: 0 0 0.7em;
+  font-size: 1.05em;
+}
+.toc ol {
+  margin: 0;
+  padding-left: 1.4em;
+}
+.toc li {
+  margin: 0.32em 0;
+}
+.toc a {
+  color: inherit;
+  text-decoration-thickness: 0.06em;
+  text-underline-offset: 0.18em;
+}
+.toc-original {
+  display: block;
+  margin-top: 0.1em;
+  font-size: 0.82em;
+  opacity: 0.62;
+}
+.chapter {
+  margin: 0;
+}
+.chapter + .chapter {
+  margin-top: 2.8em;
+  padding-top: 2.4em;
+  border-top: 1px solid rgba(127, 127, 127, 0.24);
+}
+.chapter h2 {
+  margin: 0 0 0.2em;
+  font-size: 1.42em;
+  line-height: 1.32;
+}
+.chapter-meta {
+  margin: 0 0 0.2em;
+  font-size: 0.76em;
+  letter-spacing: 0.02em;
+  opacity: 0.58;
+}
+.source-title {
+  margin: 0 0 1.1em;
+  font-size: 0.86em;
+  opacity: 0.64;
+}
+.mismatch {
+  margin: 0 0 1.2em;
+  padding: 0.55em 0.8em;
+  border-left: 3px solid #b7791f;
+  background: rgba(183, 121, 31, 0.08);
+  font-size: 0.84em;
+  line-height: 1.5;
+}
+.bilingual-pair {
+  margin: 0 0 1.35em;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+.bilingual-pair .translation {
+  margin: 0;
+  font-size: 1em;
+  line-height: 1.8;
+}
+.bilingual-pair .original {
+  margin: 0.38em 0 0;
+  padding-left: 0.65em;
+  border-left: 2px solid currentColor;
+  font-size: 0.86em;
+  line-height: 1.58;
+  opacity: 0.7;
+}
+.missing {
+  font-style: italic;
+  opacity: 0.52;
+}
+.empty {
+  margin: 2em 0;
+  opacity: 0.65;
+}
+@media (prefers-color-scheme: dark) {
+  body { color: #e9e7e2; background: #171717; }
+  .document-header { border-color: rgba(255, 255, 255, 0.2); }
+  .chapter + .chapter { border-color: rgba(255, 255, 255, 0.18); }
+  .toc { border-color: rgba(255, 255, 255, 0.18); }
+  .mismatch { background: rgba(255, 200, 100, 0.08); }
+}
+@media print {
+  body { max-width: none; padding: 0; background: transparent; color: #000; }
+  .toc { break-after: page; }
+}
+""".strip()
+
+
+_BILINGUAL_STATUS = {
+    "accepted": "已接受",
+    "ready": "待接受",
+    "manual_review": "人工复核",
+    "draft": "草稿",
+    "blocked": "阻塞",
+    "stale": "需重译",
+}
+
+
+def _bilingual_paragraph(value) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return html.escape(text, quote=False).replace("\n", "<br />")
+
+
+def _bilingual_pairs(source_paragraphs, target_paragraphs):
+    source = [str(text).strip() for text in source_paragraphs
+              if str(text).strip()]
+    target = [str(text).strip() for text in target_paragraphs
+              if str(text).strip()]
+    count = max(len(source), len(target))
+    return ([(source[index] if index < len(source) else None,
+              target[index] if index < len(target) else None)
+             for index in range(count)], len(source), len(target))
+
+
+def build_bilingual_html(*, chapters: Sequence[Mapping], title: str,
+                         language: str = "zh-CN",
+                         source_language: str = "ja") -> str:
+    """Render a two-line bilingual review HTML document.
+
+    Translation is primary; the original follows in a smaller, muted block.
+    Paragraphs are paired by position, so merged/split translations remain
+    visible instead of being silently dropped.
+    """
+    language_attr = html.escape(str(language or "zh-CN"), quote=True)
+    source_language_attr = html.escape(str(source_language or "ja"),
+                                       quote=True)
+    document_title = html.escape(str(title or "双语人工复核版"))
+    chapter_count = 0
+    pair_count = 0
+    toc = []
+    sections = []
+    for index, chapter in enumerate(chapters, 1):
+        order = chapter.get("order")
+        anchor = (f"chapter-{order}" if order is not None
+                  else f"chapter-{index}")
+        anchor = html.escape(str(anchor), quote=True)
+        target_title = str(chapter.get("title") or "").strip()
+        source_title = str(chapter.get("source_title") or
+                           chapter.get("ja_title") or "").strip()
+        heading = target_title or source_title or f"第 {index} 节"
+        status = str(chapter.get("status") or "").strip()
+        source_paragraphs = chapter.get("source_paragraphs")
+        target_paragraphs = chapter.get("translation_paragraphs")
+        if target_paragraphs is None:
+            target_paragraphs = chapter.get("paragraphs")
+        if target_paragraphs is None:
+            target_paragraphs = str(chapter.get("text") or "").split("\n\n")
+        if source_paragraphs is None:
+            source_paragraphs = []
+        pairs, source_count, target_count = _bilingual_pairs(
+            source_paragraphs, target_paragraphs)
+        chapter_count += 1
+        pair_count += len(pairs)
+        toc.append(
+            f'<li><a href="#{anchor}">{html.escape(heading)}</a>'
+            + (f'<span class="toc-original" lang="{source_language_attr}"'
+               f' xml:lang="{source_language_attr}">'
+               f'{html.escape(source_title)}</span>'
+               if source_title and source_title != heading else "")
+            + "</li>")
+        meta = []
+        if order is not None:
+            meta.append(f"序号 {html.escape(str(order))}")
+        if status:
+            meta.append(html.escape(_BILINGUAL_STATUS.get(status, status)))
+        parts = [
+            f'<section class="chapter" id="{anchor}"'
+            f' data-order="{html.escape(str(order)) if order is not None else ""}"'
+            f' data-source-count="{source_count}"'
+            f' data-target-count="{target_count}">',
+            f"<h2>{html.escape(heading)}</h2>",
+        ]
+        if meta:
+            parts.append(f'<p class="chapter-meta">{" · ".join(meta)}</p>')
+        if source_title and source_title != heading:
+            parts.append(
+                f'<p class="source-title" lang="{source_language_attr}"'
+                f' xml:lang="{source_language_attr}">原文标题：'
+                f'{html.escape(source_title)}</p>')
+        if source_count != target_count:
+            parts.append(
+                f'<p class="mismatch">段落数不一致：原文 {source_count} 段，'
+                f'译文 {target_count} 段；未配对内容按顺序保留。</p>')
+        for source_text, target_text in pairs:
+            original = _bilingual_paragraph(source_text)
+            translation = _bilingual_paragraph(target_text)
+            if not original and not translation:
+                continue
+            translation_class = "translation" + ("" if translation else " missing")
+            original_class = "original" + ("" if original else " missing")
+            parts.append(
+                '<div class="bilingual-pair">'
+                f'<p class="{translation_class}" lang="{language_attr}"'
+                f' xml:lang="{language_attr}">'
+                f'{translation or "（无译文）"}</p>'
+                f'<p class="{original_class}" lang="{source_language_attr}"'
+                f' xml:lang="{source_language_attr}">'
+                f'{original or "（无原文）"}</p>'
+                "</div>")
+        parts.append("</section>")
+        sections.append("".join(parts))
+    if not sections:
+        sections.append('<p class="empty">没有可导出的章节。</p>')
+    nav = ('<nav class="toc" aria-label="章节目录"><h2>目录</h2><ol>'
+           + "".join(toc) + "</ol></nav>") if toc else ""
+    return (
+        "<!DOCTYPE html>\n"
+        '<html xmlns="http://www.w3.org/1999/xhtml" '
+        f'lang="{language_attr}" xml:lang="{language_attr}">\n'
+        "<head>\n"
+        '<meta charset="utf-8" />\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1" />\n'
+        f"<title>{document_title}</title>\n"
+        f"<style>{_BILINGUAL_CSS}</style>\n"
+        "</head>\n<body>\n"
+        '<header class="document-header">\n'
+        '<p class="eyebrow">人工复核 · 双语对照</p>\n'
+        f"<h1>{document_title}</h1>\n"
+        f'<p class="lede">译文在上，原文在下。共 {chapter_count} 章，'
+        f"{pair_count} 个段落对。</p>\n"
+        "</header>\n"
+        f"{nav}\n"
+        "<main>\n" + "\n".join(sections) + "\n</main>\n"
+        "</body>\n</html>\n"
+    )

@@ -143,6 +143,47 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
     build_epub(output="book.epub", title="书名", chapters=chapters)
 ```
 
+人工复核可以生成“译文在上、原文在下”的双语 HTML；它不依赖 JavaScript，也不使用 ruby 承载整段译文：
+
+```python
+from pathlib import Path
+from translation.index import build_bilingual_html
+
+chapters = []
+for order in range(199, 260):
+    row = runner.store.chapter(order)
+    if row is None:
+        continue
+    chapters.append({
+        "order": order,
+        "title": row["title_zh"],
+        "source_title": runner.source(order)["raw_title"],
+        "status": row["status"],
+        "source_paragraphs": [r["text"] for r in runner.source_rows(order)
+                              if r["text"].strip()],
+        "translation_paragraphs": [p for p in row["text"].split("\n\n")
+                                   if p.strip()],
+    })
+Path("bilingual-review.html").write_text(
+    build_bilingual_html(title="书名 · 人工复核", chapters=chapters),
+    encoding="utf-8")
+```
+
+段落按位置配对；译文合并/拆分时仍保留顺序，并显示段落数不一致提示。宽屏双栏只应作为可选渐进增强，默认单列两行在 EPUB 阅读器和手机上都更可靠。
+
+同一个渲染规则可以直接用于 EPUB：
+
+```python
+chapters = collect_epub_chapters(
+    runner=runner, reference_chapters=official_chapters, end=260,
+    bilingual=True)
+build_epub(
+    output="book-bilingual.epub", title="书名 · 双语复核",
+    chapters=chapters, bilingual=True)
+```
+
+`bilingual=True` 时 `collect_epub_chapters` 会为可映射到日文源的章节补充 `source_paragraphs`/`source_title`；`build_epub` 按位置生成译文/原文对，段落数不一致会写入 `bl-mismatch` 提示。行内/块级图片仍只随译文渲染一次，不会在原文中重复。默认 `bilingual=False`，原有纯译文输出不变。
+
 - 翻译使用 `source-records`：`@@TITLE` + 每条源段一条 `@@TRANSLATION`，程序验证顺序和覆盖。
 - 审校使用 `chapter-review`；confirmed 的 critical/major 触发修订，最多 `max_revisions` 轮。批量模式下仍存在则写 `blocked`；pipelined + strict 模式写 `manual_review`，由人工接管。
 - `TranslationStore` 保存不可变版本、accepted 文本、滚动摘要、术语和事件；重启后从同一 SQLite 继续。

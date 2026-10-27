@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import json
 import re
 import threading
+import zipfile
 
 import pytest
 
@@ -570,6 +571,46 @@ def test_build_and_verify_epub(tmp_path: Path):
     assert info["total_chars"] > 0
 
 
+def test_build_bilingual_epub_renders_translation_then_original(tmp_path: Path):
+    output = tmp_path / "bilingual.epub"
+    build_epub(
+        output=output, title="双语测试", bilingual=True,
+        chapters=[{
+            "title": "第一章",
+            "source_title": "第一章 原文",
+            "paragraphs": ["译文一。", "译文二。"],
+            "source_paragraphs": ["原文一。", "原文二。"],
+        }])
+    info = verify_epub(output)
+    assert info["chapter_files"] == 1
+    with zipfile.ZipFile(output) as archive:
+        chapter = archive.read("OEBPS/text/chapter-0001.xhtml").decode("utf-8")
+        style = archive.read("OEBPS/style.css").decode("utf-8")
+    translation = chapter.index('class="bl-translation"')
+    original = chapter.index('class="bl-original"')
+    assert translation < original
+    assert "译文一。" in chapter and "原文一。" in chapter
+    assert 'lang="ja"' in chapter
+    assert "原文标题：第一章 原文" in chapter
+    assert ".bl-pair" in style and ".bl-original" in style
+
+
+def test_build_bilingual_epub_marks_unpaired_paragraphs(tmp_path: Path):
+    output = tmp_path / "bilingual-mismatch.epub"
+    build_epub(
+        output=output, title="双语测试", bilingual=True,
+        chapters=[{
+            "title": "第一章",
+            "paragraphs": ["译文一。"],
+            "source_paragraphs": ["原文一。", "原文二。"],
+        }])
+    with zipfile.ZipFile(output) as archive:
+        chapter = archive.read("OEBPS/text/chapter-0001.xhtml").decode("utf-8")
+    assert "段落数不一致：原文 2 段，译文 1 段" in chapter
+    assert "（无译文）" in chapter
+    assert chapter.count('class="bl-pair"') == 2
+
+
 def test_collect_epub_skips_extra_and_missing_orders(tmp_path: Path):
     from translation.index import collect_epub_chapters
     japanese = tmp_path / "ja.txt"
@@ -597,6 +638,12 @@ def test_collect_epub_skips_extra_and_missing_orders(tmp_path: Path):
             chapters = collect_epub_chapters(
                 runner=runner, reference_chapters=[], end=4)
             assert [row["order"] for row in chapters] == [0, 2, 3]
+            bilingual = collect_epub_chapters(
+                runner=runner, reference_chapters=[], end=4, bilingual=True)
+            assert bilingual[0]["source_title"] == "第1話 始まり"
+            assert bilingual[0]["source_paragraphs"] == [
+                "最初の段落。", "次の段落。"]
+            assert bilingual[1]["source_paragraphs"] == ["三番目の段落。"]
 
 
 class FailingProvider:

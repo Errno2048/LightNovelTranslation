@@ -14,8 +14,8 @@ from .levels import LevelConfig
 from .metrics import IndexMetrics
 from .pipeline import (ChapterBlocked, DraftChapter, TranslationRunner,
                        PipelineError, ReviewOutcome, TranslationStore,
-                       align_reference_by_titles, build_epub,
-                       collect_epub_chapters, verify_epub)
+                       align_reference_by_titles, build_bilingual_html,
+                       build_epub, collect_epub_chapters, verify_epub)
 from .pointers import (PointerAdvance, PointerEvent, PointerSet, block_identity,
                        block_key, contiguous_advance)
 from .scheduler import Task, TaskStore, fair_select, run_once
@@ -33,8 +33,8 @@ __all__ = [
     "TranslationWorkflow", "GlossaryTerm", "glossary_evidence",
     "TranslationRunner", "TranslationStore", "DraftChapter",
     "ReviewOutcome", "PipelineError", "ChapterBlocked",
-    "align_reference_by_titles", "build_epub", "collect_epub_chapters",
-    "verify_epub",
+    "align_reference_by_titles", "build_bilingual_html", "build_epub",
+    "collect_epub_chapters", "verify_epub",
     "DEFAULT_ESTIMATE_FACTOR", "MaterializationDecision", "PlannedBlock",
     "ReferenceIndexPlan", "SingleChapterSplitRequired",
     "choose_materialization", "direct_estimate", "estimate_chapter_tokens",

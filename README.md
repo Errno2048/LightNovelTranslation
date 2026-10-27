@@ -51,6 +51,8 @@ with TranslationProject("workspaces/my-novel") as project:
 
 **上下文缓存**：翻译 prompt 按 L0 固定协议 → L1 append-only core glossary/reference summary → L2 已接受摘要 → L3 本批新增术语/近期全文 → L4 本章证据与正文排列；定向证据只保留源文对齐的局部片段，并受 `evidence_excerpt_chars` / `evidence_max_excerpts` / `evidence_max_chars` 限制。稳定 core 大小由 `prompt_glossary_limit` 控制，批内预热仍会先跑批尾章。
 
+**双语人工复核**：`build_bilingual_html()` 生成无 JavaScript 的单文件 HTML，每个段落按“译文在上、原文在下”排列，原文次级显示；段落数不一致会显式提示。EPUB 也可通过 `collect_epub_chapters(..., bilingual=True)` 和 `build_epub(..., bilingual=True)` 输出同样的两行对照版，默认仍为纯译文。
+
 ## 获取日文 Web 原作
 
 可选采集模块通过官方 Narou API 搜索，使用 FanFicFare 下载 EPUB，不需要模型或 API key：

@@ -170,6 +170,10 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
     build_epub(output="book.epub", title="书名", chapters=chapters)
 ```
 
+人工复核可用 `build_bilingual_html(title=..., chapters=...)` 生成单文件 HTML：每个段落先译文、后原文，原文使用次级字号和左边线；按位置配对并显示段落数不一致提示。该渲染不依赖 JavaScript，也不使用 ruby 承载整段对照。
+
+EPUB 使用同一套可选参数：`collect_epub_chapters(..., bilingual=True)` 会补充 `source_paragraphs`/`source_title`，`build_epub(..., bilingual=True)` 输出 `div.bl-pair` 两行对照；图片仍只随译文渲染一次。默认 `bilingual=False`，不会改变纯译文输出。
+
 `TranslationStore` 保存不可变版本、当前 accepted 文本、滚动摘要、术语表和事件账本。`TranslationRunner.run_order`：
 
 1. 用 `source-records` 逐源段输出翻译（`@@TITLE` + 每个 S 段一条 `@@TRANSLATION`）；
