@@ -102,8 +102,11 @@ For batch N+1 translation:
   - provisional summary blocks.
 - The prompt marks provisional documents as `未审草稿` and provisional blocks
   with status `provisional`.
-- Existing cache-friendly ordering is preserved: stable glossary/rules first,
-  dynamic provisional context last.
+- Cache-friendly lifetime ordering: L0 rules, an append-only core glossary and
+  reference summary, accepted summaries, then batch-only terms/provisional
+  summaries/recent full text, then chapter-specific evidence and source.
+- Historical term evidence is source-aligned and bounded (short snippets, per
+  term and global caps); it never carries whole historical chapters.
 
 ### Review evidence
 
@@ -202,8 +205,10 @@ buffered per batch until the prior batch is accepted.
 - Provisional summaries cost one model call per batch and may be revised after
   review.
 - Concurrent review backlog increases memory, model usage, and log volume.
-- Prefix-cache hit rate may fall as provisional context grows; measure after
-  the mode works correctly.
+- Prefix-cache hit rate still falls when provisional summaries/full-text windows
+  roll forward or the stable core is invalidated by a term correction. Bounded
+  evidence and append-only core/summary ordering only remove the avoidable
+  losses.
 
 ## Implementation status
 
@@ -221,9 +226,12 @@ buffered per batch until the prior batch is accepted.
 - [x] Integration tests: review lag, prior-draft context, provisional term
   consistency, ordered acceptance, config dispatch.
 - [x] Docs, config example, skill copy sync.
+- [x] Bounded source-aligned evidence, L0 instruction ordering, append-only core
+  glossary/summary ordering, and prefix-order regression tests.
 - [ ] Automatic global term adjudication and automatic revision re-scheduling;
   `mark_term_revisions` currently records affected chapters for the caller.
-- [ ] Prefix-cache/cost measurement on a real long pipeline.
+- [x] Prefix-cache/cost measurement on a real long pipeline; the dominant miss
+  source was unbounded historical evidence, now bounded.
 
 ## Round 2: entity/form terms, title patterns, strict manual review
 

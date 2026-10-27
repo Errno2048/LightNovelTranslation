@@ -100,17 +100,17 @@ for segment in context.segments:
     print(segment.representation, segment.level, segment.start, segment.end)
 ```
 
-装配顺序按“稳定 → 动态”排列，以复用 provider 的前缀缓存：
+装配顺序按“生命周期长 → 短”排列，以复用 provider 的前缀缓存：
 
-1. system + 未审候选声明；
-2. 稳定 workset（core、按首次出现顺序的术语实体卡片、extraction_gaps）；
-3. 参考索引/全文/批内日文（ContextPlan segments）；
-4. 本章动态信息（unresolved、threads、target/batch 选择元数据）；
-5. 定向证据（术语出现位置、参考译文命中）；
-6. 当前目标日文正文；
-7. 输出协议与 final output-only 指令。
+1. L0：system、固定输出协议；
+2. L1：稳定 core glossary（`prompt_glossary_limit` 条，按 rowid 首次出现顺序，仅追加）和 reference summary；
+3. L2：已接受的 target summaries（append-only；旧块不重排、不删除）；
+4. L3：本批新增术语、provisional summary、近期全文窗口、批内前序日文；
+5. L4：本章 unresolved/threads/target 元数据、有界定向证据、当前目标正文、本次 S 标签表。
 
-不要把 `target_order`、`unresolved`、`threads` 等逐章变化的内容放回 workset 开头：一旦前缀在早期分叉，后面的摘要、全文和术语都无法命中缓存。同批所有目标使用同一份历史段选择（`batch_near_reserve`），因此第 k 章的 prompt 是第 k+1 章（更长的批内前文）的字节前缀。
+`glossary_evidence` 只输出源文对齐的局部片段：同一历史章节必须同时出现日文源词和 target/alias，片段长度受 `evidence_excerpt_chars` 限制，每术语受 `evidence_max_excerpts` 限制，整体受 `evidence_max_chars` 限制；近期全文窗口已经包含的章节会跳过。不要再把历史章节全文作为“摘录”传入。
+
+不要把 `target_order`、`unresolved`、`threads` 等逐章变化的内容放回稳定块之前：一旦前缀在早期分叉，后面的摘要、全文和术语都无法命中缓存。同批所有目标使用同一份历史段选择（`batch_near_reserve`），因此第 k 章的 prompt 是第 k+1 章（更长的批内前文）的字节前缀。
 
 `assemble` 会自动用 `plan_request` 检查预算；不 fit 时先丢弃可选定向证据。仍不 fit 时应缩小 batch，不要截断最近章节前缀。
 

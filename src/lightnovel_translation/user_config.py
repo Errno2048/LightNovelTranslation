@@ -129,6 +129,8 @@ _SAFE_CONFIG_PATHS = {
                  'review_tokens', 'adjudication_tokens', 'summary_tokens',
                  'glossary_tokens', 'glossary_terms_per_chapter',
                  'glossary_terms_base', 'glossary_max_continuations',
+                 'prompt_glossary_limit', 'evidence_excerpt_chars',
+                 'evidence_max_excerpts', 'evidence_max_chars',
                  'lookup_chapters', 'lookup_terms',
                  'max_term_checks', 'max_tool_rounds'},
     'syosetu': {'concurrency', 'request_interval'},

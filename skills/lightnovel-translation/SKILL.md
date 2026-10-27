@@ -86,7 +86,7 @@ messages, report, context = flow.assemble(
     threads={"active": [], "resolved": [], "dormant_relevant": []})
 ```
 
-`assemble` 会加入 workset、实体 target_form、线程/未决、定向证据和 `source_message`（只输出正文，不输出标题/ID）。检查 `report["fits"]` 和 `context.segments`；不 fit 时先缩小 batch，不能截断最近章节前缀。
+`assemble` 按 L0 固定协议 → append-only core glossary/reference summary → 已接受摘要 → 本批新增术语/近期全文 → 本章有界证据与正文排列；实体 target_form、线程/未决和 `source_message` 仍会加入。历史术语证据只保留源文对齐的短片段，并受 `evidence_*` 上限控制。检查 `report["fits"]` 和 `context.segments`；不 fit 时先缩小 batch，不能截断最近章节前缀。
 
 ### 5. 实际翻译
 

@@ -44,9 +44,12 @@ text: 第二段的完整中文
 实际输出必须使用本章全部实际S标签，按原文顺序各一次。text中的换行仅作记录内排版；不要借换行遗漏或重复源段。"""
 
 
+def source_records_alias_map(aliases):
+    return ("【本次合法源段ID，按原文顺序各一次】\n" + ",".join(aliases))
+
+
 def source_records_rules(aliases):
-    return (SOURCE_RECORDS_RULES + "\n【本次合法源段ID，按原文顺序各一次】\n"
-            + ",".join(aliases))
+    return SOURCE_RECORDS_RULES + "\n" + source_records_alias_map(aliases)
 
 
 def full_pair_message(pair, *, reference_profile="plain"):

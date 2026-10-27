@@ -49,6 +49,8 @@ with TranslationProject("workspaces/my-novel") as project:
 
 **流水线并发与人工接管**：`translation_mode="pipelined"` / `runner.run_pipelined()` 允许审校滞后于翻译；下一批只依赖前驱已物化的 provisional index（摘要、draft、滚动术语表），不等待前一批审校和 accepted。`adjudication_mode="strict"` 会把 unresolved major 写入 `manual_review` 队列，只暂停自动 accepted/导出，不停止翻译；`pipeline_manual_backlog` 控制人工复核积压。术语表使用实体/形式两层结构（同一实体的全名、短名、别名各有自己的 target，但共享 `entity_id`），标题模式由确定性解析/渲染归一化，避免批次间标题和短名漂移。人工 API 为 `manual_review_queue()` 和 `resolve_manual_review(order, decision="accept"|"revise"|"blocked", ...)`；详细说明见 [pipelined 计划](docs/pipelined-translation-plan.md) 和 [使用说明](docs/usage.md)。
 
+**上下文缓存**：翻译 prompt 按 L0 固定协议 → L1 append-only core glossary/reference summary → L2 已接受摘要 → L3 本批新增术语/近期全文 → L4 本章证据与正文排列；定向证据只保留源文对齐的局部片段，并受 `evidence_excerpt_chars` / `evidence_max_excerpts` / `evidence_max_chars` 限制。稳定 core 大小由 `prompt_glossary_limit` 控制，批内预热仍会先跑批尾章。
+
 ## 获取日文 Web 原作
 
 可选采集模块通过官方 Narou API 搜索，使用 FanFicFare 下载 EPUB，不需要模型或 API key：

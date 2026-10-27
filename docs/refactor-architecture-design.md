@@ -887,20 +887,18 @@ review/
 
 ### 19.3 建议的上下文装配顺序
 
-新 ContextPlan 的 `segments` 之后应增加一个 `ContextAssembler`。为复用 provider 的前缀缓存，必须按“全章稳定 → 逐章变化”排序：
+新 ContextPlan 的 `segments` 之后由 `TranslationWorkflow.assemble` 按内容生命周期排序，以复用 provider 的前缀缓存：
 
-1. system + 未审候选声明；
-2. 稳定 workset（core、gaps、按首次出现顺序的 entity cards）；
-3. 层级导航（L1/L2 + not_built 详情）；
-4. 参考/目标全文或摘要 segments；同批所有目标使用同一组历史段；
-5. 本章动态信息（unresolved、threads、target/batch selection）；
-6. 定向证据；
-7. 当前目标 `source_message`（只输出正文，输出协议随目标变化）；
-8. 可选的 review/checks/evidence 上下文，草稿放在最后。
+1. L0：system、固定 source-records 协议；
+2. L1：append-only core glossary（`prompt_glossary_limit` 条）和 reference summary；
+3. L2：已接受的 target summaries，按范围追加，旧块不重排；
+4. L3：本批新增术语、provisional summary、近期全文、批内前序日文；同批所有目标使用同一组历史段；
+5. L4：本章 unresolved/threads/target selection、有界定向证据、当前目标日文、本次 S 标签表；
+6. review/checks/evidence 上下文：固定协议在前，草稿放在 JSON 最后。
 
-逐章变化字段若出现在第 2–4 步，后面的长上下文全部无法命中缓存。术语表应按首次出现顺序追加，不要按频次或字形重排。
+逐章变化字段若出现在 L0–L2 之前，后面的长上下文全部无法命中缓存。术语表应按首次出现顺序追加，不要按频次或字形重排；批次新增术语放尾部。定向证据只保留源文对齐的局部片段，并有每术语/全局上限，不能把整章历史译文塞入 prompt。
 
-Token 预算应由旧 `plan_request` 统一计算；workset/实体/线程/定向证据都应有明确配额，超出时按旧 `selection` 的 omitted 统计记录，而不是静默丢弃。
+Token 预算由 `plan_request` 统一计算；workset/实体/线程/定向证据都有明确配额，超出时记录 `truncated`/`omitted_terms`，而不是静默丢弃。
 
 ### 19.4 旧实现仍然不如新架构的地方
 

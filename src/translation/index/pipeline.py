@@ -30,7 +30,8 @@ from ..storage import digest
 from .artifacts import Artifact, InputRef
 from .assets import AssetIndex, load_asset_index, sniff_media_type
 from .context_plan import ContextDocument
-from .prompts import source_records_rules
+from .prompts import (SOURCE_RECORDS_RULES, source_records_alias_map,
+                      source_records_rules)
 from .snapshot import IndexSnapshot
 from .titles import (parse_target_template, parse_title_pattern,
                      render_title_template, title_pattern_key)
@@ -885,6 +886,17 @@ class TranslationStore:
             "e.kind AS kind FROM term_forms f JOIN term_entities e"
             " ON e.entity_id=f.entity_id ORDER BY f.rowid LIMIT ?", (limit,))]
 
+    def prompt_glossary(self, limit: int = 512) -> list[dict]:
+        """A bounded, append-only glossary projection for the stable prompt."""
+        if limit <= 0:
+            return []
+        return [self._legacy_form(row) for row in self.db.execute(
+            "SELECT f.source,f.entity_id,f.target,f.form_type,f.target_aliases,"
+            "f.metadata,f.confidence,f.provisional,f.locked,f.evidence_count,"
+            "e.kind AS kind FROM term_forms f JOIN term_entities e"
+            " ON e.entity_id=f.entity_id WHERE f.form_type<>'title_pattern'"
+            " ORDER BY f.rowid LIMIT ?", (limit,))]
+
     def stats(self) -> dict:
         return {
             "accepted": len(self.accepted_orders()),
@@ -950,6 +962,14 @@ class TranslationRunner:
         self.glossary_terms_base = getattr(workflow, "glossary_terms_base", 40)
         self.glossary_max_continuations = getattr(
             workflow, "glossary_max_continuations", 4)
+        self.prompt_glossary_limit = getattr(
+            workflow, "prompt_glossary_limit", 512)
+        self.evidence_excerpt_chars = getattr(
+            workflow, "evidence_excerpt_chars", 120)
+        self.evidence_max_excerpts = getattr(
+            workflow, "evidence_max_excerpts", 2)
+        self.evidence_max_chars = getattr(
+            workflow, "evidence_max_chars", 12000)
         self.lookup_chapters = getattr(workflow, "lookup_chapters", 8)
         self.lookup_terms = getattr(workflow, "lookup_terms", 50)
         self.max_tool_rounds = getattr(workflow, "max_tool_rounds", 4)
@@ -1147,6 +1167,19 @@ class TranslationRunner:
         return [term for term in terms
                 if term.source in text or int(term.confidence) <= 1]
 
+    def _stable_glossary_cards(self) -> list[GlossaryTerm]:
+        """Return the bounded append-only glossary prefix for prompt reuse."""
+        limit = int(getattr(self, "prompt_glossary_limit", 0) or 0)
+        if limit <= 0:
+            return []
+        return [GlossaryTerm(
+            row["source"], row["target"], row.get("kind") or "other",
+            int(row.get("confidence", 2)),
+            tuple(row.get("aliases") or ()),
+            bool(row.get("locked")), bool(row.get("provisional")),
+            row.get("entity_id"), str(row.get("form_type") or "other"))
+            for row in self.store.prompt_glossary(limit)]
+
     def pending_glossary_confirmation(self, orders: Iterable[int]) -> list[dict]:
         orders = [int(order) for order in orders]
         target_text = "\n".join(self.source(order).get("text", "") for order in orders
@@ -1296,6 +1329,7 @@ class TranslationRunner:
                          snapshot: IndexSnapshot | None = None,
                          batch_orders: Iterable[int] | None = None,
                          glossary: Iterable[GlossaryTerm] | None = None,
+                         stable_glossary: Iterable[GlossaryTerm] | None = None,
                          unresolved_prior: Iterable[str] | None = None,
                          log_event: bool = False,
                          usage_sink: list | None = None) -> DraftChapter:
@@ -1317,13 +1351,19 @@ class TranslationRunner:
         unresolved = (list(unresolved_prior) if unresolved_prior is not None
                       else self._unresolved())
         aliases = [f"S{index:03d}" for index in range(1, len(rows) + 1)]
+        if stable_glossary is None:
+            stable_glossary = self._stable_glossary_cards()
         messages, report, plan = self.flow.assemble(
             snapshot=snapshot, documents=docs, target_order=order,
             batch_orders=batch, glossary=terms,
+            stable_glossary=stable_glossary,
             unresolved=unresolved, threads=None,
             output_tokens=self.translation_tokens,
             output_profile="source-records", source_rows=prompt_rows,
-            provisional_orders=provisional_orders)
+            provisional_orders=provisional_orders,
+            evidence_excerpt_chars=self.evidence_excerpt_chars,
+            evidence_max_excerpts=self.evidence_max_excerpts,
+            evidence_max_chars=self.evidence_max_chars)
         if not report["fits"]:
             raise PipelineError("context_budget", "translation request exceeds capacity",
                                 details={"order": order, "report": report})
@@ -1773,25 +1813,35 @@ class TranslationRunner:
             "authority": "draft is unverified; provisional history may still change",
             "draft": target,
         }
+        protocol = (
+            "请逐段核对本章日文与草稿的所有含义差异。只输出"
+            "FINDING/UNRESOLVED/TERMCHECK/SUMMARY记录，最后独占一行@@END。"
+            "没有问题时也必须输出SUMMARY。"
+            "可使用 read_chapter / lookup_term 工具核对既往译名，预算见 lookup_budget；"
+            "不要用 needs_lookup 字段代替实际工具调用。")
+        conditional = []
+        if term_conflicts:
+            conditional.append(
+                "term_conflicts 是程序检测到的候选形式与其它形式 canonical 冲突；"
+                "必须逐项核对并输出 term FINDING，不得直接替换正文。")
+        if term_checks:
+            conditional.append(
+                "term_checks 非空时，必须为每个 id 输出一条 @@TERMCHECK：\n"
+                "@@TERMCHECK tc001\ncheck: tc001\nverdict: ok|violation|uncertain\n"
+                "reason: 具体依据\n"
+                "verdict=violation 时必须同时输出对应的 FINDING（category: term），"
+                "不得直接按规则替换文本。")
+        # L0 protocol before the per-chapter evidence; conditional rules that
+        # depend on this chapter's checks stay after the evidence.
         messages = [{"role": "system", "content": AUDIT_TASK}]
         messages.extend(AUDIT_REVIEW_FEWSHOT)
-        messages.extend([
-            {"role": "user", "content":
-             "【审查证据；S/T为本段，R/L为历史，均为未审定】\n" +
-             json.dumps(context, ensure_ascii=False, separators=(",", ":"))},
-            {"role": "user", "content":
-             "请逐段核对本章日文与草稿的所有含义差异。只输出FINDING/UNRESOLVED/TERMCHECK/SUMMARY记录，"
-             "最后独占一行@@END。没有问题时也必须输出SUMMARY。"
-             "可使用 read_chapter / lookup_term 工具核对既往译名，预算见 lookup_budget；"
-             "不要用 needs_lookup 字段代替实际工具调用。"
-             + (("term_conflicts 是程序检测到的候选形式与其它形式 canonical 冲突；"
-                 "必须逐项核对并输出 term FINDING，不得直接替换正文。") if term_conflicts else "")
-             + (("term_checks 非空时，必须为每个 id 输出一条 @@TERMCHECK：\n"
-                 "@@TERMCHECK tc001\ncheck: tc001\nverdict: ok|violation|uncertain\n"
-                 "reason: 具体依据\n"
-                 "verdict=violation 时必须同时输出对应的 FINDING（category: term），"
-                 "不得直接按规则替换文本。") if term_checks else "")},
-        ])
+        messages.append({"role": "user", "content": protocol})
+        messages.append({"role": "user", "content":
+                         "【审查证据；S/T为本段，R/L为历史，均为未审定】\n" +
+                         json.dumps(context, ensure_ascii=False,
+                                    separators=(",", ":"))})
+        if conditional:
+            messages.append({"role": "user", "content": "\n".join(conditional)})
         outcome = None
         tools_enabled = True
         for attempt in range(3):
@@ -1801,8 +1851,8 @@ class TranslationRunner:
                     messages, self.review_tokens,
                     f"review_{draft.order}",
                     log_event=log_event, usage_sink=usage_sink,
-                    tools=REVIEW_TOOLS if tools_enabled else None,
-                    tool_choice="auto" if tools_enabled else None)
+                    tools=REVIEW_TOOLS,
+                    tool_choice="auto" if tools_enabled else "none")
                 if not result.tool_calls:
                     break
                 tool_rounds += 1
@@ -1828,10 +1878,11 @@ class TranslationRunner:
                         "role": "user",
                         "content": "工具调用轮次已用尽。请立即基于已有证据输出最终审校记录，"
                                    "不要再调用工具。"})
-                    result = self._generate(messages, self.review_tokens,
-                                            f"review_{draft.order}",
-                                            log_event=log_event,
-                                            usage_sink=usage_sink)
+                    result = self._generate(
+                        messages, self.review_tokens,
+                        f"review_{draft.order}",
+                        log_event=log_event, usage_sink=usage_sink,
+                        tools=REVIEW_TOOLS, tool_choice="none")
                     break
             outcome = self.parse_review(result.text, source_by_ref, target_by_ref,
                                         expected_checks=expected_checks)
@@ -2003,16 +2054,16 @@ class TranslationRunner:
         } for check in review.term_checks]
         messages = [{"role": "system", "content": AUDIT_ADJUDICATION}]
         messages.extend(AUDIT_ADJUDICATION_FEWSHOT)
-        messages.extend([
-            {"role": "user", "content":
-             "【候选审校意见与绑定原段；逐项裁决】\n" +
-             json.dumps(findings, ensure_ascii=False, separators=(",", ":")) +
-             "\n【程序术语检查；fixed_missing 的 canonical 为已确认规范译名】\n" +
-             json.dumps(term_checks, ensure_ascii=False, separators=(",", ":"))},
-            {"role": "user", "content":
-             "每个finding恰好输出一条DECISION；最后输出@@END。"
-             "不要新增finding、重写正文。"},
-        ])
+        messages.append({"role": "user", "content":
+                         "每个finding恰好输出一条DECISION；最后输出@@END。"
+                         "不要新增finding、重写正文。"})
+        messages.append({"role": "user", "content":
+                         "【候选审校意见与绑定原段；逐项裁决】\n" +
+                         json.dumps(findings, ensure_ascii=False,
+                                    separators=(",", ":")) +
+                         "\n【程序术语检查；fixed_missing 的 canonical 为已确认规范译名】\n" +
+                         json.dumps(term_checks, ensure_ascii=False,
+                                    separators=(",", ":"))})
         expected = {finding["id"] for finding in review.findings}
         for attempt in range(3):
             result = self._generate(messages, self.adjudication_tokens,
@@ -2102,10 +2153,11 @@ class TranslationRunner:
             {"role": "system", "content":
              "你是日译中轻小说翻译。只修复已确认的含义差异，保留其他正确内容、"
              "事实、语气和段落。按源段记录协议输出完整本章；不要解释。"},
+            {"role": "user", "content": SOURCE_RECORDS_RULES},
             {"role": "user", "content":
              "【原文、当前草稿与已确认问题】\n" +
              json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
-            {"role": "user", "content": source_records_rules(aliases)},
+            {"role": "user", "content": source_records_alias_map(aliases)},
         ]
         parsed = None
         raw = ""
@@ -2148,7 +2200,8 @@ class TranslationRunner:
                decisions: Mapping[str, Mapping]) -> DraftChapter:
         confirmed = [finding for finding in review.findings
                      if decisions.get(finding["id"], {}).get("decision") == "confirmed"]
-        revised = self._revise_draft(draft, review, decisions, log_event=True)
+        revised = self._apply_title_normalization(
+            self._revise_draft(draft, review, decisions, log_event=True))
         version = self.store.put_draft(
             order=revised.order, source_id=revised.source_id,
             source_hash=revised.source_hash, ja_title=revised.ja_title,
@@ -2359,6 +2412,7 @@ class TranslationRunner:
         snapshot = self.snapshot(batch[0], documents,
                                  provisional_orders=prior_drafts.keys())
         glossary = self.ensure_batch_glossary(batch, provisional=True)
+        stable_glossary = self._stable_glossary_cards()
         unresolved = self._unresolved()
         jobs = {}
 
@@ -2368,6 +2422,7 @@ class TranslationRunner:
                 self._translate_draft, order,
                 documents=documents, snapshot=snapshot,
                 batch_orders=batch, glossary=glossary,
+                stable_glossary=stable_glossary,
                 unresolved_prior=unresolved, provisional=prior_drafts,
                 log_event=False, usage_sink=usages), usages)
 
@@ -2466,9 +2521,9 @@ class TranslationRunner:
     def _write_pipeline_result(self, draft, result, status, results):
         review_data = (result.get("review") and self._review_data(result)) or {
             "error": status, "message": result.get("message", "")}
-        final = result["draft"]
-        if final.text == draft.text and status in {"accepted", "ready",
-                                                   "manual_review"}:
+        final = self._apply_title_normalization(result["draft"])
+        if (final.text == draft.text and final.title_zh == draft.title_zh
+                and status in {"accepted", "ready", "manual_review"}):
             self.store.set_status(final.order, status, review_data)
             version = draft.version
         else:
@@ -2851,6 +2906,7 @@ class TranslationRunner:
                     "term_conflicts": self.store.term_target_conflicts(
                         conflict_sources)[:20],
                 }
+                stable_glossary = self._stable_glossary_cards()
                 translation_jobs = {}
 
                 def submit_translation(order):
@@ -2859,6 +2915,7 @@ class TranslationRunner:
                         self._translate_draft, order,
                         documents=documents, snapshot=snapshot,
                         batch_orders=batch, glossary=glossary,
+                        stable_glossary=stable_glossary,
                         unresolved_prior=unresolved, log_event=False,
                         usage_sink=usages), usages)
 
@@ -2943,8 +3000,9 @@ class TranslationRunner:
                     status = result["status"]
                     if status == "accepted":
                         review_data = self._review_data(result)
-                        final = result["draft"]
-                        if final.text == draft.text:
+                        final = self._apply_title_normalization(result["draft"])
+                        if (final.text == draft.text
+                                and final.title_zh == draft.title_zh):
                             self.store.set_status(final.order, "accepted",
                                                   review_data)
                             version = draft.version
@@ -2967,7 +3025,7 @@ class TranslationRunner:
                                        self._review_data(result)) or {
                                            "error": status,
                                            "message": result.get("message", "")}
-                        final = result["draft"]
+                        final = self._apply_title_normalization(result["draft"])
                         self.store.put_draft(
                             order=final.order, source_id=final.source_id,
                             source_hash=final.source_hash,
@@ -3161,7 +3219,7 @@ class TranslationRunner:
                 missing_end = True
                 break
             truncated = True
-            if new_records == 0:
+            if new_records == 0 and (parsed.trimmed.strip() or rounds > 0):
                 no_progress = True
                 break
             if rounds >= self.glossary_max_continuations:

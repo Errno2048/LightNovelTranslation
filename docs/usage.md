@@ -105,19 +105,19 @@ result, report, context = flow.translate(
 print(result.text[:1000])
 ```
 
-装配内容（按稳定 → 动态排列，便于复用 provider 前缀缓存）：
+装配内容按“生命周期长的内容在前”排列，便于复用 provider 前缀缓存：
 
-1. system + 未审候选声明；
-2. 稳定 workset（core、术语实体卡片、gaps；术语表按首次出现顺序）；
-3. ContextPlan segments（层级摘要、全文、批内前日文）；
-4. 本章动态信息（unresolved、threads、target/batch 元数据）；
-5. 定向证据（术语出现位置、参考命中）；
-6. 当前目标日文正文；
-7. 输出协议与 final output-only 指令。
+1. L0：system、固定输出协议；
+2. L1：稳定 core glossary（`prompt_glossary_limit` 条，按首次出现顺序 append-only）、reference summary；
+3. L2：已接受的 target summaries（按范围追加，不重排旧块）；
+4. L3：本批新增术语、provisional summary、近期全文窗口、批内前序日文；
+5. L4：本章 unresolved/threads/target 元数据、源文对齐的有界定向证据、当前日文正文、本次合法 S 标签表。
 
-不要把逐章变化的字段放在稳定块之前。`run_concurrent` 会先单独翻译批尾章以预热前缀缓存，再并发其余章节；同一批使用相同的历史段选择。
+`glossary_evidence` 不再把历史章节全文塞进 prompt。它要求日文源词和 target/alias 在同一历史章节出现，只取命中位置附近约 `evidence_excerpt_chars` 个字符，并受 `evidence_max_excerpts` 和 `evidence_max_chars` 限制；近期全文窗口已经覆盖的章节会被跳过。证据不足时保留术语卡和 `historical_match_count`，并标记 `truncated`/`omitted_terms`，而不是静默截断。
 
-不 fit 时先缩小 batch，不能截断最近章节前缀。
+`prompt_glossary_limit=0` 可关闭稳定 core glossary；较大的 core 会提高冷启动体量，但跨 batch 的稳定前缀通常可以命中。不要把逐章变化的字段放回稳定块之前。
+
+`run_concurrent` 会先单独翻译批尾章以预热前缀缓存，再并发其余章节；同一批使用相同的历史段选择。不 fit 时先缩小 batch，不要截断最近章节前缀。
 
 ### 4. 章节审校、提交与导出
 

@@ -42,6 +42,10 @@ class WorkflowConfig:
     glossary_terms_per_chapter: int = 5
     glossary_terms_base: int = 40
     glossary_max_continuations: int = 4
+    prompt_glossary_limit: int = 512
+    evidence_excerpt_chars: int = 120
+    evidence_max_excerpts: int = 2
+    evidence_max_chars: int = 12000
     lookup_chapters: int = 8
     lookup_terms: int = 50
     max_term_checks: int = 50
@@ -53,8 +57,9 @@ class WorkflowConfig:
                      'batch_size', 'full_chapters', 'summary_every',
                      'reference_chunk', 'translation_tokens', 'review_tokens',
                      'adjudication_tokens', 'summary_tokens', 'glossary_tokens',
-                     'glossary_terms_per_chapter', 'lookup_chapters',
-                     'lookup_terms', 'max_tool_rounds'):
+                     'glossary_terms_per_chapter', 'evidence_excerpt_chars',
+                     'evidence_max_excerpts', 'evidence_max_chars',
+                     'lookup_chapters', 'lookup_terms', 'max_tool_rounds'):
             value = getattr(self, name)
             if type(value) is not int or value <= 0:
                 raise ConfigurationError(f'workflow.{name} must be a positive integer')
@@ -66,6 +71,10 @@ class WorkflowConfig:
                 "workflow.adjudication_mode must be 'normal' or 'strict'")
         if type(self.max_term_checks) is not int or self.max_term_checks < 0:
             raise ConfigurationError('workflow.max_term_checks must be a nonnegative integer')
+        if (type(self.prompt_glossary_limit) is not int or
+                self.prompt_glossary_limit < 0):
+            raise ConfigurationError(
+                'workflow.prompt_glossary_limit must be a nonnegative integer')
         if type(self.glossary_terms_base) is not int or self.glossary_terms_base < 0:
             raise ConfigurationError('workflow.glossary_terms_base must be a nonnegative integer')
         if (type(self.glossary_max_continuations) is not int or

@@ -367,7 +367,14 @@ def test_adjudication_receives_term_canonical_authority():
     decisions = runner.adjudicate(SimpleNamespace(order=1), review,
                                   log_event=False)
     assert decisions["f1"]["decision"] == "confirmed"
-    payload = captured["messages"][-2]["content"]
+    contents = [message["content"] for message in captured["messages"]]
+    payload = next(content for content in contents
+                   if content.startswith("【候选审校意见"))
+    instruction = next(index for index, content in enumerate(contents)
+                       if content.startswith("每个finding"))
+    evidence = next(index for index, content in enumerate(contents)
+                    if content.startswith("【候选审校意见"))
+    assert instruction < evidence
     assert "ウェザエモン" in payload
     assert "维哲卫门" in payload
     assert "fixed_missing" in payload
@@ -558,6 +565,32 @@ def test_extract_terms_resumes_after_truncation():
     assert len(calls) == 2
     assert "@@TERM" in calls[1][2]["content"]
     assert "上一次输出" in calls[1][3]["content"]
+
+
+def test_extract_terms_retries_after_no_complete_records():
+    runner = object.__new__(TranslationRunner)
+    runner.glossary_tokens = 100
+    runner.glossary_max_continuations = 2
+    calls = []
+    script = [
+        SimpleNamespace(text="reasoning only", finish_reason="length"),
+        SimpleNamespace(
+            text="@@TERM\nsource: A\ntarget: 甲\nkind: person\nconfidence: 1\n"
+                 "@@END\n", finish_reason="stop"),
+    ]
+
+    def _generate(messages, max_tokens, task, **kwargs):
+        calls.append([dict(message) for message in messages])
+        return script.pop(0)
+
+    runner._generate = _generate
+    rows, stats = runner._extract_terms(
+        system="system", prompt="prompt", task="glossary", max_terms=10)
+    assert [row["source"] for row in rows] == ["A"]
+    assert stats["rounds"] == 1
+    assert stats["truncated"] is True
+    assert stats["complete"] is True
+    assert "第一条记录" in calls[1][-1]["content"]
 
 
 def test_extract_terms_stops_without_progress_or_at_cap():

@@ -113,6 +113,8 @@ runner.ensure_glossary()           # 双语对照抽词，按 chunk 记录 gloss
 | `history_chapters` | 3（审校历史） |
 | `summary_every` / `summary_lag` | 5 / 0 |
 | `reference_chunk` | 16 |
+| `prompt_glossary_limit` | 512（append-only 稳定术语卡） |
+| `evidence_excerpt_chars` / `evidence_max_excerpts` / `evidence_max_chars` | 120 / 2 / 12,000 |
 | 翻译 / 审校 / 裁决 / 修订输出 | 65,536 / 65,536 / 32,768 / 65,536 |
 | 摘要 / 术语输出 | 16,384 / 16,384 |
 | 翻译批大小 | 30 章/批；`translation_concurrency` 个请求并发 |
@@ -272,6 +274,8 @@ pipeline_manual_backlog = 2
 | `batch_size` | 批次包含的章节数，必须与上下文容量匹配 |
 | `full_chapters` / `history_chapters` | 近期全文窗口 / 审校历史章数 |
 | `summary_every` / `summary_lag` / `reference_chunk` | 目标摘要节奏 / 参考摘要与术语分批 |
+| `prompt_glossary_limit` | 稳定 core glossary 的条数；0 关闭，按 rowid append-only |
+| `evidence_excerpt_chars` / `evidence_max_excerpts` / `evidence_max_chars` | 定向证据片段半径 / 每术语片段数 / 总片段字符上限 |
 | `max_revisions` | critical/major 修订上限 |
 | `translation_tokens` / `review_tokens` / `adjudication_tokens` | 各阶段输出预算 |
 | `summary_tokens` / `glossary_tokens` | 摘要 / 术语抽取输出预算 |
@@ -293,10 +297,12 @@ pipeline_manual_backlog = 2
 
 provider 按“从头开始的精确 token 前缀”复用缓存。任何逐章变化的字段只要出现在 prompt 前部，后面再长的参考摘要、全文和术语表都不会命中。当前约定：
 
-- 翻译 prompt 的顺序是 system → 稳定 workset（术语表按首次出现顺序）→ 参考摘要/近章全文/批内前序日文 → 本章动态字段 → 定向证据 → 当前目标 → 输出协议。
+- 翻译 prompt 的生命周期顺序是：L0 system/固定协议 → L1 稳定 core glossary（`prompt_glossary_limit`，append-only）+ reference summary → L2 已接受 target summaries → L3 本批新增术语/provisional summary/近期全文/批内前序日文 → L4 本章动态字段/有界证据/当前目标/S 标签表。
 - 同批所有章节使用同一组历史摘要/全文段（`batch_near_reserve` 取批内最大近端上下文作为统一预算）；否则预算差异会让某章少选一段旧摘要，前缀在摘要处即分叉。
-- 术语表按首次出现顺序追加，不按 `evidence_count` 或 `source` 重排；新词只追加到末尾，已有词条位置不变。不要按“本章出现”过滤掉术语表中间项，否则每次请求前缀都会在术语表处断开。
-- 审校 prompt 把 glossary、source、history、unresolved 放在前面，**草稿放在 JSON 最后**；同一章的复审/修订可以复用草稿之前的前缀。修订同样把 confirmed findings 放在 source 之后、draft 之前。
+- 术语卡按首次出现顺序追加，不按 `evidence_count` 或 `source` 重排；核心投影只取前 `prompt_glossary_limit` 条，新词只追加到末尾，已有词条位置不变。批次新增术语放在 L3 尾部，不要重新过滤并重排整个 core。
+- `glossary_evidence` 是源文对齐的有界片段：同一历史章节必须同时出现日文源词和 target/alias，只取命中附近窗口；`evidence_max_excerpts` / `evidence_max_chars` 控制每术语和总量，近期全文已覆盖的章节跳过。不要再把整章历史译文写进证据。
+- 审校 prompt 先输出固定协议，再放 glossary/source/history/draft；**草稿放在 context JSON 最后**，同一章复审可复用草稿之前的前缀。依赖本章 term_checks/term_conflicts 的条件提示放在证据之后。修订同样先放固定协议，再放 evidence，S 标签表放最后。
+- 裁决 prompt 的固定指令放在 findings JSON 之前；工具轮次用尽后保持工具 schema 不变，改用 `tool_choice="none"`，避免缓存前缀因工具定义消失而重置。
 - 批次预热见 2.1。若 provider 不支持前缀缓存，预热只损失一次串行等待，不影响正确性。
 
 查看命中情况（DeepSeek 兼容端点通常在 `usage` 返回 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`）：

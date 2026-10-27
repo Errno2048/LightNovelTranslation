@@ -34,6 +34,9 @@ class ScriptedProvider:
 
 
 class RevisionProvider:
+    translate_title = "归来"
+    revise_title = "归来"
+
     def __init__(self):
         self.requests = []
         self.reviews = 0
@@ -41,7 +44,7 @@ class RevisionProvider:
     def generate(self, request):
         self.requests.append(request)
         if request.task.startswith("translate_"):
-            text = ("@@TITLE\ntext: 归来\n"
+            text = (f"@@TITLE\ntext: {self.translate_title}\n"
                     "@@TRANSLATION S001\ntext: 诺亚没有回到村子。\n"
                     "@@TRANSLATION S002\ntext: 众人听他讲述旅途。\n@@END")
         elif request.task.startswith("review_"):
@@ -60,12 +63,17 @@ class RevisionProvider:
             text = ("@@DECISION d1\nfinding: f1\ndecision: confirmed\n"
                     "reason: 原文明确为肯定，草稿加入否定。\n@@END")
         elif request.task.startswith("revise_"):
-            text = ("@@TITLE\ntext: 归来\n"
+            text = (f"@@TITLE\ntext: {self.revise_title}\n"
                     "@@TRANSLATION S001\ntext: 诺亚回到了村子。\n"
                     "@@TRANSLATION S002\ntext: 众人听他讲述旅途。\n@@END")
         else:
             raise AssertionError("unexpected task " + request.task)
         return GenerationResult(text, "stop", "scripted", str(len(self.requests)), {}, 0)
+
+
+class TitleRevisionProvider(RevisionProvider):
+    translate_title = "第二章 出发"
+    revise_title = "第二章 归来了"
 
 
 def test_pipelined_mode_config_validation():
@@ -115,6 +123,26 @@ def test_runner_accepts_a_clean_review(tmp_path: Path):
             assert result["status"] == "accepted"
             assert store.translations()[1] == "诺亚回到了村子。\n\n众人听他讲述旅途。"
             assert store.chapter(1)["title_zh"] == "归来"
+
+            translate = next(request for request in provider.requests
+                             if request.task == "translate_1")
+            contents = [message["content"] for message in translate.messages]
+            rules = next(index for index, content in enumerate(contents)
+                         if content.startswith("【译文输出协议 source-records】"))
+            target = next(index for index, content in enumerate(contents)
+                          if content.startswith("【当前目标"))
+            aliases = next(index for index, content in enumerate(contents)
+                           if content.startswith("【本次合法源段ID"))
+            assert rules < target < aliases
+
+            review = next(request for request in provider.requests
+                          if request.task == "review_1")
+            contents = [message["content"] for message in review.messages]
+            protocol = next(index for index, content in enumerate(contents)
+                            if content.startswith("请逐段核对"))
+            evidence = next(index for index, content in enumerate(contents)
+                            if content.startswith("【审查证据"))
+            assert protocol < evidence
 
 
 class ConcurrentProvider:
@@ -495,6 +523,38 @@ def test_runner_revises_a_confirmed_major_finding(tmp_path: Path):
             assert result["rounds"] == 1
             assert store.translations()[1] == "诺亚回到了村子。\n\n众人听他讲述旅途。"
             assert store.chapter(1)["version"] == 2
+
+
+def test_revision_keeps_the_seeded_title_pattern(tmp_path: Path):
+    japanese = tmp_path / "ja.txt"
+    chinese = tmp_path / "zh.txt"
+    japanese.write_text("第1話 帰還\n\nノアは村に帰った。\n\n皆は旅の話を聞いた。\n\n"
+                        "第2話 出発\n\nノアは村を出た。\n\n皆は見送った。\n",
+                        encoding="utf-8")
+    chinese.write_text("第1章 归来\n\n诺亚回到了村子。\n\n众人听他讲述旅途。\n\n"
+                       "第2章 出发\n\n诺亚离开了村子。\n\n众人为他送行。\n",
+                       encoding="utf-8")
+    provider = TitleRevisionProvider()
+    with TranslationProject(tmp_path / "project",
+                            TranslationConfig(), provider=provider,
+                            provider_id="title-revision-v1") as project:
+        project.import_book(japanese, edition_id="ja", language="ja",
+                            paragraph_policy="blank_line")
+        project.import_book(chinese, edition_id="zh", language="zh",
+                            paragraph_policy="blank_line")
+        flow = TranslationWorkflow(project, "ja", "zh",
+                                   levels=LevelConfig((2, 2), (1, 1)),
+                                   full_chapters=1)
+        with TranslationStore(tmp_path / "translation.sqlite") as store:
+            runner = TranslationRunner(
+                project, flow, store, continuation_start=1, main_end=2,
+                reference_texts={0: "诺亚回到了村子。\n\n众人听他讲述旅途。"},
+                translation_tokens=512, review_tokens=512,
+                adjudication_tokens=512, max_revisions=1)
+            result = runner.run_order(1)
+            assert result["status"] == "accepted"
+            assert result["rounds"] == 1
+            assert store.chapter(1)["title_zh"] == "第二章 出发"
 
 
 def test_build_and_verify_epub(tmp_path: Path):

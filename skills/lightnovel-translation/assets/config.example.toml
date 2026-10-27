@@ -52,6 +52,15 @@ glossary_tokens = 16384
 glossary_terms_per_chapter = 5
 glossary_terms_base = 40
 glossary_max_continuations = 4
+# The first N glossary forms are an append-only prompt prefix shared across
+# batches. Batch-only additions are appended later in the prompt. 0 disables
+# the stable core.
+prompt_glossary_limit = 512
+# Historical term evidence is source-aligned and bounded. The excerpt radius is
+# in characters; the global cap counts excerpt characters, not JSON overhead.
+evidence_excerpt_chars = 120
+evidence_max_excerpts = 2
+evidence_max_chars = 12000
 # Per-review native tool-call budgets. The review model may request prior
 # chapters or term usages; the remaining budget is shown in its context.
 lookup_chapters = 8

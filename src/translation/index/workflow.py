@@ -17,7 +17,8 @@ from .context_plan import (ContextDocument, batch_near_reserve,
                            build_context_plan)
 from .lazy import plan_reference_blocks
 from .levels import LevelConfig
-from .prompts import source_message, source_records_rules
+from .prompts import (SOURCE_RECORDS_RULES, source_message,
+                      source_records_alias_map)
 from .snapshot import IndexSnapshot
 
 
@@ -146,12 +147,18 @@ class TranslationWorkflow:
 
     def assemble(self, *, snapshot: IndexSnapshot, documents: Mapping[int, ContextDocument],
                  target_order: int, batch_orders: Iterable[int],
-                 glossary: Iterable[GlossaryTerm] = (), unresolved: Iterable[str] = (),
+                 glossary: Iterable[GlossaryTerm] = (),
+                 stable_glossary: Iterable[GlossaryTerm] = (),
+                 unresolved: Iterable[str] = (),
                  threads: Mapping | None = None,
                  output_tokens: int = 16384,
                  output_profile: str = "plain",
                  source_rows: Iterable[Mapping] | None = None,
-                 provisional_orders: Iterable[int] = ()) -> tuple[list[dict], dict, object]:
+                 provisional_orders: Iterable[int] = (),
+                 evidence_excerpt_chars: int = 120,
+                 evidence_max_excerpts: int = 2,
+                 evidence_max_chars: int = 12000,
+                 ) -> tuple[list[dict], dict, object]:
         if output_profile not in {"plain", "source-records"}:
             raise ValueError("unknown output profile")
         batch_orders = tuple(batch_orders)
@@ -169,18 +176,26 @@ class TranslationWorkflow:
                                   max_tokens=self.capacity - output_tokens,
                                   full_chapters=self.full_chapters,
                                   selection_reserve_tokens=reserve)
-        # Keep the caller's stable order. Re-sorting a growing glossary breaks
-        # the cached prefix at the first newly inserted term.
-        terms = list(glossary)
+        # The stable core is an append-only projection. Batch-only additions go
+        # in a later message so a new term never moves the reusable prefix.
+        stable_terms = list(stable_glossary)
+        stable_sources = {term.source for term in stable_terms}
+        batch_terms = [term for term in glossary
+                       if term.source not in stable_sources]
+        terms = stable_terms + batch_terms
         cards = [_entity_card(index, term) for index, term in enumerate(terms, 1)]
-        # Keep the cacheable prefix free of per-chapter values. The glossary and
-        # fixed rules go first; target/batch selection and thread state go after
-        # the reference context.
+        stable_cards = cards[:len(stable_terms)]
+        batch_cards = cards[len(stable_terms):]
         stable_workset = {
             "core": [{"id": "CORE-REF", "value": "参考译文只作术语/风格候选，日文是事实依据。"}],
-            "candidates": cards,
             "extraction_gaps": ["参考索引为 lazy planned blocks；仅使用已物化摘要或全文。"],
             "authority": "candidate_unreviewed",
+            "candidates": stable_cards,
+        }
+        batch_workset = {
+            "scope": "batch_additions",
+            "authority": "candidate_unreviewed",
+            "candidates": batch_cards,
         }
         dynamic_workset = {
             "unresolved": list(unresolved),
@@ -200,24 +215,57 @@ class TranslationWorkflow:
                 "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
                 "日文原文是事实依据。实体卡中 confidence=1、locked 或 provisional 的 "
                 "target_form 必须使用；其余术语为候选。只输出正文，不输出标题、段落定位ID或解释。")
-        messages = [
-            {"role": "system", "content": system},
+        # L0 first, then run-stable, then batch-stable, then chapter-specific.
+        # Do not put a per-chapter value before a block with a longer lifetime.
+        messages = [{"role": "system", "content": system}]
+        if output_profile == "source-records":
+            messages.append({"role": "user", "content": SOURCE_RECORDS_RULES})
+        messages.extend([
             {"role": "user", "content":
              "【冻结约定与稳定候选；参考译文不是事实】\n" +
              json.dumps(stable_workset, ensure_ascii=False, separators=(",", ":"))},
             {"role": "user", "content":
              "【参考索引与近期全文；参考译文不是目标已提交译文】"},
-        ]
+        ])
         rendered = plan.render_messages()
-        messages.extend(message for message, segment in zip(rendered, plan.segments)
-                        if segment.representation != "target_source")
+        stable_summaries = []
+        provisional_summaries = []
+        full_messages = []
+        batch_sources = []
+        for message, segment in zip(rendered, plan.segments):
+            if segment.representation == "target_source":
+                continue
+            if segment.representation == "summary":
+                target_list = (provisional_summaries
+                               if segment.status == "provisional"
+                               else stable_summaries)
+                target_list.append(message)
+            elif segment.representation == "full":
+                full_messages.append(message)
+            elif segment.representation == "batch_source":
+                batch_sources.append(message)
+        messages.extend(stable_summaries)
+        if batch_cards:
+            messages.append({"role": "user", "content":
+                             "【本批次新增术语候选；未审】\n" +
+                             json.dumps(batch_workset, ensure_ascii=False,
+                                        separators=(",", ":"))})
+        messages.extend(provisional_summaries)
+        messages.extend(full_messages)
+        messages.extend(batch_sources)
         messages.append({"role": "user", "content":
              "【本章未决、线程与选择元数据；未审候选】\n" +
              json.dumps(dynamic_workset, ensure_ascii=False, separators=(",", ":"))})
+        near_orders = {segment.start for segment in plan.segments
+                       if segment.representation == "full"}
+        history_docs = [doc for doc in documents.values()
+                        if doc.order < target_order and doc.translation_text]
         evidence = glossary_evidence(
-            target.source_text, terms,
-            [doc.translation_text for doc in documents.values()
-             if doc.order < target_order and doc.translation_text])
+            target.source_text, terms, history_docs,
+            near_orders=near_orders,
+            excerpt_chars=evidence_excerpt_chars,
+            max_excerpts=evidence_max_excerpts,
+            max_chars=evidence_max_chars)
         if evidence:
             messages.append({"role": "user", "content":
                              "【本章定向词条与局部证据；未审候选】\n" +
@@ -232,7 +280,7 @@ class TranslationWorkflow:
                              "\n".join(f"[{alias}] {row['text']}"
                                        for alias, row in zip(aliases, rows))})
             messages.append({"role": "user", "content":
-                             source_records_rules(aliases)})
+                             source_records_alias_map(aliases)})
         else:
             source = {"chapter_id": target.source_id, "match_key": target.title,
                       "title": target.title, "text": target.source_text,
@@ -253,16 +301,24 @@ class TranslationWorkflow:
     def translate(self, *, snapshot: IndexSnapshot,
                   documents: Mapping[int, ContextDocument], target_order: int,
                   batch_orders: Iterable[int], glossary: Iterable[GlossaryTerm] = (),
+                  stable_glossary: Iterable[GlossaryTerm] = (),
                   unresolved: Iterable[str] = (), threads: Mapping | None = None,
                   output_tokens: int = 16384, output_profile: str = "plain",
                   source_rows: Iterable[Mapping] | None = None,
-                  provisional_orders: Iterable[int] = ()):
+                  provisional_orders: Iterable[int] = (),
+                  evidence_excerpt_chars: int = 120,
+                  evidence_max_excerpts: int = 2,
+                  evidence_max_chars: int = 12000):
         messages, report, plan = self.assemble(
             snapshot=snapshot, documents=documents, target_order=target_order,
-            batch_orders=batch_orders, glossary=glossary, unresolved=unresolved,
-            threads=threads, output_tokens=output_tokens,
+            batch_orders=batch_orders, glossary=glossary,
+            stable_glossary=stable_glossary,
+            unresolved=unresolved, threads=threads, output_tokens=output_tokens,
             output_profile=output_profile, source_rows=source_rows,
-            provisional_orders=provisional_orders)
+            provisional_orders=provisional_orders,
+            evidence_excerpt_chars=evidence_excerpt_chars,
+            evidence_max_excerpts=evidence_max_excerpts,
+            evidence_max_chars=evidence_max_chars)
         result = self.project.provider.generate(GenerationRequest(
             messages, max_tokens=output_tokens, temperature=0,
             task=f"translate_{target_order}"))
@@ -304,31 +360,148 @@ def _entity_card(index: int, term: GlossaryTerm) -> dict:
     }
 
 
+def _doc_value(doc, name, default=None):
+    if isinstance(doc, Mapping):
+        return doc.get(name, default)
+    return getattr(doc, name, default)
+
+
+def _excerpt(text: str, index: int, length: int, radius: int) -> str:
+    start = max(0, index - radius)
+    end = min(len(text), index + length + radius)
+    value = text[start:end].replace("\r", " ").replace("\n", " ").strip()
+    if start > 0:
+        value = "…" + value
+    if end < len(text):
+        value = value + "…"
+    return value
+
+
 def glossary_evidence(target_text: str, glossary: Iterable[GlossaryTerm],
-                      reference_texts: Iterable[str] = ()) -> dict | None:
-    terms = []
-    for term in glossary:
+                      history=(), *, near_orders: Iterable[int] = (),
+                      excerpt_chars: int = 120, max_excerpts: int = 2,
+                      max_chars: int = 12000) -> dict | None:
+    """Return bounded, source-aligned usage snippets for target terms.
+
+    Full historical chapters made this block dominate the prompt and still
+    matched the wrong entity whenever the target string was a common substring.
+    A term now needs both its Japanese source and one of its target/alias forms
+    in the same historical chapter; only a short window around that usage is
+    emitted. Documents already present as recent full context are skipped.
+    """
+    if max_chars <= 0 or max_excerpts <= 0:
+        return None
+    near = {int(order) for order in near_orders}
+    prepared = []
+    for term_index, term in enumerate(glossary):
+        if not term.source or not term.target:
+            continue
         if term.source not in target_text:
             continue
-        occurrences = [index for index, line in enumerate(target_text.splitlines(), 1)
-                       if term.source in line]
-        hits = [text for text in reference_texts if term.target in text]
-        terms.append({"source_form": term.source,
-                      "candidate_cards": [{
-                          "description": [f"参考译名候选：{term.target}"],
-                          "target_forms": [term.target],
-                          "confidence": term.confidence,
-                          "locked": term.locked,
-                          "provisional": term.provisional,
-                          "entity_id": term.entity_id,
-                          "form_type": term.form_type,
-                          "semantic_status": _term_authority(term)}],
-                      "occurrences": occurrences[:8],
-                      "historical_match_count": len(hits),
-                      "historical_excerpts": hits[:2]})
-    if not terms:
+        forms = list(dict.fromkeys(
+            form for form in (term.target, *term.aliases) if form))
+        if not forms:
+            continue
+        candidates = []
+        for doc in history:
+            order = _doc_value(doc, "order")
+            if order is None or int(order) in near:
+                continue
+            source_text = _doc_value(doc, "source_text") or ""
+            if term.source not in source_text:
+                continue
+            translation = _doc_value(doc, "translation_text") or ""
+            if not translation:
+                continue
+            found = None
+            for form in forms:
+                index = translation.find(form)
+                if index >= 0:
+                    found = (form, index)
+                    break
+            if found is None:
+                continue
+            candidates.append({
+                "order": int(order),
+                "title": str(_doc_value(doc, "title") or ""),
+                "form": found[0],
+                "text": _excerpt(translation, found[1], len(found[0]),
+                                 max(0, int(excerpt_chars))),
+            })
+        if not candidates:
+            continue
+        # Prefer recent usage, then keep a stable glossary-order output.
+        candidates.sort(key=lambda item: -item["order"])
+        excerpts = []
+        seen = set()
+        for candidate in candidates:
+            if candidate["text"] in seen:
+                continue
+            seen.add(candidate["text"])
+            excerpts.append(candidate)
+            if len(excerpts) >= max_excerpts:
+                break
+        if not excerpts:
+            continue
+        canonical = (term.locked or term.provisional or
+                     int(term.confidence) == 1)
+        kind = str(term.kind or "other")
+        priority = (0 if canonical else 1,
+                    0 if kind not in {"other"} else 1,
+                    term_index)
+        prepared.append((priority, term_index, term,
+                         len(candidates), excerpts))
+    if not prepared:
         return None
-    return {"schema": "targeted-evidence-v1",
-            "selection": "glossary_and_literal_reference_hits",
-            "authority": "candidate_unreviewed", "terms": terms,
-            "note": "检索不到不等于作品没有相关信息；日文原文是事实依据。"}
+
+    prepared.sort(key=lambda item: item[0])
+    selected = {}
+    used = 0
+    omitted_terms = 0
+    truncated = False
+    for _, term_index, term, match_count, excerpts in prepared:
+        first = excerpts[0]
+        cost = len(first["text"])
+        if used + cost > max_chars:
+            omitted_terms += 1
+            truncated = True
+            continue
+        # Keep one excerpt for every selected term before spending bytes on a
+        # second usage; this avoids losing a whole term to the global cap.
+        selected[term_index] = {
+            "source_form": term.source,
+            "target": term.target,
+            "confidence": int(term.confidence),
+            "locked": bool(term.locked),
+            "provisional": bool(term.provisional),
+            "historical_match_count": match_count,
+            "historical_excerpts": [{
+                "order": first["order"], "text": first["text"]}],
+        }
+        used += cost
+    for _, term_index, _, _, excerpts in prepared:
+        entry = selected.get(term_index)
+        if entry is None:
+            continue
+        for extra in excerpts[1:]:
+            cost = len(extra["text"])
+            if used + cost > max_chars:
+                truncated = True
+                break
+            entry["historical_excerpts"].append({
+                "order": extra["order"], "text": extra["text"]})
+            used += cost
+    if not selected:
+        return None
+    terms = [selected[index] for index in sorted(selected)]
+    return {
+        "schema": "targeted-evidence-v2",
+        "selection": "source_aligned_bounded_snippets",
+        "authority": "candidate_unreviewed",
+        "excerpt_chars": int(excerpt_chars),
+        "max_chars": int(max_chars),
+        "truncated": truncated,
+        "omitted_terms": omitted_terms,
+        "terms": terms,
+        "note": "证据为抽样局部片段；未列出的术语不等于无历史用法，日文原文是事实依据。",
+    }
