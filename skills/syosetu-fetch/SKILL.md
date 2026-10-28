@@ -22,6 +22,8 @@ description: 在成为小说家吧按作者或标题检索日文 Web 小说，�
 
 下载返回的 `epub_path` 是清洗过的 `source.epub`，可直接 `project.import_book(epub_path, edition_id="web-ja", language="ja")`。检查导入章数、开头结尾与 `validate_inputs()`；中文文库与 Web 默认按独立版本处理，不按章节序号硬配。原始 EPUB、响应缓存、清洗计数、篇章归属、稳定 URL 与修订标识保留在同一快照。
 
+下载结果还包含 `chapter_plan_path`（`chapter_plan.json`）。它按 manifest 的 `section` 和标题规则区分 `main`/`extra`/`character_sheet`/`setting`；把该文件复制到翻译项目根目录，续译 runner 会优先使用它。不要只用 `^\d+话` 判断主线：篇名前缀、裸编号、书信番外和人物表都会造成误判；`main_ratio < 0.90` 时应人工复核分类。
+
 本模块不用模型、API key 或个人 FanFicFare INI。下载仅使用用户配置中的 `[syosetu]` 节，不初始化模型或使用翻译凭据。默认 2 个线程预取正文，全部下载线程共享 1 秒请求启动间隔；`--concurrency 1` 恢复串行，显式参数优先于配置。429 / 503 会降低并发并共享退避，遵守 Retry-After；重试次数用尽或等待超过 60 秒时返回错误并保留缓存，不自动扩大并发重试。每份 manifest 的 `download_stats` 可核对实际并发、重试和限流事件。
 
 网络不通时使用用户给定的代理参数，例如 `--proxy http://127.0.0.1:7890`；不修改系统代理或个人配置，不在报告中输出含认证信息的代理 URL。仅支持普通站公开作品；不尝试登录、验证码绕过或成人站获取。

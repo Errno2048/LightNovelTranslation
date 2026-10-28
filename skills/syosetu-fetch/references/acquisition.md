@@ -66,7 +66,9 @@ TXT 支持 `--encoding` / `inspect_reference(..., encoding=...)`。预览是有�
 ## 下载与导入
 
 ```python
-from lightnovel_translation import TranslationConfig, TranslationProject
+from pathlib import Path
+
+from lightnovel_translation import TranslationProject
 from lightnovel_translation.syosetu import download_work
 
 result = download_work(
@@ -74,11 +76,20 @@ result = download_work(
     proxy="http://127.0.0.1:7890", timeout=20, retries=1,
     selection_evidence={"reference": "中文第一卷.epub", "reason": "作者全名、蜘蛛关键词及转生简介相符"},
 )
-with TranslationProject("work/project", TranslationConfig()) as project:
+with TranslationProject("work/project") as project:
     edition = project.import_book(result["epub_path"], edition_id="web-ja", language="ja")
     assert len(edition.chapters()) == result["chapter_count"]
     print(project.validate_inputs())
+    if result.get("chapter_plan_path"):
+        # The acquisition role plan uses source ordinals. Copy it to the
+        # translation project root so the runner can classify extras without
+        # guessing from titles.
+        (Path("work/project") / "chapter_plan.json").write_text(
+            Path(result["chapter_plan_path"]).read_text(encoding="utf-8"),
+            encoding="utf-8")
 ```
+
+生成阶段使用 `TranslationProject("work/project")`；不要传入空的 `TranslationConfig()`，它不会自动加载用户模型配置（只适合纯导入/离线检查）。
 
 ```console
 python -m lightnovel_translation syosetu download n7975cr work/acquisition-01 --first 1 --last 2 --proxy http://127.0.0.1:7890
@@ -93,6 +104,7 @@ python -m lightnovel_translation syosetu download n7975cr work/acquisition-01 --
 | `source.epub` | 清洗后的 EPUB 3，供现有 `import_book` 导入 |
 | `raw.epub` | FanFicFare 原始输出，可能含标题标记 U+200B |
 | `manifest.json` | 状态、作品身份、范围、每话标题 / 篇章 / canonical URL / 修订标识、输出哈希、清洗计数 |
+| `chapter_plan.json` | 派生角色计划：`main`/`extra`/`character_sheet`/`setting`、`section`、序号与 `main_ratio`；供续译 runner 使用 |
 | `cache/work.json` | 当次作品元信息 |
 | `cache/responses/responses.json` + `.bin` | GET 响应字节、URL、哈希；不保存 cookie、请求头或 pickle |
 

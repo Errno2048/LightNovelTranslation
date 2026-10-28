@@ -973,3 +973,20 @@ Token 预算由 `plan_request` 统一计算；workset/实体/线程/定向证据
 - 仍需 agent 判断：跨版本目录锚点、实体/线程目录、单章拆分译文对齐、blocked 章节的局部修复。
 - 需要旧完整自动管线时使用 `legacy-sequence` 分支。
 - 验证：共享测试、新索引测试和 pipeline 离线测试通过；离线示例输出摘要 + 全文 + target 段并完成两次 provider 调用；真实 Web 章节已跑通翻译 → 审校 → 裁决 → 修订 → 复审 → accepted。
+
+### 21.1 摘要物化现状与分层块 TODO（2026-10-29）
+
+当前接线的摘要物化是扁平滚动 scope，块位置按章数/批次界定，与层级和 token 预算无关：
+
+- `reference` / `reference-progress`：`ensure_reference_summary()` 按 `reference_chunk`（默认 16 章）分块推进。
+- `target`：`update_target_summary()` 从 `continuation_start` 起按 `summary_every`（默认 5 章）对 accepted 连续前缀切块；范围内有未接受章节时指针停住。`run_concurrent`/`run` 每批/每章后触发，`run_pipelined` 仅在收尾且无 blocked 时触发。
+- `target-provisional`：pipelined 每批 draft 落库后整批一块，模型失败时降级为每章前 300 字拼接。
+
+`translation.index.summary_index` 与 `translation.index.block_builder`（`SummaryIndex`）实现了 level 1 / level 2 分层物化，**未接入 runner、未从 `translation.index` 导出**，仅有测试覆盖。其设计语义：块边界由 token 预算贪心划分（level 1 受 `level1_capacity` 约束，level 2 归堆 level-1 块）；level 2 direct 优先、超容量回退为“先物化全部 level-1 子块再 rollup”；`translation_barrier()`/`review_barrier()` 以 coverage gap 声明物化前置条件；`commit_block()` 在覆盖章节全部 accepted 后升 committed。
+
+接线前待办（TODO）：
+
+1. 裁决 `review_barrier` 语义：当前直接复用 `translation_barrier`，`strict=False` 时审校屏障接受 PROVISIONAL 覆盖，与“审校基于 accepted 事实”的设计意图不符（docstring 已标注）。
+2. 把扁平 scope 迁移或映射到分层块（含 `summary_every` 节奏与 token 预算边界的取舍）。
+3. 在 runner 批次循环中按 barrier gap 自动物化缺失块，并从 `translation.index` 导出 `SummaryIndex`。
+4. 更新技能文档（operations.md 0.2、new-architecture.md 7.5）中的“规划中”标注。

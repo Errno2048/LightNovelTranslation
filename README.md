@@ -43,7 +43,7 @@ with TranslationProject("workspaces/my-novel") as project:
     print(result.text[:1000])
 ```
 
-新流程：lazy 参考规划 → 高层摘要 → ContextPlan + workset/实体/线程/定向证据 → `source-records` 输出协议 → 翻译 → `chapter-review` 审校/裁决/修订 → accepted 提交与 EPUB 导出。当前 runner 使用章节快照与 level-2 摘要；lazy 低层物化器和目标 level-1 自动物化仍是规划能力，尚未接入自动闭环。
+新流程：lazy 参考规划 → 高层摘要 → ContextPlan + workset/实体/线程/定向证据 → `source-records` 输出协议 → 翻译 → `chapter-review` 审校/裁决/修订 → accepted 提交与 EPUB 导出。当前 runner 使用章节快照与 level-2 摘要；level 1/level 2 分层摘要块物化（`translation.index.summary_index`/`block_builder`）与目标 level-1 自动物化仍是规划能力（TODO），尚未接入自动闭环。
 
 **章节闭环**：`translation.index.TranslationRunner` 提供逐章翻译、审校、裁决、有限修订/复审、accepted 提交、滚动摘要与 EPUB 导出；状态保存在 SQLite，可中断续跑。跨版本目录对齐仍需按标题/内容建立映射（可用模型或显式锚点），单章拆分、线程目录和部分质量判定仍可能需人工接管。完整说明见[新架构技能文档](skills/lightnovel-translation/references/new-architecture.md)、[库使用说明](docs/usage.md)和[架构设计](docs/refactor-architecture-design.md)。
 

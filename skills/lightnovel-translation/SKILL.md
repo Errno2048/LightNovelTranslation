@@ -18,6 +18,21 @@ description: 使用 lightnovel_translation 的新分层索引工作流标准化 
 
 优先使用新工作流和结构化诊断；只有文档不足或任务要求修改库时再读源码。
 
+## 续译工作流的新增约束（0.5）
+
+以下行为已经接入 runner；旧文档中“可选/跳过”的说法不再适用于续译：
+
+- **章节角色计划**：runner 读取项目的 `chapter_plan.json`（没有时在线分类），区分 `main`、`extra`、`character_sheet`、`setting` 等。非主线默认翻译；不要再用 `_is_extra_title` 的标题启发式作为唯一判据。`main_ratio < 0.90` 需要人工确认，`< 0.75` 必须硬停。
+- **参考术语必须预载**：存在 `reference_texts` 时，`ensure_glossary()` 必须在翻译前完成；runner 在缺失时会自动补跑，空术语表会报错。不要跳过。术语块可用 `[workflow] glossary_concurrency` 并发调用模型，写库仍由主线程串行。
+- **样式与标题**：runner 从参考标题/正文抽取 `StyleProfile`，标题序号由规则渲染，引号/全半角标点做确定性规范化。只在提示词里强调不够。
+- **番外纳入**：`run_concurrent` / `run_pipelined` 默认翻译 `extra`、`character_sheet`、`setting`；导出用 `collect_planned_chapters()`，不要用会跳过番外的旧 `collect_epub_chapters()`。
+- **双语模式**：参考章默认 `bilingual_mode="blocks"`（按章对照），流水线生成章默认 `pairs`（逐段 S/T）。
+- **错误隔离**：`failure_policy="continue"` 时单章翻译/审校失败不再阻断同批或后续批次；成功章节继续成为 `ready`/`accepted`，失败章节记为 `blocked`。可配 `review_start="as_completed"`（每章译完即审）或 `"prefix_as_completed"`（批内前序章节落定后即审）让审校随翻译推进，两者都要求 `failure_policy="continue"`。最终导出前调用 `runner.repair_pending()` 统一重试 blocked/draft 章节；manual_review 仍需人工。
+- **补译**：`runner.backfill_plan()` / `runner.run_backfill()` 处理参考区间内无参考的缺口；执行前先把 `plan.report` 给用户确认。
+- **层级摘要块**：当前 runner 只使用扁平滚动摘要 scope（`target` 每 `summary_every` 章一块、`target-provisional` 每批一块）；level 1/level 2 分层物化（`summary_index`/`block_builder` 的 `SummaryIndex`）尚未接入 runner，属规划能力（TODO），不要当作可用 API。
+- **配置与探针**：生成阶段用 `TranslationProject(path)`，不要传空的 `TranslationConfig()`；provider 探针 `max_tokens >= 256`。
+- **资产索引**：无图片 EPUB 会跳过全页资产解析；有图片时仍会构建索引。
+
 ## 配置与凭据
 
 配置空模板见 [assets/config.example.toml](assets/config.example.toml)。首次执行：
@@ -108,27 +123,43 @@ print(result.text[:1000])
 
 ```python
 from translation.index import (TranslationRunner, TranslationStore,
-                               build_epub, collect_epub_chapters)
+                               build_epub, build_review_report,
+                               collect_planned_chapters)
 
 # {Web edition_order: official Chinese prose}
 # Build this from the verified alignment; never reverse the direction or pass
 # a directory object. Split Chinese chapters are concatenated with "\n\n".
 reference_texts = {ja_order: chinese_text, ...}
 
+# If Web orders and reference orders differ (world intro/extras), pass the
+# explicit source->reference map; do not let equal order numbers pair blindly.
+flow = TranslationWorkflow(project, "web-ja", "web-zh",
+                           levels=LevelConfig((10, 10), (3, 1)),
+                           reference_map={ja_order: zh_order, ...})
+
 with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner = TranslationRunner(
         project, flow, store, continuation_start=199, main_end=260,
         reference_texts=reference_texts)
+    # Mandatory for continuation when reference_texts is present.
     runner.ensure_reference_summary()
     runner.ensure_glossary()
     runner.run_concurrent(start=199, end=260)
     runner.update_target_summary(force=True)
-    chapters = collect_epub_chapters(
-        runner=runner, reference_chapters=official_chapters, end=260)
-    build_epub(output="book.epub", title="书名", chapters=chapters)
+
+    # Role-aware collector: reference chapters, main line and extras in
+    # source order. Reference chapters use blocks; generated chapters use pairs.
+    chapters = collect_planned_chapters(
+        runner=runner, reference_chapters=official_chapters, end=260,
+        bilingual=True)
+    build_epub(output="book.epub", title="书名", chapters=chapters,
+               bilingual=True)
+    build_review_report(runner=runner,
+                        markdown_path="work/my-novel/review-report.md",
+                        json_path="work/my-novel/review-report.json")
 ```
 
-`run_order` 会逐源段翻译、用 `chapter-review` 审校、裁决、修订并复审；只有通过的章节写为 accepted。长任务改用 `run_concurrent`（见 [operations.md](references/operations.md#2-并发运行参数)）。
+`run_order` 会逐源段翻译、用 `chapter-review` 审校、裁决、修订并复审；只有通过的章节写为 accepted。长任务改用 `run_concurrent`（见 [operations.md](references/operations.md#2-并发运行参数)）。runner 默认把 `extra`/`character_sheet`/`setting` 纳入翻译；可用 `translate_roles` 或 `[workflow] translate_extras / translate_reference_pages` 调整。
 
 遇到 `ChapterBlocked`、摘要停住、目录对齐、provider 502/524、事后质量复查或导出失败时，按 [operations.md](references/operations.md) 的对应小节操作；其中包含精确修补目标段落、恢复 accepted、再次导出和结构验证的完整代码。不要跳过 blocked 章节伪造 accepted，也不要凭空删除审校记录。跨版本目录必须按标题/内容锚点对齐，不能把中文文库章号直接当 Web 话序；单章拆分和线程目录仍可能需人工接管。
 
@@ -137,6 +168,9 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
 - 不改原书、来源快照、已有导出或已冻结的产物；结构变化使用有版本约束的 patch 或新导入分支。
 - 不删除错误标记、伪造指纹、添加空译文、重复段落或凭剧情补齐缺页来通过验证。
 - 参考译文只用于译名、实体、事件和文风候选；冲突以日文为准。
-- LLM 摘要/实体不是权威事实；partial、未决和抽取缺口必须保留。
+- 续译的既有专名以参考术语表为一致性来源；参考事实仍不得覆盖日文事实。参考术语表为空时不要开始续译。
+- 章节角色以 `chapter_plan.json`/`ChapterPlan` 为准；`main_ratio` 低于阈值时不要自动跑全量。
+- 参考章按 `blocks` 对照、生成章按 `pairs` 对照；不要把不可靠的参考段落强行逐段配对。
+- LLM 摘要/实体不是权威事实；partial、未决和抽取缺口必须保留，并在 `build_review_report()` 中可见。
 - 每次模型尝试（含失败）写入 `events`；`limits.max_attempts` 控制传输/截断重试。总请求/token 上限在批次边界检查，批次内可能短暂超出。timeout/524 等未知远端完成状态不自动重发。
 - 指标和参考摘要可能产生费用；`IndexMetrics` 需要调用方手动记录，runner 不会自动写入 direct/fallback/split/estimate 指标。

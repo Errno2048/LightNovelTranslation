@@ -217,6 +217,11 @@ runner.run_mode(start=199, end=260)
 - N+1 的上下文包含 N 的未审 draft、provisional 摘要和滚动术语表；这些内容标记为 provisional，不冒充 accepted。
 - accepted 仍按连续前缀推进；`ready` 表示自动审校完成但因前面的人工/阻塞无法 accepted。
 - `pipeline_review_backlog` 限制自动审校积压；`pipeline_manual_backlog` 限制人工复核积压，达到上限时暂停启动新翻译。
+- 与 `run_concurrent` 每批后更新 accepted 摘要不同，`run_pipelined` 只在全部结束且无 blocked 时统一调用 `update_target_summary()`；流水线中途的远距上下文由 `target-provisional` 块支撑。需要中途导出 accepted 摘要时手动调用 `update_target_summary()`。
+
+`failure_policy="continue"` 时单章翻译/审校失败不再阻断同批或后续批次；`review_start` 控制审校启动时机：`barrier`（批内全部译完后）、`as_completed`（每章译完即审）、`prefix_as_completed`（该章批内前序章节全部落定后即审，保住审校历史完整性）；后两者要求 `failure_policy="continue"`。导出前调用 `runner.repair_pending()` 统一重试 blocked/draft 章节。
+
+当前的摘要块均为扁平滚动 scope，按章数/批次界定边界；level 1 / level 2 分层物化（`translation.index.summary_index` / `block_builder` 的 `SummaryIndex`）尚未接入 runner，属于规划能力，见技能文档 [operations.md 0.2](../skills/lightnovel-translation/references/operations.md)（TODO）。
 
 ### 4.2 实体/形式术语表
 

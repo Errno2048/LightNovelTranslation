@@ -153,7 +153,7 @@ store.add(Task("translate-111", "translate", "translate"),
 
 ```python
 from translation.index import (TranslationRunner, TranslationStore,
-                               build_epub, collect_epub_chapters)
+                               build_epub, collect_planned_chapters)
 
 with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner = TranslationRunner(
@@ -165,9 +165,11 @@ with TranslationStore("work/my-novel/translation.sqlite") as store:
     runner.ensure_glossary()
     runner.run_concurrent(start=199, end=260)
     runner.update_target_summary(force=True)
-    chapters = collect_epub_chapters(
-        runner=runner, reference_chapters=official_chapters, end=260)
-    build_epub(output="book.epub", title="书名", chapters=chapters)
+    chapters = collect_planned_chapters(
+        runner=runner, reference_chapters=official_chapters, end=260,
+        bilingual=True)
+    build_epub(output="book.epub", title="书名", chapters=chapters,
+               bilingual=True)
 ```
 
 人工复核可用 `build_bilingual_html(title=..., chapters=...)` 生成单文件 HTML：每个段落先译文、后原文，原文使用次级字号和左边线；按位置配对并显示段落数不一致提示。该渲染不依赖 JavaScript，也不使用 ruby 承载整段对照。
@@ -180,9 +182,9 @@ EPUB 使用同一套可选参数：`collect_epub_chapters(..., bilingual=True)` 
 2. 用 `chapter-review` 对照完整 S/T 与近期 R/L 历史审校；
 3. 逐条裁决；confirmed 的 critical/major 触发完整重译修订；
 4. 复审，最多 `max_revisions` 轮；batch 模式仍有 major 时写 `blocked` 并抛出 `ChapterBlocked`，pipelined + strict 模式写 `manual_review`；
-5. 通过后原子写 `accepted`，并每隔 `summary_every` 章生成增量目标摘要。
+5. 通过后原子写 `accepted`。滚动目标摘要按 `summary_every` 章节奏增量生成；注意 `run_concurrent`/`run` 每批/每章后调用 `update_target_summary()`，而 `run_pipelined` 只在全部结束且无 blocked 时统一补齐——流水线中途的下游上下文由 `target-provisional` 块支撑（见 7.2）。
 
-恢复时直接用同一 SQLite 重新构造 runner；accepted 章节会跳过。`blocked` 章节会重新进入草稿流程，或由 agent 检查 `review` 字段后局部接管；`manual_review` 用 `resolve_manual_review()` 处理。
+恢复时直接用同一 SQLite 重新构造 runner；accepted 章节会跳过。`blocked` 章节会重新进入草稿流程，或由 agent 检查 `review` 字段后局部接管；`manual_review` 用 `resolve_manual_review()` 处理。导出续译书稿用 `collect_planned_chapters()`（参考章 + 主线 + 番外按 source order 交错）；旧 `collect_epub_chapters()` 仍保留兼容，但会跳过番外，续译导出不要再用它。
 
 长任务使用 `run_concurrent` 批次执行：
 
@@ -225,6 +227,37 @@ runner.run_mode(start=continuation, end=main_end)  # 按配置分派
 - `link_term_form` / `merge_term_entities` 显式维护全名/短名关系；合并只改 `entity_id`，不改各 form target。
 - `promote_provisional_terms` 拒绝把 target 提升为另一个 form 已占用的 canonical，并记录/暴露 `term_conflicts`。
 - 标题模式存为 `form_type="title_pattern"`，由 `translation.index.titles` 解析固定前缀/序号/后缀并渲染；只归一化重复模式，`update_title_pattern()` 只更新 `title_zh`。
+
+### 7.4 章节角色、样式、补译与统一导出（0.5）
+
+```python
+from translation.index import (
+    ChapterPlan, StyleProfile, BackfillPlan, plan_backfill,
+    collect_planned_chapters, build_review_report)
+```
+
+- **角色计划**：`ChapterPlan` / `ChapterClassifier`（`translation.index.roles`）把条目分为 `main`、`extra`、`character_sheet`、`setting`、`preface`、`afterword`、`unknown`。`chapter_plan.json` 是首选来源；采集 manifest 的 `section` 比标题启发式更可靠。`main_ratio < 0.90` 需要人工确认，`< 0.75` 硬停。
+- **runner 角色策略**：`TranslationRunner(..., translate_roles=..., summary_roles=...)`；默认翻译 `main`+`extra`+`character_sheet`+`setting`+`preface`+`afterword`。`run`/`run_concurrent`/`run_pipelined` 不再静默跳过番外。
+- **参考术语**：存在 `reference_texts` 时，`ensure_glossary()` 是必需前置；runner 会自动补跑并对空术语表报 `reference_glossary_empty`。`unresolved` 中专名冲突会升级为 major。
+- **样式**：`StyleProfile` 从参考标题/正文抽取；标题由 `render_main_title()` 规则渲染，正文由 `normalize_punctuation()` 规范化。只在提示词中强调不足以约束模型。
+- **统一导出**：`collect_planned_chapters(runner, reference_chapters, end, bilingual=True)` 按 `source order` 交错参考章、主线译文和番外；参考章 `bilingual_mode="blocks"`，生成章 `pairs`。
+- **审校报告**：`build_review_report(runner, markdown_path, json_path)` 输出 unresolved、confirmed findings、term checks、manual fixes 和 accepted-with-major。
+- **补译**：`plan_backfill(runner, ...)` 生成 `BackfillPlan`（gap + region + before/after + prefix_hash）；`runner.run_backfill(plan)` 使用 `assemble_backfill()` 的 Layer A（稳定术语/摘要/风格）→ Layer B（region 前后文）→ Layer C（单缺口目标）布局。补译应先于主线续译。
+- **资产**：`load_asset_index` 在 source EPUB 无图片资源时跳过逐页解析。
+- **双语**：`build_epub(..., bilingual=True)` 读取每章 `bilingual_mode`；`blocks` 不再产生逐段“段落数不一致”提示。
+
+### 7.5 层级摘要块物化（TODO，规划中）
+
+当前 runner 的摘要全部是 `summaries` 表里的扁平滚动 scope（`reference`、`reference-progress`、`target`、`target-provisional`），块位置按章数/批次界定：`target` 从 `continuation_start` 起每 `summary_every`（默认 5）章对 accepted 连续前缀切块，`target-provisional` 整批一块；范围内出现未接受章节时 `update_target_summary()` 会停住指针，不允许跳过打洞。快照把这些摘要包装成 level-2 Artifact 供 ContextPlan 使用，**level 1 在已接线路径中从未出现**。
+
+真正的 level 1 / level 2 分层物化存在于 `translation.index.summary_index` / `translation.index.block_builder`（`SummaryIndex`），**尚未接入 runner、未从 `translation.index` 导出**，属于规划能力（TODO）：
+
+- 块边界由 token 预算贪心划分：level 1 受 `level1_capacity` 与 `child_max_chapters` 约束，level 2 按 `expected_l2_count` / `parent_max_chapters` 归堆；与现行固定章数节奏不同。
+- level 2 物化 direct 优先，`context_budget` 超限时回退为“先物化该父块全部 level-1 子块再 rollup”，对应 `required_children_for_high_level` 的覆盖不变量。
+- `translation_barrier()` / `review_barrier()` 以 coverage gap 形式声明“翻译/审校某章前必须先物化哪些区间”，由调用方执行；`commit_block()` 在块覆盖章节全部 accepted 后把 provisional 升为 committed。
+- 已知差异：`review_barrier` 目前直接复用 `translation_barrier`，`strict=False` 时审校也接受 PROVISIONAL 覆盖，与“审校基于 accepted 事实”的设计意图不符；接线前需裁决（docstring 已标注 TODO）。
+
+在接线完成前，不要把这些模块当作可用 API；摘要触发表与边界规则详见 [operations.md 0.2](operations.md#02-层级摘要块物化规划中todo)。
 
 ## 8. 当前自动化边界与手动接管
 

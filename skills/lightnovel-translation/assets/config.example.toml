@@ -26,11 +26,29 @@ max_output_tokens = 131072
 token_inflation_factor = 1.05
 safety_tokens = 2048
 
+[index]
+# Hierarchical summary index: level 1 groups chapters, level 2 groups level 1
+# blocks. Boundaries follow the token budget first; a direct level 2 build
+# that does not fit falls back to level 1 + rollup.
+parent_max_chapters = 100
+child_max_chapters = 10
+expected_l2_count = 10
+l2_prepartition_min_chapters = 3
+parent_build_mode = "direct_then_rollup"
+child_target_tokens = 64000
+child_min_content_tokens = 4000
+predecessor_reserve_tokens = 4096
+protocol_reserve_tokens = 4096
+layout = "token"
+
 [workflow]
 # Batch-source translation: chapters in a batch do not depend on each other's
 # translations. A batch-wide glossary keeps names consistent.
 translation_concurrency = 3
 review_concurrency = 4
+# Reference glossary chunks are independent; model calls may run concurrently.
+# Results are still written to SQLite serially by the main thread.
+glossary_concurrency = 2
 translation_mode = "batch" # "batch" or "pipelined".
 pipeline_review_backlog = 2 # In pipelined mode, reviewed batches may lag behind translation.
 pipeline_manual_backlog = 2 # Pending manual-review holds allowed before translation pauses.
@@ -67,3 +85,38 @@ lookup_chapters = 8
 lookup_terms = 50
 max_term_checks = 50 # Deterministic glossary mismatches sent to the reviewer.
 max_tool_rounds = 4
+# Role policy. Non-main content is translated by default; set
+# translate_reference_pages=false to keep character sheets/setting pages out of
+# the translation queue.
+translate_extras = true
+translate_reference_pages = true
+summary_extras = true
+# Role classification guard. Below 0.90 requires manual confirmation; below
+# 0.75 the runner refuses automatic classification.
+main_ratio_floor = 0.90
+# Continuation with reference_texts requires a reference-derived glossary.
+require_reference_glossary = true
+auto_reference_glossary = true
+# Unresolved term/name conflicts become major findings and block acceptance.
+strict_term_conflicts = true
+style_profile = true
+bilingual_mode = "auto" # "auto", "pairs" or "blocks".
+backfill = "ask" # "ask", "all", "extras" or "none".
+# stop_batch: current behavior; a failed translation/review blocks the batch.
+# continue: successful chapters continue through review/ready; failures are
+# collected for a final runner.repair_pending() pass.
+failure_policy = "stop_batch"
+# barrier: start reviews after all batch translations finish.
+# as_completed: start each review as its translation finishes (requires
+# failure_policy="continue").
+# prefix_as_completed: start a chapter's review once every earlier chapter in
+# the batch has settled (translated or terminally failed), keeping reviewer
+# history complete; also requires failure_policy="continue".
+review_start = "barrier"
+
+[limits]
+# Bounded exponential backoff for retryable provider failures
+# (timeout/network/server/rate_limit/empty). One wait never exceeds this cap.
+retry_max_wait_seconds = 8.0
+max_attempts = 3
+# max_requests / max_input_tokens / max_output_tokens: 0 means unlimited.
