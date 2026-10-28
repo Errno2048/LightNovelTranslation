@@ -397,6 +397,16 @@ def build_asset_index(project, edition_id: str, source_path: Path,
     return index
 
 
+_IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".svg",
+                   ".avif", ".bmp")
+
+
+def has_image_resources(source_path: Path) -> bool:
+    with zipfile.ZipFile(source_path) as archive:
+        return any(name.lower().endswith(_IMAGE_SUFFIXES)
+                   for name in archive.namelist())
+
+
 def load_asset_index(project, edition_id: str, *, refresh: bool = False) -> AssetIndex:
     source_path = _source_epub(project, edition_id)
     if source_path is None:
@@ -410,7 +420,14 @@ def load_asset_index(project, edition_id: str, *, refresh: bool = False) -> Asse
                 return AssetIndex.from_dict(value)
         except (OSError, ValueError, TypeError):
             pass
-    index = build_asset_index(project, edition_id, source_path, source_sha)
+    if not has_image_resources(source_path):
+        index = AssetIndex(
+            edition_id=edition_id, source_path=str(source_path),
+            source_sha256=source_sha)
+        index.warnings.append(
+            "source has no image resources; asset index skipped")
+    else:
+        index = build_asset_index(project, edition_id, source_path, source_sha)
     cache.parent.mkdir(parents=True, exist_ok=True)
     cache.write_text(json.dumps(index.to_dict(), ensure_ascii=False, indent=2),
                      encoding="utf-8")

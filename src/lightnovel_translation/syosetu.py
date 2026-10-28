@@ -602,7 +602,19 @@ def download_work(ncode_or_url: str, output_dir: str | Path, *, first_chapter: i
                         raw_epub_sha256=sha256(raw_path.read_bytes()).hexdigest(),
                         epub_sha256=sha256(epub_path.read_bytes()).hexdigest(), epub_path=str(epub_path))
         _write_json(output / "manifest.json", manifest)
+        chapter_plan_path = None
+        try:
+            from translation.index.roles import build_chapter_plan_from_manifest
+            chapter_plan = build_chapter_plan_from_manifest("", manifest)
+            chapter_plan_path = output / "chapter_plan.json"
+            chapter_plan.save(chapter_plan_path)
+        except Exception:
+            # Classification is a translation concern; acquisition remains
+            # valid if a future title pattern cannot be classified.
+            chapter_plan_path = None
         return {"ok": True, "epub_path": str(epub_path), "manifest_path": str(output / "manifest.json"),
+                "chapter_plan_path": (str(chapter_plan_path)
+                                      if chapter_plan_path else None),
                 "cache_dir": str(cache), "chapter_count": len(chapters), "work": work, "validation": validation,
                 "download_stats": requests.summary()}
     except Exception as exc:

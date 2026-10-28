@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 
 from translation.index.pipeline import DraftChapter, TranslationRunner, TranslationStore
+from translation.index.style import StyleProfile
 from translation.index.titles import (format_chinese_number, parse_target_template,
                                      parse_title_pattern, render_title_template,
                                      title_pattern_key)
@@ -63,5 +64,27 @@ def test_title_pattern_seed_and_normalize():
         assert pattern is not None
         assert pattern["form_type"] == "title_pattern"
         assert pattern["provisional"] is True
+    finally:
+        store.close()
+
+
+def test_title_pattern_reapplies_fullwidth_style():
+    store = TranslationStore(Path(tempfile.mkdtemp()) / "titles.sqlite")
+    runner = object.__new__(TranslationRunner)
+    runner.store = store
+    runner.style_profile = StyleProfile(
+        title_marker="话", fullwidth=True,
+        dialogue_open="「", dialogue_close="」")
+    try:
+        store.put_glossary([{
+            "source": "@title:第{n} 標題?", "target": "{n}话 标题?",
+            "kind": "title_pattern", "form_type": "title_pattern",
+            "confidence": 1,
+            "metadata": {"ordinal_style": "arabic",
+                         "marker": "", "suffix": "標題?"},
+        }])
+        result = runner._apply_title_normalization(
+            _draft(1, "第1話　標題?", "1话 标题?"))
+        assert result.title_zh == "1话 标题？"
     finally:
         store.close()

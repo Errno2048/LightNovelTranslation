@@ -123,7 +123,7 @@ def test_runner_accepts_a_clean_review(tmp_path: Path):
             result = runner.run_order(1)
             assert result["status"] == "accepted"
             assert store.translations()[1] == "诺亚回到了村子。\n\n众人听他讲述旅途。"
-            assert store.chapter(1)["title_zh"] == "归来"
+            assert store.chapter(1)["title_zh"] == "第2章 归来"
 
             translate = next(request for request in provider.requests
                              if request.task == "translate_1")
@@ -156,6 +156,10 @@ class ConcurrentProvider:
             self.requests.append(request)
         if request.task.startswith("batch_glossary_"):
             return GenerationResult("[]", "stop", "scripted", request.task, {}, 0)
+        if request.task.startswith("glossary_"):
+            return GenerationResult(
+                "@@TERM\nsource: ノア\ntarget: 诺亚\nkind: person\n"
+                "confidence: 1\n@@END", "stop", "scripted", request.task, {}, 0)
         if request.task.startswith("translate_"):
             content = "\n".join(message["content"] for message in request.messages)
             aliases = list(dict.fromkeys(re.findall(r"\[(S\d{3})\]", content)))
@@ -185,6 +189,10 @@ class PipelinedProvider:
             text = (f"@@TERM\nsource: ノア\ntarget: {target}\n"
                     "kind: person\nconfidence: 3\n@@END\n")
             return GenerationResult(text, "stop", "scripted", task, {}, 0)
+        if task.startswith("glossary_"):
+            return GenerationResult(
+                "@@TERM\nsource: ノア\ntarget: 诺亚\nkind: person\n"
+                "confidence: 1\n@@END", "stop", "scripted", task, {}, 0)
         if task.startswith("provisional_summary_"):
             return GenerationResult("未审摘要：诺亚继续旅行。", "stop",
                                     "scripted", task, {}, 0)
@@ -245,6 +253,10 @@ class StrictProvider:
         task = request.task
         if task.startswith("batch_glossary_"):
             return GenerationResult("@@END", "stop", "scripted", task, {}, 0)
+        if task.startswith("glossary_"):
+            return GenerationResult(
+                "@@TERM\nsource: ノア\ntarget: 诺亚\nkind: person\n"
+                "confidence: 1\n@@END", "stop", "scripted", task, {}, 0)
         if task.startswith("provisional_summary_"):
             return GenerationResult("未审摘要。", "stop", "scripted", task, {}, 0)
         if task.startswith("translate_"):
@@ -359,6 +371,7 @@ def test_pipelined_runner_uses_prior_drafts_and_provisional_terms(tmp_path: Path
             runner = TranslationRunner(
                 project, flow, store, continuation_start=1, main_end=4,
                 reference_texts={0: "旅人离开了村子。\n\n道路很漫长。"},
+                require_reference_glossary=False,
                 translation_tokens=512, review_tokens=512,
                 adjudication_tokens=512)
             result = runner.run_pipelined(
@@ -415,6 +428,7 @@ def test_concurrent_runner_accepts_a_window(tmp_path: Path):
             runner = TranslationRunner(
                 project, flow, store, continuation_start=1, main_end=3,
                 reference_texts={0: "诺亚回到了村子。\n\n众人听他讲述旅途。"},
+                require_reference_glossary=False,
                 translation_tokens=512, review_tokens=512,
                 adjudication_tokens=512)
             result = runner.run_concurrent(
@@ -472,6 +486,7 @@ def test_concurrent_runner_warms_the_last_chapter_first(tmp_path: Path):
             runner = TranslationRunner(
                 project, flow, store, continuation_start=1, main_end=4,
                 reference_texts={0: "诺亚回到了村子。\n\n众人听他讲述旅途。"},
+                require_reference_glossary=False,
                 translation_tokens=512, review_tokens=512,
                 adjudication_tokens=512)
             result = runner.run_concurrent(
@@ -555,7 +570,7 @@ def test_revision_keeps_the_seeded_title_pattern(tmp_path: Path):
             result = runner.run_order(1)
             assert result["status"] == "accepted"
             assert result["rounds"] == 1
-            assert store.chapter(1)["title_zh"] == "第二章 出发"
+            assert store.chapter(1)["title_zh"] == "第2章 出发"
 
 
 def test_build_and_verify_epub(tmp_path: Path):
@@ -674,25 +689,36 @@ def _failure_runner(tmp_path: Path, provider, *, max_attempts=3):
     return runner, store
 
 
-def test_timeout_is_not_retried(tmp_path: Path):
+def test_timeout_retries_with_bounded_backoff(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("translation.index.pipeline.time.sleep", lambda _: None)
     provider = FailingProvider([ProviderError("timeout", retryable=True)])
-    runner, store = _failure_runner(tmp_path, provider)
-    with pytest.raises(ProviderError):
-        runner._generate([{"role": "user", "content": "x"}], 64, "probe")
-    assert provider.calls == 1
+    runner, store = _failure_runner(tmp_path, provider, max_attempts=2)
+    result = runner._generate([{"role": "user", "content": "x"}], 64, "probe")
+    assert result.text == "OK" and provider.calls == 2
     events = [json.loads(row[0]) for row in store.db.execute(
         "SELECT payload FROM events WHERE kind='model'")]
-    assert len(events) == 1 and events[0]["success"] is False
+    assert [event["success"] for event in events] == [False, True]
     assert events[0]["error"] == "timeout"
     store.close()
 
 
-def test_server_error_is_not_retried(tmp_path: Path):
-    provider = FailingProvider([ProviderError("server", "HTTP 502", retryable=True)])
+def test_timeout_not_retried_beyond_attempt_budget(tmp_path: Path):
+    provider = FailingProvider([ProviderError("timeout", retryable=True),
+                                ProviderError("timeout", retryable=True),
+                                ProviderError("timeout", retryable=True)])
     runner, store = _failure_runner(tmp_path, provider)
     with pytest.raises(ProviderError):
         runner._generate([{"role": "user", "content": "x"}], 64, "probe")
-    assert provider.calls == 1
+    assert provider.calls == 3
+    store.close()
+
+
+def test_server_error_retries_with_bounded_backoff(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr("translation.index.pipeline.time.sleep", lambda _: None)
+    provider = FailingProvider([ProviderError("server", "HTTP 502", retryable=True)])
+    runner, store = _failure_runner(tmp_path, provider, max_attempts=2)
+    result = runner._generate([{"role": "user", "content": "x"}], 64, "probe")
+    assert result.text == "OK" and provider.calls == 2
     store.close()
 
 

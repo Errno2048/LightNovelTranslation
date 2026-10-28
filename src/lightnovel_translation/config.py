@@ -23,6 +23,7 @@ class WorkflowConfig:
     """Defaults for the resumable, batch-concurrent translation workflow."""
     translation_concurrency: int = 3
     review_concurrency: int = 4
+    glossary_concurrency: int = 2
     translation_mode: str = "batch"
     pipeline_review_backlog: int = 2
     pipeline_manual_backlog: int = 2
@@ -50,9 +51,22 @@ class WorkflowConfig:
     lookup_terms: int = 50
     max_term_checks: int = 50
     max_tool_rounds: int = 4
+    translate_extras: bool = True
+    translate_reference_pages: bool = True
+    summary_extras: bool = True
+    main_ratio_floor: float = 0.90
+    require_reference_glossary: bool = True
+    auto_reference_glossary: bool = True
+    strict_term_conflicts: bool = True
+    style_profile: bool = True
+    bilingual_mode: str = "auto"
+    backfill: str = "ask"
+    failure_policy: str = "stop_batch"
+    review_start: str = "barrier"
 
     def __post_init__(self):
         for name in ('translation_concurrency', 'review_concurrency',
+                     'glossary_concurrency',
                      'pipeline_review_backlog', 'pipeline_manual_backlog',
                      'batch_size', 'full_chapters', 'summary_every',
                      'reference_chunk', 'translation_tokens', 'review_tokens',
@@ -86,6 +100,33 @@ class WorkflowConfig:
             raise ConfigurationError('workflow.summary_lag must be a nonnegative integer')
         if type(self.max_revisions) is not int or not 0 <= self.max_revisions <= 8:
             raise ConfigurationError('workflow.max_revisions must be between 0 and 8')
+        for name in ('translate_extras', 'translate_reference_pages',
+                     'summary_extras', 'require_reference_glossary',
+                     'auto_reference_glossary', 'strict_term_conflicts',
+                     'style_profile'):
+            if type(getattr(self, name)) is not bool:
+                raise ConfigurationError(f'workflow.{name} must be boolean')
+        if (type(self.main_ratio_floor) not in (int, float) or
+                not 0 <= float(self.main_ratio_floor) <= 1):
+            raise ConfigurationError(
+                'workflow.main_ratio_floor must be between 0 and 1')
+        if self.bilingual_mode not in {'auto', 'pairs', 'blocks'}:
+            raise ConfigurationError(
+                "workflow.bilingual_mode must be 'auto', 'pairs' or 'blocks'")
+        if self.backfill not in {'ask', 'all', 'extras', 'none'}:
+            raise ConfigurationError(
+                "workflow.backfill must be 'ask', 'all', 'extras' or 'none'")
+        if self.failure_policy not in {'stop_batch', 'continue'}:
+            raise ConfigurationError(
+                "workflow.failure_policy must be 'stop_batch' or 'continue'")
+        if self.review_start not in {'barrier', 'as_completed', 'prefix_as_completed'}:
+            raise ConfigurationError(
+                "workflow.review_start must be 'barrier', 'as_completed' or "
+                "'prefix_as_completed'")
+        if self.review_start in {'as_completed', 'prefix_as_completed'} and self.failure_policy != 'continue':
+            raise ConfigurationError(
+                "workflow.review_start='as_completed' or 'prefix_as_completed' "
+                "requires failure_policy='continue'")
 
 
 @dataclass(frozen=True)
@@ -141,16 +182,21 @@ class ModelConfig(_EngineModelConfig):
 @dataclass(frozen=True)
 class Limits:
     """Durable limits, separately applied to each index and translation job."""
+    retry_max_wait_seconds: float = 8.0
     max_requests: int = 0
     max_input_tokens: int = 0
     max_output_tokens: int = 0
     max_attempts: int = 3
 
     def __post_init__(self) -> None:
-        if any(type(v) is not int or v < 0 for v in asdict(self).values()):
+        integer_fields = {k: v for k, v in asdict(self).items()
+                          if k != 'retry_max_wait_seconds'}
+        if any(type(v) is not int or v < 0 for v in integer_fields.values()):
             raise ConfigurationError("limits must be nonnegative integers (0 means unlimited)")
         if not 1 <= self.max_attempts <= 3:
             raise ConfigurationError("max_attempts must be between 1 and 3")
+        if type(self.retry_max_wait_seconds) not in (int, float) or self.retry_max_wait_seconds <= 0:
+            raise ConfigurationError("limits.retry_max_wait_seconds must be positive")
 
 
 def _known(value: dict, names: set[str], section: str) -> dict:
@@ -212,7 +258,7 @@ class TranslationConfig:
         return budgets
 
     def sequence_spec(self) -> SequenceSpec:
-        controlled = {"capacity", "roles", *asdict(self.limits)}
+        controlled = {"capacity", "roles", *asdict(self.limits).keys()}
         allowed = {f.name for f in fields(SequenceSpec)} - controlled
         values = _known(self.sequence, allowed, "sequence")
         # Source-bound records avoid silently accepting merged/missing paragraphs.
@@ -243,7 +289,9 @@ class TranslationConfig:
             if key in values:
                 values[key] = mapping.get(values[key], values[key])
         try:
-            return SequenceSpec(self.capacity, roles=self.role_budgets(), **asdict(self.limits), **values)
+            sequence_limits = {k: v for k, v in asdict(self.limits).items()
+                               if k != 'retry_max_wait_seconds'}
+            return SequenceSpec(self.capacity, roles=self.role_budgets(), **sequence_limits, **values)
         except (TypeError, ValueError) as exc:
             raise ConfigurationError(str(exc)) from exc
 

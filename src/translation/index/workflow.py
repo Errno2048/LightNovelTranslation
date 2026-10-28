@@ -158,6 +158,7 @@ class TranslationWorkflow:
                  evidence_excerpt_chars: int = 120,
                  evidence_max_excerpts: int = 2,
                  evidence_max_chars: int = 12000,
+                 style_profile=None,
                  ) -> tuple[list[dict], dict, object]:
         if output_profile not in {"plain", "source-records"}:
             raise ValueError("unknown output profile")
@@ -227,6 +228,8 @@ class TranslationWorkflow:
             {"role": "user", "content":
              "【参考索引与近期全文；参考译文不是目标已提交译文】"},
         ])
+        if style_profile is not None:
+            messages.append({"role": "user", "content": style_profile.card()})
         rendered = plan.render_messages()
         stable_summaries = []
         provisional_summaries = []
@@ -308,7 +311,8 @@ class TranslationWorkflow:
                   provisional_orders: Iterable[int] = (),
                   evidence_excerpt_chars: int = 120,
                   evidence_max_excerpts: int = 2,
-                  evidence_max_chars: int = 12000):
+                  evidence_max_chars: int = 12000,
+                  style_profile=None):
         messages, report, plan = self.assemble(
             snapshot=snapshot, documents=documents, target_order=target_order,
             batch_orders=batch_orders, glossary=glossary,
@@ -318,11 +322,108 @@ class TranslationWorkflow:
             provisional_orders=provisional_orders,
             evidence_excerpt_chars=evidence_excerpt_chars,
             evidence_max_excerpts=evidence_max_excerpts,
-            evidence_max_chars=evidence_max_chars)
+            evidence_max_chars=evidence_max_chars,
+            style_profile=style_profile)
         result = self.project.provider.generate(GenerationRequest(
             messages, max_tokens=output_tokens, temperature=0,
             task=f"translate_{target_order}"))
         return result, report, plan
+
+    def assemble_backfill(self, *, target_order: int, target_title: str,
+                          before_texts: Iterable[tuple[int, str, str]] = (),
+                          after_texts: Iterable[tuple[int, str, str]] = (),
+                          glossary: Iterable[GlossaryTerm] = (),
+                          stable_glossary: Iterable[GlossaryTerm] = (),
+                          reference_summary: str = "",
+                          target_summaries: Iterable[str] = (),
+                          unresolved: Iterable[str] = (),
+                          threads: Mapping | None = None,
+                          output_tokens: int = 16384,
+                          source_rows: Iterable[Mapping] | None = None,
+                          style_profile=None,
+                          region_label: str = "") -> tuple[list[dict], dict]:
+        """Build a cache-friendly backfill prompt.
+
+        Layer A (system/glossary/summary/style) and Layer B (region before and
+        after) are identical for every gap in a region.  Per-gap metadata and
+        the target source are appended last.
+        """
+        stable_terms = list(stable_glossary)
+        stable_sources = {term.source for term in stable_terms}
+        batch_terms = [term for term in glossary
+                       if term.source not in stable_sources]
+        cards = [_entity_card(index, term)
+                 for index, term in enumerate(stable_terms + batch_terms, 1)]
+        stable_cards = cards[:len(stable_terms)]
+        batch_cards = cards[len(stable_terms):]
+        stable_workset = {
+            "core": [{"id": "CORE-REF",
+                      "value": "参考译文只作术语/风格候选，日文是事实依据。"}],
+            "extraction_gaps": ["补译缺口没有参考译文；使用前后参考章节作为上下文。"],
+            "authority": "candidate_unreviewed",
+            "candidates": stable_cards,
+        }
+        system = (
+            "你是日译中轻小说翻译。参考资料（摘要、实体、线程、定向证据）均为未审候选；"
+            "日文原文是事实依据。实体卡中 confidence=1、locked 或 provisional 的 "
+            "target_form 必须使用；其余术语为候选。按源段记录协议输出，不要解释、不要代码块。")
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": SOURCE_RECORDS_RULES},
+            {"role": "user", "content":
+             "【冻结约定与稳定候选；参考译文不是事实】\n" +
+             json.dumps(stable_workset, ensure_ascii=False,
+                        separators=(",", ":"))},
+            {"role": "user", "content":
+             "【补译区域上下文；位置来自日文源顺序】"},
+        ]
+        if style_profile is not None:
+            messages.append({"role": "user", "content": style_profile.card()})
+        if reference_summary:
+            messages.append({"role": "user", "content":
+                             "【全书参考摘要；未审候选】\n" + reference_summary})
+        for summary in target_summaries:
+            messages.append({"role": "user", "content":
+                             "【已接受摘要；未审候选】\n" + str(summary)})
+        if batch_cards:
+            messages.append({"role": "user", "content":
+                             "【本批次新增术语候选；未审】\n" +
+                             json.dumps({"scope": "batch_additions",
+                                         "candidates": batch_cards},
+                                        ensure_ascii=False,
+                                        separators=(",", ":"))})
+        if region_label:
+            messages.append({"role": "user", "content":
+                             f"【补译区域】{region_label}"})
+        for label, rows in (("缺口前文参考", before_texts),
+                            ("缺口后文参考", after_texts)):
+            for order, title, text in rows:
+                messages.append({"role": "user", "content":
+                                 f"【{label}；order {order}】{title}\n{text}"})
+        dynamic = {
+            "unresolved": list(unresolved),
+            "threads": dict(threads or {"active": [], "resolved": [],
+                                        "dormant_relevant": []}),
+            "selection": {"target_order": target_order,
+                          "mode": "backfill"},
+        }
+        messages.append({"role": "user", "content":
+                         "【本章未决、线程与选择元数据；未审候选】\n" +
+                         json.dumps(dynamic, ensure_ascii=False,
+                                    separators=(",", ":"))})
+        rows = list(source_rows or ())
+        if not rows or any(not str(row.get("text", "")).strip() for row in rows):
+            raise ValueError("source_rows must contain nonempty target paragraphs")
+        aliases = [f"S{index:03d}" for index in range(1, len(rows) + 1)]
+        messages.append({"role": "user", "content":
+                         f"【当前目标 {target_title} 完整日文正文；只翻译本章】\n" +
+                         "\n".join(f"[{alias}] {row['text']}"
+                                   for alias, row in zip(aliases, rows))})
+        messages.append({"role": "user", "content":
+                         source_records_alias_map(aliases)})
+        report = plan_request(messages, self.project.config.capacity,
+                              RoleBudget(output_tokens), self.project.counter)
+        return messages, report
 
 
 class _ByteCounter:

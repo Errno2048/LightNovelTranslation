@@ -8,10 +8,11 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field, replace
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import html
 import json
+import traceback
 from pathlib import Path
 import re
 import sqlite3
@@ -29,10 +30,16 @@ from ..schemas import GenerationRequest
 from ..storage import digest
 from .artifacts import Artifact, InputRef
 from .assets import AssetIndex, load_asset_index, sniff_media_type
+from .backfill import BackfillPlan, plan_backfill
 from .context_plan import ContextDocument
 from .prompts import (SOURCE_RECORDS_RULES, source_records_alias_map,
                       source_records_rules)
+from .roles import (AFTERWORD, CHARACTER_SHEET, ChapterPlan, EXTRA, MAIN,
+                    PREFACE, SETTING, SUMMARY_ROLES, TRANSLATED_ROLES, UNKNOWN,
+                    classify_document, load_chapter_plan)
 from .snapshot import IndexSnapshot
+from .style import (StyleProfile, extract_style_profile, normalize_punctuation,
+                    render_main_title, strip_title_ordinal)
 from .titles import (parse_target_template, parse_title_pattern,
                      render_title_template, title_pattern_key)
 from .workflow import TranslationWorkflow, GlossaryTerm
@@ -245,6 +252,9 @@ class TranslationStore:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Promotion keeps reporting same-target variant pairs as conflicts;
+        # review-time reporting drops them (they cannot change any text).
+        self._variant_conflicts_are_conflicts = True
         self.db = sqlite3.connect(self.path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -702,7 +712,23 @@ class TranslationStore:
                 " ORDER BY f.rowid"):
             if wanted is not None and row["source"] not in wanted:
                 continue
-            result.append(dict(row))
+            # Two source forms that already share the exact same canonical
+            # target are kana/spelling variants of one item, not a conflict:
+            # promoting either would not change any rendered text.  This
+            # filter only relaxes review-time conflict reporting; promotion
+            # still requires an explicit distinct-target check.
+            row_dict = dict(row)
+            row_dict["same_target_variant"] = False
+            other = self._form_row(row["conflict_source"])
+            current = self._form_row(row["source"])
+            if (other is not None and current is not None
+                    and other["target"] == current["target"] == row["target"]):
+                row_dict["same_target_variant"] = True
+                if self._variant_conflicts_are_conflicts:
+                    result.append(row_dict)
+                    continue
+                continue
+            result.append(row_dict)
         return result
 
     def put_glossary(self, rows: Iterable[Mapping]):
@@ -912,6 +938,12 @@ class TranslationRunner:
                  continuation_start: int, main_end: int,
                  glossary: Iterable[GlossaryTerm] = (),
                  reference_texts: Mapping[int, str] | None = None,
+                 chapter_plan: ChapterPlan | None = None,
+                 translate_roles: Iterable[str] | None = None,
+                 summary_roles: Iterable[str] | None = None,
+                 require_reference_glossary: bool | None = None,
+                 strict_term_conflicts: bool | None = None,
+                 style_profile: StyleProfile | None = None,
                  history_chapters: int | None = None,
                  summary_every: int | None = None,
                  summary_lag: int | None = None,
@@ -930,6 +962,8 @@ class TranslationRunner:
         self.glossary = list(glossary)
         workflow = project.config.workflow
         self.translation_mode = getattr(workflow, "translation_mode", "batch")
+        self.failure_policy = getattr(workflow, "failure_policy", "stop_batch")
+        self.review_start = getattr(workflow, "review_start", "barrier")
         self.pipeline_review_backlog = getattr(
             workflow, "pipeline_review_backlog", 2)
         self.pipeline_manual_backlog = getattr(
@@ -984,9 +1018,154 @@ class TranslationRunner:
         self.reference_texts = dict(reference_texts or {
             order: doc["text"]
             for order, doc in flow._reference_by_source_order.items()})
+        self.reference_end = max(self.reference_texts,
+                                 default=continuation_start) + 1
+        self.chapter_plan = chapter_plan or load_chapter_plan(
+            project, source_edition, documents=flow._source_docs,
+            main_ratio_floor=float(getattr(workflow, "main_ratio_floor", 0.90)))
+        for order, doc in self.source_by_order.items():
+            if order in self.chapter_plan.entries:
+                continue
+            metadata = doc.get("metadata") or {}
+            self.chapter_plan.entries[order] = classify_document(
+                order=order, title=doc.get("raw_title", ""),
+                section=doc.get("section") or metadata.get("section"))
+        default_roles = {MAIN, PREFACE, AFTERWORD}
+        if getattr(workflow, "translate_extras", True):
+            default_roles.add(EXTRA)
+        if getattr(workflow, "translate_reference_pages", True):
+            default_roles.update({CHARACTER_SHEET, SETTING})
+        self.translate_roles = set(translate_roles or default_roles)
+        default_summary = {MAIN, PREFACE, AFTERWORD}
+        if getattr(workflow, "summary_extras", True):
+            default_summary.add(EXTRA)
+        self.summary_roles = set(summary_roles or default_summary)
+        self.require_reference_glossary = (
+            bool(getattr(workflow, "require_reference_glossary", True))
+            if require_reference_glossary is None else bool(require_reference_glossary))
+        self.strict_term_conflicts = (
+            bool(getattr(workflow, "strict_term_conflicts", True))
+            if strict_term_conflicts is None else bool(strict_term_conflicts))
+        if style_profile is not None:
+            self.style_profile = style_profile
+        elif getattr(workflow, "style_profile", True):
+            sample = sorted(self.reference_texts)[:24]
+            texts = [self.reference_texts[order] for order in sample
+                     if self.reference_texts.get(order)]
+            titles = []
+            for order in sample:
+                reference = flow._reference_by_source_order.get(order)
+                if reference is None:
+                    continue
+                value = str(reference.get("raw_title") or "").strip()
+                if value:
+                    titles.append(value)
+            self.style_profile = extract_style_profile(texts, titles)
+        else:
+            self.style_profile = None
+        self.plan_warnings = list(self.chapter_plan.warnings)
         summaries = store.summaries("target")
         self._last_summary_end = max(
             (row["end_order"] for row in summaries), default=continuation_start)
+
+    def _plan_ready(self) -> None:
+        if not self.chapter_plan.entries:
+            raise PipelineError(
+                "chapter_plan_missing",
+                "no chapter roles are available; build a chapter plan first")
+        if self.chapter_plan.main_ratio < 0.75:
+            raise PipelineError(
+                "classification_manual_takeover",
+                "main ratio is too low; manual classification is required",
+                details={"main_ratio": self.chapter_plan.main_ratio,
+                         "warnings": self.chapter_plan.warnings})
+
+    def _translate_orders(self, start: int, end: int, *,
+                          exclude: Iterable[int] = ()) -> list[int]:
+        excluded = set(exclude)
+        return [order for order in range(max(start, self.continuation_start), end)
+                if order in self.source_by_order
+                and order not in excluded
+                and self.chapter_plan.is_translatable(order, self.translate_roles)]
+
+    def _summary_orders_for(self, start: int, end: int) -> list[int]:
+        return [order for order in range(start, end)
+                if order in self.source_by_order
+                and self.chapter_plan.is_translatable(order, self.summary_roles)]
+
+    def _ensure_reference_glossary(self) -> None:
+        if not self.reference_texts:
+            return
+        if not self.require_reference_glossary:
+            return
+        workflow = self.project.config.workflow
+        def ready():
+            return [row for row in self.store.glossary(limit=1_000_000)
+                    if int(row.get("confidence", 3)) <= 2
+                    and row.get("form_type") != "title_pattern"]
+        terms = ready()
+        if terms:
+            return
+        if not getattr(workflow, "auto_reference_glossary", True):
+            raise PipelineError(
+                "reference_glossary_required",
+                "reference terminology must be extracted before translation")
+        self.ensure_glossary()
+        terms = ready()
+        if not terms:
+            raise PipelineError(
+                "reference_glossary_empty",
+                "reference terminology extraction produced no usable terms")
+        self.store.event("reference_glossary_ready", terms=len(terms))
+
+    def _unresolved_term_findings(
+            self, review: ReviewOutcome, draft: DraftChapter, *,
+            terms=None, log_event: bool = True) -> dict[str, Mapping]:
+        if not self.strict_term_conflicts or not review.unresolved:
+            return {}
+        def field(row, name, default=None):
+            if isinstance(row, Mapping):
+                return row.get(name, default)
+            return getattr(row, name, default)
+        rows = (list(terms) if terms is not None
+                else self.store.glossary(limit=1_000_000))
+        terms = [row for row in rows
+                 if field(row, "form_type") != "title_pattern"
+                 and (field(row, "locked") or
+                      int(field(row, "confidence", 3)) <= 2)]
+        if not terms:
+            return {}
+        source_text = str(self.source(draft.order).get("text", ""))
+        target_text = "\n".join(str(value) for value in draft.paragraphs)
+        relevant = [row for row in terms
+                    if (field(row, "source") and
+                        field(row, "source") in source_text) or
+                       (field(row, "target") and
+                        field(row, "target") in target_text)]
+        if not relevant:
+            return {}
+        markers = ("译名", "人名", "术语", "专名", "不一致", "冲突", "混用")
+        findings = {}
+        for index, text in enumerate(review.unresolved, 1):
+            if not isinstance(text, str):
+                continue
+            if not any(marker in text for marker in markers):
+                continue
+            finding_id = f"unresolved_term_{index}"
+            findings[finding_id] = {
+                "id": finding_id,
+                "severity": "major",
+                "category": "term",
+                "source_ref": "",
+                "target_ref": "",
+                "claim": text,
+                "suggestion": "按参考术语表统一专名后重新审校。",
+                "basis": "source_meaning",
+            }
+        if findings and log_event:
+            self.store.event("term_conflict_unresolved", order=draft.order,
+                             count=len(findings))
+        return findings
 
     # -- source and context -------------------------------------------------
     def source(self, order: int) -> dict:
@@ -1301,9 +1480,12 @@ class TranslationRunner:
                 if usage_sink is not None:
                     usage_sink.append(record)
                 # Only retry failures whose remote completion state is known and
-                # non-billable (or a completed truncated/empty response). Timeout,
-                # network and gateway 5xx/524 states are ambiguous and are not
-                # silently resent.
+                # non-billable (or a completed truncated/empty response). Timeout
+                # and network failures were previously never resent; the
+                # bounded exponential backoff below now retries them because a
+                # lost connection has no completion to duplicate, while the
+                # total wait is capped so long provider hangs cannot stall a
+                # batch indefinitely.
                 if exc.kind == "truncated" and attempt + 1 < attempts:
                     capacity = self.project.config.capacity.max_output_tokens
                     if request.max_tokens < capacity:
@@ -1314,11 +1496,13 @@ class TranslationRunner:
                             tools=tools, tool_choice=tool_choice,
                             allow_truncated=allow_truncated)
                         continue
-                if exc.kind in {"empty", "finish_reason"} and attempt + 1 < attempts:
-                    time.sleep(1 + attempt)
-                    continue
-                if exc.kind == "rate_limit" and attempt + 1 < attempts:
-                    time.sleep(min(2 ** attempt, 20))
+                retryable = {"empty", "finish_reason", "rate_limit",
+                             "timeout", "network", "server"}
+                max_wait = float(getattr(
+                    self.project.config.limits, "retry_max_wait_seconds", 8))
+                if exc.kind in retryable and attempt + 1 < attempts:
+                    backoff = min(max(1.0, 2.0 ** attempt), max_wait)
+                    time.sleep(backoff)
                     continue
                 raise
         raise last
@@ -1363,7 +1547,8 @@ class TranslationRunner:
             provisional_orders=provisional_orders,
             evidence_excerpt_chars=self.evidence_excerpt_chars,
             evidence_max_excerpts=self.evidence_max_excerpts,
-            evidence_max_chars=self.evidence_max_chars)
+            evidence_max_chars=self.evidence_max_chars,
+            style_profile=self.style_profile)
         if not report["fits"]:
             raise PipelineError("context_budget", "translation request exceeds capacity",
                                 details={"order": order, "report": report})
@@ -1389,6 +1574,9 @@ class TranslationRunner:
                                 "translation output is incomplete",
                                 details={"order": order, "errors": parsed["errors"],
                                          "text": raw[-4000:]})
+        title_zh, paragraphs, style_changes = self._apply_style(
+            order, parsed["title"], parsed["paragraphs"])
+        text = "\n\n".join(paragraphs)
         source_assets = self.asset_index.chapter_assets(order)
         assets = {
             "source_edition": getattr(self.flow, "source_edition", ""),
@@ -1401,10 +1589,43 @@ class TranslationRunner:
         return DraftChapter(order=order, source_id=source["entry_id"],
                             source_hash=source["text_hash"],
                             ja_title=source["raw_title"],
-                            title_zh=parsed["title"], text=parsed["text"],
-                            paragraphs=tuple(parsed["paragraphs"]),
-                            version=0, review={"protocol": parsed["profile"]},
+                            title_zh=title_zh, text=text,
+                            paragraphs=tuple(paragraphs),
+                            version=0,
+                            review={"protocol": parsed["profile"],
+                                    "style_changes": style_changes},
                             assets=assets)
+
+    def _apply_style(self, order: int, title: str,
+                     paragraphs: Sequence[str]) -> tuple[str, list[str], list[str]]:
+        if self.style_profile is None:
+            return title, list(paragraphs), []
+        changes: list[str] = []
+        normalized: list[str] = []
+        for paragraph in paragraphs:
+            value, found = normalize_punctuation(paragraph, self.style_profile)
+            normalized.append(value)
+            changes.extend(found)
+        entry = self.chapter_plan.entry(order)
+        role = entry.role if entry else MAIN
+        if role == MAIN:
+            parsed_title = parse_title_pattern(self.source(order)["raw_title"])
+            ordinal = (entry.ordinal if entry and entry.ordinal is not None
+                       else parsed_title.ordinal if parsed_title else None)
+            if ordinal is not None:
+                suffix = strip_title_ordinal(title, self.style_profile)
+                suffix, found = normalize_punctuation(suffix, self.style_profile)
+                changes.extend(found)
+                if not suffix:
+                    suffix = parsed_title.suffix if parsed_title else title
+                title = render_main_title(ordinal, suffix, self.style_profile)
+            else:
+                title, found = normalize_punctuation(title, self.style_profile)
+                changes.extend(found)
+        else:
+            title, found = normalize_punctuation(title, self.style_profile)
+            changes.extend(found)
+        return title, normalized, list(dict.fromkeys(changes))
 
     def _seed_title_patterns(self, drafts: Sequence[DraftChapter]):
         for draft in drafts:
@@ -1440,6 +1661,9 @@ class TranslationRunner:
             return draft
         style = (row.get("metadata") or {}).get("ordinal_style", "chinese")
         rendered = render_title_template(row["target"], parsed.ordinal, style)
+        profile = getattr(self, "style_profile", None)
+        if rendered and profile is not None:
+            rendered, _changes = normalize_punctuation(rendered, profile)
         if not rendered or rendered == draft.title_zh:
             return draft
         self.store.event("title_pattern_applied", order=draft.order,
@@ -1467,6 +1691,9 @@ class TranslationRunner:
             if parsed is None or title_pattern_key(parsed) != pattern_key:
                 continue
             rendered = render_title_template(target, parsed.ordinal, style)
+            profile = getattr(self, "style_profile", None)
+            if rendered and profile is not None:
+                rendered, _changes = normalize_punctuation(rendered, profile)
             if rendered and rendered != chapter["title_zh"]:
                 self.store.set_title(order, rendered)
                 updated.append(order)
@@ -1476,6 +1703,9 @@ class TranslationRunner:
 
     def translate_order(self, order: int) -> DraftChapter:
         draft = self._translate_draft(order, log_event=True)
+        if draft.review.get("style_changes"):
+            self.store.event("style_fix", order=order,
+                             changes=draft.review["style_changes"])
         self._seed_title_patterns([draft])
         draft = self._apply_title_normalization(draft)
         version = self.store.put_draft(
@@ -1792,11 +2022,15 @@ class TranslationRunner:
         expected_checks = {check["id"]: check for check in term_checks}
         source_text = "\n".join(row["text"] for row in rows)
         if tool_context is None:
-            term_conflicts = self.store.term_target_conflicts(
-                [term.source for term in glossary
-                 if term.source in source_text])[:20]
+            term_conflicts = [
+                row for row in self.store.term_target_conflicts(
+                    [term.source for term in glossary
+                     if term.source in source_text])
+                if not row.get("same_target_variant")][:20]
         else:
-            term_conflicts = list(tool_context.get("term_conflicts") or ())[:20]
+            term_conflicts = [
+                row for row in (tool_context.get("term_conflicts") or ())
+                if not row.get("same_target_variant")][:20]
         budget = {"max_chapters": self.lookup_chapters,
                   "max_terms": self.lookup_terms,
                   "used_chapters": set(), "used_terms": set()}
@@ -1810,6 +2044,7 @@ class TranslationRunner:
             "source": source,
             "history": history,
             "unresolved_prior": unresolved,
+            "style": self.style_profile.to_dict() if self.style_profile else None,
             "authority": "draft is unverified; provisional history may still change",
             "draft": target,
         }
@@ -2234,6 +2469,7 @@ class TranslationRunner:
         confirmed = {finding["id"]: finding for finding in review.findings
                      if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
         major = self._revision_findings(confirmed, review)
+        major.update(self._unresolved_term_findings(review, draft))
         rounds = 0
         while major and rounds < self.max_revisions:
             draft = self.revise(draft, review, decisions)
@@ -2246,6 +2482,7 @@ class TranslationRunner:
             confirmed = {finding["id"]: finding for finding in review.findings
                          if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
             major = self._revision_findings(confirmed, review)
+            major.update(self._unresolved_term_findings(review, draft))
             rounds += 1
         review_data = {
             "profile": "chapter-review",
@@ -2271,16 +2508,179 @@ class TranslationRunner:
         return {"order": order, "status": "accepted", "rounds": rounds,
                 "findings": len(review.findings)}
 
+    def backfill_plan(self, **kwargs) -> BackfillPlan:
+        self._plan_ready()
+        self._ensure_reference_glossary()
+        return plan_backfill(self, **kwargs)
+
+    def _backfill_texts(self, orders: Iterable[int]) -> list[tuple[int, str, str]]:
+        accepted = self.store.translations()
+        result = []
+        for order in orders:
+            if order not in self.source_by_order:
+                continue
+            text = accepted.get(order) or self.reference_texts.get(order)
+            if not text:
+                continue
+            result.append((order, self.source(order).get("raw_title", ""), text))
+        return result
+
+    def _translate_backfill(self, order: int, region) -> DraftChapter:
+        source = self.source(order)
+        rows = self.source_rows(order)
+        prompt_rows = self.prompt_rows(order)
+        expected_markers = self.expected_markers(prompt_rows)
+        aliases = [f"S{index:03d}" for index in range(1, len(rows) + 1)]
+        reference_rows = self.store.summaries("reference")
+        reference_summary = (reference_rows[-1]["text"]
+                             if reference_rows else "")
+        target_summaries = [row["text"] for row in self.store.summaries("target")]
+        messages, report = self.flow.assemble_backfill(
+            target_order=order, target_title=source.get("raw_title", ""),
+            before_texts=self._backfill_texts(region.before_orders),
+            after_texts=self._backfill_texts(region.after_orders),
+            glossary=self._glossary_cards(order),
+            stable_glossary=self._stable_glossary_cards(),
+            reference_summary=reference_summary,
+            target_summaries=target_summaries,
+            unresolved=self._unresolved(),
+            output_tokens=self.translation_tokens,
+            source_rows=prompt_rows,
+            style_profile=self.style_profile,
+            region_label=f"region {region.region_id} "
+                         f"[{region.start}:{region.end})")
+        if not report["fits"]:
+            raise PipelineError(
+                "context_budget", "backfill request exceeds capacity",
+                details={"order": order, "report": report})
+        parsed = None
+        raw = ""
+        for _attempt in range(3):
+            result = self._generate(messages, self.translation_tokens,
+                                    f"backfill_translate_{order}",
+                                    log_event=True)
+            raw = result.text
+            parsed = self.parse_translation(raw, aliases,
+                                            expected_markers=expected_markers)
+            if not parsed["errors"]:
+                break
+            messages = messages[:-1] + [
+                {"role": "assistant", "content": raw},
+                {"role": "user", "content":
+                 "上次输出未通过源段布局校验。依据同一原文重新输出本章全部标题和"
+                 "TRANSLATION记录，不能只补一段。错误：" + "; ".join(parsed["errors"]) +
+                 "\n" + source_records_rules(aliases)}]
+        if parsed is None or parsed["errors"]:
+            raise PipelineError(
+                "translation_protocol", "backfill translation output is incomplete",
+                details={"order": order, "errors": parsed["errors"],
+                         "text": raw[-4000:]})
+        title_zh, paragraphs, style_changes = self._apply_style(
+            order, parsed["title"], parsed["paragraphs"])
+        if style_changes:
+            self.store.event("style_fix", order=order, changes=style_changes)
+        text = "\n\n".join(paragraphs)
+        source_assets = self.asset_index.chapter_assets(order)
+        assets = {
+            "source_edition": getattr(self.flow, "source_edition", ""),
+            "inline": parsed["inline_assets"],
+            "block": source_assets.get("block", []),
+        }
+        asset_ids = {item["asset_id"] for item in assets["inline"]}
+        asset_ids.update(item["asset_id"] for item in assets["block"])
+        assets["asset_ids"] = sorted(asset_ids)
+        return DraftChapter(
+            order=order, source_id=source["entry_id"],
+            source_hash=source["text_hash"], ja_title=source["raw_title"],
+            title_zh=title_zh, text=text, paragraphs=tuple(paragraphs),
+            version=0, review={"protocol": parsed["profile"]}, assets=assets)
+
+    def run_backfill(self, plan: BackfillPlan | None = None, *,
+                     update_summaries: bool = False) -> dict:
+        self._plan_ready()
+        self._ensure_reference_glossary()
+        plan = plan or plan_backfill(self)
+        results = []
+        for region in plan.regions:
+            self.store.event("backfill_region", **region.to_dict())
+            for gap in region.gaps:
+                current = self.store.chapter(gap.order)
+                if current and current["status"] == "accepted":
+                    continue
+                draft = self._translate_backfill(gap.order, region)
+                review = self.review_order(draft)
+                if review.errors:
+                    raise ChapterBlocked(
+                        "review_protocol", "review output is invalid",
+                        details={"order": gap.order, "errors": review.errors})
+                decisions = self.adjudicate(draft, review)
+                confirmed = {
+                    finding["id"]: finding for finding in review.findings
+                    if decisions.get(finding["id"], {}).get(
+                        "decision") == "confirmed"}
+                major = self._revision_findings(confirmed, review)
+                major.update(self._unresolved_term_findings(review, draft))
+                rounds = 0
+                while major and rounds < self.max_revisions:
+                    draft = self.revise(draft, review, decisions)
+                    review = self.review_order(draft)
+                    if review.errors:
+                        raise ChapterBlocked(
+                            "review_protocol", "review output is invalid",
+                            details={"order": gap.order,
+                                     "errors": review.errors})
+                    decisions = self.adjudicate(draft, review)
+                    confirmed = {
+                        finding["id"]: finding for finding in review.findings
+                        if decisions.get(finding["id"], {}).get(
+                            "decision") == "confirmed"}
+                    major = self._revision_findings(confirmed, review)
+                    major.update(self._unresolved_term_findings(review, draft))
+                    rounds += 1
+                review_data = {
+                    "profile": "chapter-review",
+                    "rounds": rounds,
+                    "findings": review.findings,
+                    "decisions": decisions,
+                    "unresolved": review.unresolved,
+                    "term_checks": review.term_checks,
+                    "semantic_coverage_complete": review.coverage_complete,
+                    "accepted_with_major": sorted(major),
+                    "text_hash": digest(draft.text),
+                    "mode": "backfill",
+                }
+                status = "accepted" if not major else "blocked"
+                version = self.store.put_draft(
+                    order=draft.order, source_id=draft.source_id,
+                    source_hash=draft.source_hash, ja_title=draft.ja_title,
+                    title_zh=draft.title_zh, text=draft.text,
+                    status=status, review=review_data, assets=draft.assets)
+                self.store.event(
+                    "backfill_accept" if status == "accepted" else "blocked",
+                    order=draft.order, version=version, rounds=rounds,
+                    findings=sorted(major))
+                if major:
+                    raise ChapterBlocked(
+                        "unresolved_major",
+                        "major findings remain after the revision budget",
+                        details={"order": draft.order,
+                                 "findings": sorted(major)})
+                results.append({"order": draft.order, "status": status,
+                                "rounds": rounds,
+                                "findings": len(review.findings)})
+        if update_summaries:
+            self.update_target_summary(force=True)
+        return {"regions": len(plan.regions), "chapters": len(results),
+                "results": results, "report": plan.report}
+
     def run(self, start: int | None = None, end: int | None = None,
             *, update_summaries: bool = True) -> dict:
+        self._plan_ready()
+        self._ensure_reference_glossary()
         start = self.continuation_start if start is None else start
         end = self.main_end if end is None else end
         results = []
-        for order in range(max(start, self.continuation_start), end):
-            if order not in self.source_by_order:
-                continue
-            if _is_extra_title(self.source(order)["raw_title"]):
-                continue
+        for order in self._translate_orders(start, end):
             result = self.run_order(order)
             results.append(result)
             if update_summaries:
@@ -2324,7 +2724,8 @@ class TranslationRunner:
             return {"status": "error", "draft": draft, "review": None,
                     "decisions": {}, "rounds": 0, "usages": usages,
                     "tool_events": (tool_context or {}).get("events", []),
-                    "message": str(exc)}
+                    "message": str(exc),
+                    "traceback": traceback.format_exc()}
 
     def _process_draft_inner(self, draft: DraftChapter, *, history, glossary,
                              unresolved_prior, max_revisions: int,
@@ -2362,6 +2763,8 @@ class TranslationRunner:
         confirmed = {finding["id"]: finding for finding in review.findings
                      if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
         major = self._revision_findings(confirmed, review)
+        major.update(self._unresolved_term_findings(
+            review, draft, terms=glossary, log_event=False))
         rounds = 0
         while major and rounds < max_revisions:
             draft = self._revise_draft(draft, review, decisions, log_event=False,
@@ -2379,6 +2782,8 @@ class TranslationRunner:
             confirmed = {finding["id"]: finding for finding in review.findings
                          if decisions.get(finding["id"], {}).get("decision") == "confirmed"}
             major = self._revision_findings(confirmed, review)
+            major.update(self._unresolved_term_findings(
+                review, draft, terms=glossary, log_event=False))
             rounds += 1
         status = ("accepted" if not major else
                   "manual_review" if self.adjudication_mode == "strict"
@@ -2484,8 +2889,9 @@ class TranslationRunner:
         conflict_sources = [
             row["source"] for row in self.store.glossary(limit=1_000_000)
             if row["source"] in batch_source]
-        term_conflicts = self.store.term_target_conflicts(
-            conflict_sources)[:20]
+        term_conflicts = [
+            row for row in self.store.term_target_conflicts(conflict_sources)
+            if not row.get("same_target_variant")][:20]
         jobs = []
         for draft in drafts:
             draft_texts = {order: text for order, text in all_drafts.items()
@@ -2742,6 +3148,8 @@ class TranslationRunner:
                 batch_size < 1 or backlog < 1 or manual_backlog < 1):
             raise ValueError(
                 "concurrency, batch_size and pipeline backlogs must be positive")
+        self._plan_ready()
+        self._ensure_reference_glossary()
         start = self.continuation_start if start is None else start
         end = self.main_end if end is None else end
         if self.adjudication_mode == "strict":
@@ -2751,7 +3159,7 @@ class TranslationRunner:
                         "SELECT edition_order,status FROM chapters")}
         orders = [order for order in range(max(start, self.continuation_start), end)
                   if order in self.source_by_order
-                  and not _is_extra_title(self.source(order)["raw_title"])
+                  and self.chapter_plan.is_translatable(order, self.translate_roles)
                   and statuses.get(order) not in
                   {"accepted", "manual_review", "ready", "stale"}]
         batches = [orders[index:index + batch_size]
@@ -2874,13 +3282,22 @@ class TranslationRunner:
         batch_size = workflow.batch_size if batch_size is None else batch_size
         if translation_concurrency < 1 or review_concurrency < 1 or batch_size < 1:
             raise ValueError("concurrency and batch_size must be positive")
+        self._plan_ready()
+        self._ensure_reference_glossary()
         start = self.continuation_start if start is None else start
         end = self.main_end if end is None else end
         accepted = set(self.store.accepted_orders())
         orders = [order for order in range(max(start, self.continuation_start), end)
                   if order in self.source_by_order
-                  and not _is_extra_title(self.source(order)["raw_title"])
+                  and self.chapter_plan.is_translatable(order, self.translate_roles)
                   and order not in accepted]
+        if self.failure_policy == "continue":
+            return self._run_concurrent_continue(
+                orders, start=start, end=end,
+                translation_concurrency=translation_concurrency,
+                review_concurrency=review_concurrency,
+                batch_size=batch_size,
+                update_summaries=update_summaries)
         results = []
         index = 0
         with ThreadPoolExecutor(max_workers=max(1, translation_concurrency)) as trans_pool, \
@@ -2946,6 +3363,11 @@ class TranslationRunner:
                     for usage in usages:
                         self.store.event("model", **usage)
                     drafts.append(draft)
+                for draft in drafts:
+                    if draft.review.get("style_changes"):
+                        self.store.event(
+                            "style_fix", order=draft.order,
+                            changes=draft.review["style_changes"])
                 self._seed_title_patterns(drafts)
                 written = []
                 for draft in drafts:
@@ -3047,12 +3469,357 @@ class TranslationRunner:
         return {"start": start, "end": end, "chapters": len(results),
                 "results": results, "stats": self.store.stats()}
 
+    def _batch_continue_context(self, batch: Sequence[int]) -> dict:
+        documents = self.documents(max(batch) + 1)
+        snapshot = self.snapshot(batch[0], documents)
+        glossary = self.ensure_batch_glossary(batch)
+        unresolved = self._unresolved()
+        batch_source = "\n".join(
+            self.source(order)["text"] for order in batch)
+        conflict_sources = [
+            row["source"] for row in self.store.glossary(limit=1_000_000)
+            if row["source"] in batch_source]
+        return {
+            "documents": documents,
+            "snapshot": snapshot,
+            "glossary": glossary,
+            "unresolved": unresolved,
+            "stable_glossary": self._stable_glossary_cards(),
+            "tool_snapshot": {
+                "accepted_texts": self.store.translations(),
+                "draft_texts": {},
+                "glossary": self.store.glossary(limit=1_000_000),
+                "term_conflicts": [
+                    row for row in self.store.term_target_conflicts(
+                        conflict_sources)
+                    if not row.get("same_target_variant")][:20],
+            },
+        }
+
+    def _commit_translation_draft(self, draft: DraftChapter) -> DraftChapter:
+        if draft.review.get("style_changes"):
+            self.store.event("style_fix", order=draft.order,
+                             changes=draft.review["style_changes"])
+        self._seed_title_patterns([draft])
+        draft = self._apply_title_normalization(draft)
+        version = self.store.put_draft(
+            order=draft.order, source_id=draft.source_id,
+            source_hash=draft.source_hash, ja_title=draft.ja_title,
+            title_zh=draft.title_zh, text=draft.text,
+            status="draft", review=draft.review, assets=draft.assets)
+        self.store.event("translate", order=draft.order, version=version,
+                         paragraphs=len(draft.paragraphs))
+        return replace(draft, version=version)
+
+    def _mark_translation_failure(self, order: int, reason: str,
+                                  message: str) -> None:
+        row = self.store.chapter(order)
+        review = {"error": reason, "message": message}
+        if row:
+            self.store.set_status(order, "blocked", review)
+        else:
+            source = self.source(order)
+            self.store.put_draft(
+                order=order, source_id=source["entry_id"],
+                source_hash=source["text_hash"],
+                ja_title=source["raw_title"], title_zh=source["raw_title"],
+                text="", status="blocked", review=review, assets={})
+        self.store.event("blocked", order=order,
+                         reason="translation_" + reason)
+
+    def _collect_one_translation(self, order: int, job, errors: list):
+        future, usages = job
+        for usage in usages:
+            self.store.event("model", **usage)
+        try:
+            draft = future.result()
+        except Exception as exc:
+            reason = type(exc).__name__
+            message = str(exc)
+            self._mark_translation_failure(order, reason, message)
+            errors.append({"order": order, "status": "blocked",
+                           "reason": reason, "message": message})
+            return None
+        return self._commit_translation_draft(draft)
+
+    def _commit_review_result(self, future, draft: DraftChapter,
+                              errors: list, results: list) -> None:
+        try:
+            result = future.result()
+        except Exception as exc:
+            result = {"status": "error", "draft": draft, "usages": [],
+                      "review": None, "decisions": {}, "rounds": 0,
+                      "message": str(exc), "tool_events": []}
+        for event in result.get("tool_events") or []:
+            self.store.event("review_tool", **event)
+        for usage in result.get("usages") or []:
+            self.store.event("model", **usage)
+        status = result["status"]
+        if status == "accepted":
+            review_data = self._review_data(result)
+            final = self._apply_title_normalization(result["draft"])
+            if (final.text == draft.text
+                    and final.title_zh == draft.title_zh):
+                self.store.set_status(final.order, "ready", review_data)
+                version = draft.version
+            else:
+                version = self.store.put_draft(
+                    order=final.order, source_id=final.source_id,
+                    source_hash=final.source_hash, ja_title=final.ja_title,
+                    title_zh=final.title_zh, text=final.text,
+                    status="ready", review=review_data, assets=final.assets)
+            self.store.event(
+                "ready", order=final.order, version=version,
+                rounds=result["rounds"],
+                findings=len(result["review"].findings))
+            results.append({"order": final.order, "status": "ready",
+                            "rounds": result["rounds"]})
+            return
+        review_data = (result.get("review") and self._review_data(result)) or {
+            "error": status, "message": result.get("message", "")}
+        final = self._apply_title_normalization(result["draft"])
+        target_status = "manual_review" if status == "manual_review" else "blocked"
+        self.store.put_draft(
+            order=final.order, source_id=final.source_id,
+            source_hash=final.source_hash, ja_title=final.ja_title,
+            title_zh=final.title_zh, text=final.text,
+            status=target_status, review=review_data, assets=final.assets)
+        self.store.event(target_status, order=final.order, reason=status)
+        errors.append({"order": final.order, "status": target_status,
+                       "reason": status, "message": result.get("message", ""),
+                       "traceback": result.get("traceback", "")})
+
+    def _submit_and_collect_reviews(self, batch, drafts, ctx,
+                                    review_pool, errors, results) -> None:
+        provisional = {draft.order: draft.text for draft in drafts}
+        jobs = []
+        for draft in drafts:
+            history = self._history_pairs(
+                draft.order,
+                provisional={order: text for order, text in provisional.items()
+                             if order < draft.order})
+            tool_context = {**ctx["tool_snapshot"], "events": [],
+                            "buffer_events": True}
+            jobs.append((draft, review_pool.submit(
+                self._process_draft, draft, history=history,
+                glossary=ctx["glossary"],
+                unresolved_prior=ctx["unresolved"],
+                max_revisions=self.max_revisions,
+                tool_context=tool_context)))
+        for draft, job in jobs:
+            self._commit_review_result(job, draft, errors, results)
+
+    def _collect_translations_as_completed(self, batch, jobs, ctx,
+                                           review_pool, errors, results) -> None:
+        future_map = {future: (order, usages)
+                      for order, (future, usages) in jobs.items()}
+        provisional = {}
+        review_jobs = {}
+        for future in as_completed(future_map):
+            order, usages = future_map[future]
+            for usage in usages:
+                self.store.event("model", **usage)
+            try:
+                draft = future.result()
+            except Exception as exc:
+                reason = type(exc).__name__
+                message = str(exc)
+                self._mark_translation_failure(order, reason, message)
+                errors.append({"order": order, "status": "blocked",
+                               "reason": reason, "message": message})
+                continue
+            draft = self._commit_translation_draft(draft)
+            provisional[draft.order] = draft.text
+            history = self._history_pairs(
+                draft.order,
+                provisional={o: t for o, t in provisional.items()
+                             if o < draft.order})
+            tool_context = {
+                **ctx["tool_snapshot"],
+                "draft_texts": {o: t for o, t in provisional.items()
+                                if o < draft.order},
+                "events": [], "buffer_events": True,
+            }
+            review_jobs[review_pool.submit(
+                self._process_draft, draft, history=history,
+                glossary=ctx["glossary"],
+                unresolved_prior=ctx["unresolved"],
+                max_revisions=self.max_revisions,
+                tool_context=tool_context)] = draft
+        for future in as_completed(review_jobs):
+            self._commit_review_result(
+                future, review_jobs[future], errors, results)
+
+    def _collect_translations_prefix_as_completed(
+            self, batch, jobs, ctx, review_pool, errors, results) -> None:
+        """Wait for all batch translations, but start each review as soon as
+        every earlier chapter in the batch has a translation (or a terminal
+        failure), preserving history completeness for reviewers."""
+        future_map = {future: (order, usages)
+                      for order, (future, usages) in jobs.items()}
+        done_translations: dict[int, str] = {}
+        failed_orders: set[int] = set()
+        review_jobs = []
+        pending = set(future_map)
+        import concurrent.futures as _cf
+        while pending:
+            completed, pending = _cf.wait(
+                pending, return_when=_cf.FIRST_COMPLETED)
+            for future in completed:
+                order, usages = future_map[future]
+                for usage in usages:
+                    self.store.event("model", **usage)
+                try:
+                    draft = future.result()
+                except Exception as exc:
+                    self._mark_translation_failure(
+                        order, type(exc).__name__, str(exc))
+                    errors.append({"order": order, "status": "blocked",
+                                   "reason": type(exc).__name__,
+                                   "message": str(exc)})
+                    failed_orders.add(order)
+                    done_translations[order] = None
+                    continue
+                draft = self._commit_translation_draft(draft)
+                done_translations[draft.order] = draft.text
+            # Submit reviews for every chapter whose full prefix is settled.
+            for order in sorted(set(done_translations) - {
+                    job_order for job_order, _ in review_jobs}):
+                prefix_ready = all(
+                    earlier in done_translations
+                    for earlier in batch if earlier < order)
+                if not prefix_ready:
+                    continue
+                if done_translations[order] is None:
+                    continue
+                # Rebuild a light DraftChapter handle from the store.
+                draft_obj = self._draft_from_store(
+                    order, self.store.chapter(order))
+                review_jobs.append((order, review_pool.submit(
+                    self._process_draft, draft_obj,
+                    history=self._history_pairs(
+                        order, provisional={o: t for o, t in
+                                            done_translations.items()
+                                            if o < order and t is not None}),
+                    glossary=ctx["glossary"],
+                    unresolved_prior=ctx["unresolved"],
+                    max_revisions=self.max_revisions,
+                    tool_context={**ctx["tool_snapshot"],
+                                  "draft_texts": {o: t for o, t in
+                                                  done_translations.items()
+                                                  if o < order and t is not None},
+                                  "events": [], "buffer_events": True})))
+        for order, job in review_jobs:
+            draft_obj = self._draft_from_store(
+                order, self.store.chapter(order))
+            self._commit_review_result(job, draft_obj, errors, results)
+
+    def _draft_from_store(self, order: int, row) -> "DraftChapter":
+        return DraftChapter(
+            order=order, source_id=row["source_id"],
+            source_hash=row["source_hash"], ja_title=row["ja_title"],
+            title_zh=row["title_zh"], text=row["text"],
+            paragraphs=tuple(p for p in row["text"].split("\n\n") if p),
+            version=row["version"],
+            review=_json_dict(row["review"]), assets=_json_dict(row["assets"]))
+
+    def _run_concurrent_continue(self, orders, *, start, end,
+                                 translation_concurrency, review_concurrency,
+                                 batch_size, update_summaries) -> dict:
+        errors = []
+        results = []
+        processed = 0
+        with ThreadPoolExecutor(max_workers=max(1, translation_concurrency)) as trans_pool, \
+                ThreadPoolExecutor(max_workers=max(1, review_concurrency)) as review_pool:
+            for index in range(0, len(orders), batch_size):
+                self._check_limits()
+                batch = orders[index:index + batch_size]
+                if not batch:
+                    continue
+                ctx = self._batch_continue_context(batch)
+                jobs = {}
+
+                def submit(order):
+                    usages = []
+                    future = trans_pool.submit(
+                        self._translate_draft, order,
+                        documents=ctx["documents"], snapshot=ctx["snapshot"],
+                        batch_orders=batch, glossary=ctx["glossary"],
+                        stable_glossary=ctx["stable_glossary"],
+                        unresolved_prior=ctx["unresolved"],
+                        log_event=False, usage_sink=usages)
+                    return future, usages
+
+                if len(batch) > 1:
+                    warm = submit(batch[-1])
+                    jobs[batch[-1]] = warm
+                    try:
+                        warm[0].result()
+                    except Exception:
+                        pass
+                for order in batch:
+                    if order not in jobs:
+                        jobs[order] = submit(order)
+                if self.review_start == "as_completed":
+                    self._collect_translations_as_completed(
+                        batch, jobs, ctx, review_pool, errors, results)
+                elif self.review_start == "prefix_as_completed":
+                    self._collect_translations_prefix_as_completed(
+                        batch, jobs, ctx, review_pool, errors, results)
+                else:
+                    drafts = []
+                    for order in batch:
+                        draft = self._collect_one_translation(
+                            order, jobs[order], errors)
+                        if draft is not None:
+                            drafts.append(draft)
+                    if drafts:
+                        self._submit_and_collect_reviews(
+                            batch, drafts, ctx, review_pool, errors, results)
+                processed += len(batch)
+                self.accept_ready_prefix()
+                if update_summaries:
+                    self.update_target_summary()
+        self.accept_ready_prefix()
+        return {"start": start, "end": end, "chapters": processed,
+                "accepted": len(self.store.accepted_orders()),
+                "errors": errors, "stats": self.store.stats()}
+
+    def repair_pending(self, *, include_manual: bool = False) -> dict:
+        """Retry blocked/draft chapters once the main pass has finished."""
+        repaired = []
+        errors = []
+        for order in range(self.continuation_start, self.main_end):
+            row = self.store.chapter(order)
+            if not row or row["status"] == "accepted":
+                continue
+            if row["status"] == "ready":
+                continue
+            if row["status"] == "manual_review" and not include_manual:
+                errors.append({"order": order, "status": "manual_review"})
+                continue
+            try:
+                self.run_order(order)
+                repaired.append(order)
+            except ChapterBlocked as exc:
+                errors.append({"order": order, "status": "blocked",
+                               "code": exc.code})
+            except Exception as exc:
+                errors.append({"order": order, "status": "error",
+                               "error": type(exc).__name__,
+                               "message": str(exc)})
+        self.accept_ready_prefix()
+        return {"repaired": repaired, "errors": errors,
+                "stats": self.store.stats()}
+
     def contiguous_accepted_end(self) -> int:
         accepted = set(self.store.accepted_orders())
         order = self.continuation_start
         while order < self.main_end:
             source = self.source_by_order.get(order)
-            if source is None or _is_extra_title(source["raw_title"]):
+            if (source is None or
+                    not self.chapter_plan.is_translatable(
+                        order, self.translate_roles)):
                 order += 1
                 continue
             if order in accepted:
@@ -3111,7 +3878,9 @@ class TranslationRunner:
         pairs = []
         for order in range(start, stop):
             source = self.source_by_order.get(order)
-            if source is None or _is_extra_title(source["raw_title"]):
+            if (source is None or
+                    not self.chapter_plan.is_translatable(
+                        order, self.summary_roles)):
                 continue
             row = self.store.chapter(order)
             if not row or row["status"] != "accepted":
@@ -3185,7 +3954,8 @@ class TranslationRunner:
 
     def _extract_terms(self, *, system: str, prompt: str, task: str,
                        max_terms: int, max_tokens: int | None = None,
-                       log_event: bool = True) -> tuple[list[dict], dict]:
+                       log_event: bool = True,
+                       usage_sink: list | None = None) -> tuple[list[dict], dict]:
         """Extract @@TERM records, continuing after truncated responses."""
         max_terms = max(1, int(max_terms))
         messages = [
@@ -3199,7 +3969,8 @@ class TranslationRunner:
         while True:
             result = self._generate(
                 messages, max_tokens or self.glossary_tokens, task,
-                log_event=log_event, allow_truncated=True)
+                log_event=log_event, usage_sink=usage_sink,
+                allow_truncated=True)
             parsed = parse_term_records(result.text)
             new_records = 0
             for row in parsed.records:
@@ -3273,12 +4044,12 @@ class TranslationRunner:
                     continue
                 done.add((value.get("start"), value.get("end")))
         chunk = self.reference_chunk
-        expected = {(start, min(start + chunk, self.continuation_start))
-                    for start in range(0, self.continuation_start, chunk)}
-        truncated_chunks = incomplete_chunks = 0
-        for start in range(0, self.continuation_start, chunk):
-            self._check_limits()
-            stop = min(start + chunk, self.continuation_start)
+        starts = [(start, min(start + chunk, self.continuation_start))
+                  for start in range(0, self.continuation_start, chunk)]
+        expected = set(starts)
+        style_hint = self._target_style_hint()
+        jobs = []
+        for start, stop in starts:
             if (start, stop) in done:
                 continue
             pairs = []
@@ -3292,27 +4063,28 @@ class TranslationRunner:
             if not pairs:
                 done.add((start, stop))
                 continue
-            max_terms = self._glossary_cap(len(pairs))
-            style_hint = self._target_style_hint()
-            prompt = _reference_glossary_prompt(
-                pairs, style_hint, max_terms=max_terms)
+            jobs.append((start, stop, pairs, self._glossary_cap(len(pairs))))
+
+        def run_chunk(job):
+            start, stop, pairs, max_terms = job
+            usages = []
+            general_rows = []
+            general_stats = None
+            general_error = None
+            focused_rows = []
+            focused_stats = None
+            focused_error = None
             try:
-                rows, stats = self._extract_terms(
+                prompt = _reference_glossary_prompt(
+                    pairs, style_hint, max_terms=max_terms)
+                general_rows, general_stats = self._extract_terms(
                     system="你是严谨的日中对照术语整理员。",
                     prompt=prompt, task=f"glossary_{start}_{stop}",
-                    max_terms=max_terms)
-                self.store.put_glossary(rows)
-                self.store.event(
-                    "glossary_chunk", start=start, end=stop,
-                    terms=len(rows), version=GLOSSARY_PROTOCOL_VERSION,
-                    **stats)
-                if stats["truncated"]:
-                    truncated_chunks += 1
-                if not (stats["complete"] or stats["cap_reached"]):
-                    incomplete_chunks += 1
-                    self.store.event(
-                        "glossary_chunk_incomplete", start=start, end=stop,
-                        version=GLOSSARY_PROTOCOL_VERSION, **stats)
+                    max_terms=max_terms, log_event=False,
+                    usage_sink=usages)
+            except (PipelineError, ProviderError, ValueError) as exc:
+                general_error = type(exc).__name__
+            if general_stats is not None:
                 try:
                     focused_max = self._glossary_cap(len(pairs))
                     focused_prompt = _reference_focused_prompt(
@@ -3321,19 +4093,66 @@ class TranslationRunner:
                         system="你是严谨的日中对照术语整理员。",
                         prompt=focused_prompt,
                         task=f"glossary_focus_{start}_{stop}",
-                        max_terms=focused_max)
-                    self.store.put_glossary(focused_rows)
+                        max_terms=focused_max, log_event=False,
+                        usage_sink=usages)
+                except (PipelineError, ProviderError, ValueError) as exc:
+                    focused_error = type(exc).__name__
+            return {"start": start, "stop": stop, "usages": usages,
+                    "general_rows": general_rows, "general_stats": general_stats,
+                    "general_error": general_error,
+                    "focused_rows": focused_rows, "focused_stats": focused_stats,
+                    "focused_error": focused_error}
+
+        truncated_chunks = incomplete_chunks = 0
+        concurrency = max(1, int(getattr(
+            self.project.config.workflow, "glossary_concurrency", 2)))
+        if jobs:
+            self._check_limits()
+            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+                futures = [pool.submit(run_chunk, job) for job in jobs]
+                for future in futures:
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        self.store.event("glossary_failed",
+                                         error=type(exc).__name__)
+                        continue
+                    for usage in result["usages"]:
+                        self.store.event("model", **usage)
+                    start, stop = result["start"], result["stop"]
+                    if result["general_error"]:
+                        self.store.event(
+                            "glossary_failed", start=start, end=stop,
+                            error=result["general_error"])
+                        continue
+                    rows, stats = result["general_rows"], result["general_stats"]
+                    self.store.put_glossary(rows)
                     self.store.event(
-                        "glossary_focus_chunk", start=start, end=stop,
-                        terms=len(focused_rows),
-                        version=GLOSSARY_PROTOCOL_VERSION, **focused_stats)
-                except (PipelineError, ProviderError, ValueError):
-                    self.store.event("glossary_focus_failed", start=start,
-                                     end=stop)
-                if stats["complete"] or stats["cap_reached"]:
-                    done.add((start, stop))
-            except (PipelineError, ProviderError, ValueError):
-                self.store.event("glossary_failed", start=start, end=stop)
+                        "glossary_chunk", start=start, end=stop,
+                        terms=len(rows), version=GLOSSARY_PROTOCOL_VERSION,
+                        **stats)
+                    if stats["truncated"]:
+                        truncated_chunks += 1
+                    if not (stats["complete"] or stats["cap_reached"]):
+                        incomplete_chunks += 1
+                        self.store.event(
+                            "glossary_chunk_incomplete", start=start, end=stop,
+                            version=GLOSSARY_PROTOCOL_VERSION, **stats)
+                    if result["focused_error"]:
+                        self.store.event(
+                            "glossary_focus_failed", start=start, end=stop,
+                            error=result["focused_error"])
+                    else:
+                        focused_rows = result["focused_rows"]
+                        focused_stats = result["focused_stats"]
+                        self.store.put_glossary(focused_rows)
+                        self.store.event(
+                            "glossary_focus_chunk", start=start, end=stop,
+                            terms=len(focused_rows),
+                            version=GLOSSARY_PROTOCOL_VERSION, **focused_stats)
+                    if stats["complete"] or stats["cap_reached"]:
+                        done.add((start, stop))
+                    self._check_limits()
         if expected <= done:
             self.store.event(
                 "glossary_complete", version=GLOSSARY_PROTOCOL_VERSION,
@@ -3359,7 +4178,8 @@ class TranslationRunner:
         """
         orders = [order for order in batch_orders
                   if order in self.source_by_order
-                  and not _is_extra_title(self.source(order)["raw_title"])]
+                  and self.chapter_plan.is_translatable(
+                      order, self.translate_roles)]
         if not orders:
             return list(self.glossary)
         text = "\n\n".join(
@@ -3787,13 +4607,15 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
                              (chapter.get("source_paragraphs") or [])
                              if str(text).strip()]
         bilingual_chapter = bool(bilingual and source_paragraphs)
-        if bilingual_chapter:
+        bilingual_mode = str(chapter.get("bilingual_mode") or "pairs")
+        if bilingual_chapter and bilingual_mode != "blocks":
             pairs, source_count, target_count = _bilingual_pairs(
                 source_paragraphs, chapter["paragraphs"])
         else:
             pairs = [(None, text) for text in chapter["paragraphs"]
                      if str(text).strip()]
-            source_count = target_count = 0
+            source_count = len(source_paragraphs)
+            target_count = len(chapter["paragraphs"])
         chapter_assets = chapter.get("assets") or {}
         inline_by_paragraph: dict[int, list[Mapping]] = {}
         for item in chapter_assets.get("inline") or []:
@@ -3807,37 +4629,61 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
             else:
                 after.setdefault(int(item.get("after_paragraph", -1)), []).append(rendered)
         parts: list[str] = list(after.get(-1, []))
-        if bilingual_chapter and source_count != target_count:
+        if bilingual_chapter and bilingual_mode == "blocks":
             parts.append(
-                f'<p class="bl-mismatch" lang="{language_attr}"'
-                f' xml:lang="{language_attr}">段落数不一致：原文 {source_count} 段，'
-                f'译文 {target_count} 段；未配对内容按顺序保留。</p>')
-        paragraph_index = 0
-        for source_text, target_text in pairs:
-            parts.extend(before.get(paragraph_index, []))
-            if bilingual_chapter:
-                translation = _render_paragraph(
-                    target_text or "（无译文）",
-                    inline_by_paragraph.get(paragraph_index, []),
-                    asset_files,
-                    class_name=("bl-translation" if target_text
-                                else "bl-translation bl-missing"),
-                    language=language_attr)
-                original = _render_paragraph(
-                    source_text or "（无原文）", [], asset_files,
-                    class_name=("bl-original" if source_text
-                                else "bl-original bl-missing"),
-                    language=source_language_attr)
-                parts.append(f'<div class="bl-pair">{translation}{original}</div>')
-            elif target_text is not None:
+                f'<p class="bl-note" lang="{language_attr}"'
+                f' xml:lang="{language_attr}">本章按章对照：上为译文，下为原文；'
+                f'未逐段配对。</p>')
+            for paragraph_index_index, text in enumerate(chapter["paragraphs"]):
+                if not str(text).strip():
+                    continue
+                parts.extend(before.get(paragraph_index_index, []))
                 parts.append(_render_paragraph(
-                    target_text,
-                    inline_by_paragraph.get(paragraph_index, []),
-                    asset_files))
-            parts.extend(after.get(paragraph_index, []))
-            paragraph_index += 1
-        for extra in sorted(index for index in after if index >= paragraph_index):
-            parts.extend(after[extra])
+                    str(text),
+                    inline_by_paragraph.get(paragraph_index_index, []),
+                    asset_files, class_name="bl-translation",
+                    language=language_attr))
+                parts.extend(after.get(paragraph_index_index, []))
+            parts.append(
+                f'<div class="bl-original-block" lang="{source_language_attr}"'
+                f' xml:lang="{source_language_attr}">')
+            for text in source_paragraphs:
+                parts.append(_render_paragraph(
+                    text, [], asset_files, class_name="bl-original",
+                    language=source_language_attr))
+            parts.append("</div>")
+        else:
+            if bilingual_chapter and source_count != target_count:
+                parts.append(
+                    f'<p class="bl-mismatch" lang="{language_attr}"'
+                    f' xml:lang="{language_attr}">段落数不一致：原文 {source_count} 段，'
+                    f'译文 {target_count} 段；未配对内容按顺序保留。</p>')
+            paragraph_index = 0
+            for source_text, target_text in pairs:
+                parts.extend(before.get(paragraph_index, []))
+                if bilingual_chapter:
+                    translation = _render_paragraph(
+                        target_text or "（无译文）",
+                        inline_by_paragraph.get(paragraph_index, []),
+                        asset_files,
+                        class_name=("bl-translation" if target_text
+                                    else "bl-translation bl-missing"),
+                        language=language_attr)
+                    original = _render_paragraph(
+                        source_text or "（无原文）", [], asset_files,
+                        class_name=("bl-original" if source_text
+                                    else "bl-original bl-missing"),
+                        language=source_language_attr)
+                    parts.append(f'<div class="bl-pair">{translation}{original}</div>')
+                elif target_text is not None:
+                    parts.append(_render_paragraph(
+                        target_text,
+                        inline_by_paragraph.get(paragraph_index, []),
+                        asset_files))
+                parts.extend(after.get(paragraph_index, []))
+                paragraph_index += 1
+            for extra in sorted(index for index in after if index >= paragraph_index):
+                parts.extend(after[extra])
         source_heading = ""
         if bilingual and source_title and source_title != str(chapter["title"]):
             source_heading = (
@@ -3879,6 +4725,10 @@ def build_epub(*, output: str | Path, title: str, chapters: Sequence[dict],
         "p.bl-missing{font-style:italic;opacity:0.55;}"
         "p.bl-mismatch{text-indent:0;font-size:0.86em;opacity:0.7;"
         "border-left:3px solid currentColor;padding-left:0.6em;}"
+        "p.bl-note{text-indent:0;font-size:0.86em;opacity:0.7;"
+        "border-left:3px solid currentColor;padding-left:0.6em;}"
+        "div.bl-original-block{margin-top:1.4em;padding-top:0.8em;"
+        "border-top:1px solid currentColor;}"
         "p.source-title{text-indent:0;font-size:0.86em;opacity:0.65;"
         "margin:0 0 1em;}")
     cover_meta = ('<meta name="cover" content="cover-image"/>'
@@ -4026,6 +4876,177 @@ def collect_epub_chapters(*, runner: TranslationRunner,
     return chapters
 
 
+def _parsed_assets(value) -> dict:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            value = {}
+    return value or {"inline": [], "block": []}
+
+
+def collect_planned_chapters(*, runner: TranslationRunner,
+                             reference_chapters: Sequence[dict] = (),
+                             end: int | None = None,
+                             reference_assets: Mapping[int, Mapping] | None = None,
+                             bilingual: bool = False) -> list[dict]:
+    """Collect every role in source reading order, mixing reference and target.
+
+    Reference chapters are rendered as chapter-level blocks; pipeline-generated
+    chapters keep the exact S/T paragraph pairing produced by the protocol.
+    """
+    end = runner.main_end if end is None else end
+    reference_assets = reference_assets or {}
+    ref_by_order = {}
+    for row in reference_chapters:
+        order = row.get("order")
+        if isinstance(order, int):
+            ref_by_order[order] = dict(row)
+    chapters = []
+    for order in sorted(runner.source_by_order):
+        if order >= end:
+            break
+        source = runner.source(order)
+        role = runner.chapter_plan.role(order)
+        if role == UNKNOWN:
+            raise PipelineError(
+                "unknown_chapter_role",
+                f"chapter {order} has no reliable role; manual review required",
+                details={"order": order, "title": source.get("raw_title")})
+        translated = runner.chapter_plan.is_translatable(
+            order, runner.translate_roles)
+        row = runner.store.chapter(order)
+        accepted = bool(row and row["status"] == "accepted")
+        reference = ref_by_order.get(order)
+        use_reference = reference is not None and (
+            not translated or order < runner.continuation_start or role != MAIN)
+        if use_reference:
+            chapter = dict(reference)
+            chapter["paragraphs"] = list(
+                chapter.get("paragraphs")
+                or str(chapter.get("text") or "").split("\n\n"))
+            chapter["assets"] = (chapter.get("assets")
+                                 or reference_assets.get(order)
+                                 or {"inline": [], "block": []})
+            chapter["source"] = "reference"
+            chapter["bilingual_mode"] = "blocks"
+        elif accepted:
+            chapter = {
+                "title": row["title_zh"],
+                "paragraphs": [value for value in row["text"].split("\n\n")
+                               if value.strip()],
+                "order": order, "source": "target",
+                "assets": _parsed_assets(row.get("assets")),
+                "bilingual_mode": "pairs",
+            }
+        elif reference is not None:
+            chapter = dict(reference)
+            chapter["paragraphs"] = list(
+                chapter.get("paragraphs")
+                or str(chapter.get("text") or "").split("\n\n"))
+            chapter["assets"] = (chapter.get("assets")
+                                 or reference_assets.get(order)
+                                 or {"inline": [], "block": []})
+            chapter["source"] = "reference"
+            chapter["bilingual_mode"] = "blocks"
+        elif not translated:
+            continue
+        else:
+            raise PipelineError("missing_accepted",
+                                f"chapter {order} is not accepted")
+        if bilingual:
+            chapter.setdefault("source_paragraphs",
+                               _source_paragraphs(runner, order))
+            chapter.setdefault("source_title", source["raw_title"])
+        chapters.append(chapter)
+    return chapters
+
+
+def build_review_report(*, runner: TranslationRunner,
+                        markdown_path: str | Path,
+                        json_path: str | Path | None = None) -> dict:
+    """Write a human-review report with unresolved and confirmed findings."""
+    rows = list(runner.store.db.execute(
+        "SELECT edition_order,status,title_zh,review FROM chapters"
+        " ORDER BY edition_order"))
+    chapters = []
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        order = int(row["edition_order"])
+        review = json.loads(row["review"] or "{}")
+        decisions = review.get("decisions") or {}
+        findings = []
+        for finding in review.get("findings") or []:
+            decision = decisions.get(finding.get("id"), {})
+            findings.append({
+                "id": finding.get("id"),
+                "severity": finding.get("severity"),
+                "category": finding.get("category"),
+                "claim": finding.get("claim"),
+                "suggestion": finding.get("suggestion"),
+                "decision": decision.get("decision"),
+                "reason": decision.get("reason"),
+            })
+        status = str(row["status"])
+        status_counts[status] = status_counts.get(status, 0) + 1
+        source = runner.source_by_order.get(order) or {}
+        chapters.append({
+            "order": order,
+            "role": runner.chapter_plan.role(order),
+            "ja_title": source.get("raw_title", ""),
+            "title_zh": row["title_zh"],
+            "status": status,
+            "rounds": review.get("rounds"),
+            "unresolved": list(review.get("unresolved") or []),
+            "findings": findings,
+            "term_checks": [check for check in (review.get("term_checks") or [])
+                            if check.get("verdict") == "violation"],
+            "accepted_with_major": list(review.get("accepted_with_major") or []),
+            "manual_fixes": list(review.get("manual_fixes") or []),
+        })
+    report = {"summary": {"statuses": status_counts,
+                          "chapters": len(chapters)},
+              "chapters": chapters}
+    markdown_path = Path(markdown_path)
+    markdown_path.parent.mkdir(parents=True, exist_ok=True)
+    lines = ["# 翻译审校报告", "",
+             f"- 章节数：{len(chapters)}",
+             f"- 状态：{json.dumps(status_counts, ensure_ascii=False)}", ""]
+    for chapter in chapters:
+        if not (chapter["unresolved"] or chapter["findings"]
+                or chapter["term_checks"] or chapter["accepted_with_major"]
+                or chapter["manual_fixes"]):
+            continue
+        lines.append(f"## {chapter['order']} {chapter['title_zh']}")
+        lines.append(f"- 角色：{chapter['role']}；状态：{chapter['status']}；"
+                     f"修订轮数：{chapter['rounds']}")
+        if chapter["ja_title"]:
+            lines.append(f"- 日文标题：{chapter['ja_title']}")
+        for text in chapter["unresolved"]:
+            lines.append(f"- 未决：{text}")
+        for finding in chapter["findings"]:
+            lines.append(
+                f"- {finding['severity']}/{finding['category']} "
+                f"[{finding['decision']}] {finding['claim']}"
+                + (f" → {finding['suggestion']}" if finding.get("suggestion") else ""))
+        for check in chapter["term_checks"]:
+            lines.append(
+                f"- 术语 {check.get('term')} → {check.get('canonical')}："
+                f"{check.get('reason', '')}")
+        for item in chapter["accepted_with_major"]:
+            lines.append(f"- 带 major 接受：{item}")
+        for fix in chapter["manual_fixes"]:
+            lines.append(f"- 人工修补：{fix.get('ref')} {fix.get('reason', '')}")
+        lines.append("")
+    markdown_path.write_text("\n".join(lines), encoding="utf-8")
+    if json_path is not None:
+        json_path = Path(json_path)
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(report, ensure_ascii=False, indent=2),
+                             encoding="utf-8")
+    return report
+
+
 _BILINGUAL_CSS = """
 :root { color-scheme: light dark; }
 * { box-sizing: border-box; }
@@ -4142,6 +5163,30 @@ body {
   line-height: 1.58;
   opacity: 0.7;
 }
+.block-note {
+  margin: 0 0 1.2em;
+  padding-left: 0.65em;
+  border-left: 3px solid currentColor;
+  font-size: 0.84em;
+  opacity: 0.7;
+}
+.translation-block p {
+  margin: 0 0 0.9em;
+  line-height: 1.8;
+}
+.original-block {
+  margin-top: 1.6em;
+  padding-top: 1em;
+  border-top: 1px solid currentColor;
+}
+.original-block p {
+  margin: 0 0 0.8em;
+  padding-left: 0.65em;
+  border-left: 2px solid currentColor;
+  font-size: 0.86em;
+  line-height: 1.58;
+  opacity: 0.7;
+}
 .missing {
   font-style: italic;
   opacity: 0.52;
@@ -4227,8 +5272,18 @@ def build_bilingual_html(*, chapters: Sequence[Mapping], title: str,
             target_paragraphs = str(chapter.get("text") or "").split("\n\n")
         if source_paragraphs is None:
             source_paragraphs = []
-        pairs, source_count, target_count = _bilingual_pairs(
-            source_paragraphs, target_paragraphs)
+        mode = str(chapter.get("bilingual_mode") or "pairs")
+        if mode == "blocks":
+            source_list = [str(value).strip() for value in source_paragraphs
+                           if str(value).strip()]
+            target_list = [str(value).strip() for value in target_paragraphs
+                           if str(value).strip()]
+            pairs = []
+            source_count, target_count = len(source_list), len(target_list)
+        else:
+            source_list = target_list = []
+            pairs, source_count, target_count = _bilingual_pairs(
+                source_paragraphs, target_paragraphs)
         chapter_count += 1
         pair_count += len(pairs)
         toc.append(
@@ -4257,26 +5312,44 @@ def build_bilingual_html(*, chapters: Sequence[Mapping], title: str,
                 f'<p class="source-title" lang="{source_language_attr}"'
                 f' xml:lang="{source_language_attr}">原文标题：'
                 f'{html.escape(source_title)}</p>')
-        if source_count != target_count:
+        if mode == "blocks":
             parts.append(
-                f'<p class="mismatch">段落数不一致：原文 {source_count} 段，'
-                f'译文 {target_count} 段；未配对内容按顺序保留。</p>')
-        for source_text, target_text in pairs:
-            original = _bilingual_paragraph(source_text)
-            translation = _bilingual_paragraph(target_text)
-            if not original and not translation:
-                continue
-            translation_class = "translation" + ("" if translation else " missing")
-            original_class = "original" + ("" if original else " missing")
+                '<p class="block-note">本章按章对照：上为译文，下为原文；'
+                '未逐段配对。</p>')
+            parts.append('<div class="translation-block">')
+            for text in target_list:
+                parts.append(
+                    f'<p class="translation" lang="{language_attr}"'
+                    f' xml:lang="{language_attr}">{_bilingual_paragraph(text)}</p>')
+            parts.append("</div>")
             parts.append(
-                '<div class="bilingual-pair">'
-                f'<p class="{translation_class}" lang="{language_attr}"'
-                f' xml:lang="{language_attr}">'
-                f'{translation or "（无译文）"}</p>'
-                f'<p class="{original_class}" lang="{source_language_attr}"'
-                f' xml:lang="{source_language_attr}">'
-                f'{original or "（无原文）"}</p>'
-                "</div>")
+                f'<div class="original-block" lang="{source_language_attr}"'
+                f' xml:lang="{source_language_attr}">')
+            for text in source_list:
+                parts.append(
+                    f'<p class="original">{_bilingual_paragraph(text)}</p>')
+            parts.append("</div>")
+        else:
+            if source_count != target_count:
+                parts.append(
+                    f'<p class="mismatch">段落数不一致：原文 {source_count} 段，'
+                    f'译文 {target_count} 段；未配对内容按顺序保留。</p>')
+            for source_text, target_text in pairs:
+                original = _bilingual_paragraph(source_text)
+                translation = _bilingual_paragraph(target_text)
+                if not original and not translation:
+                    continue
+                translation_class = "translation" + ("" if translation else " missing")
+                original_class = "original" + ("" if original else " missing")
+                parts.append(
+                    '<div class="bilingual-pair">'
+                    f'<p class="{translation_class}" lang="{language_attr}"'
+                    f' xml:lang="{language_attr}">'
+                    f'{translation or "（无译文）"}</p>'
+                    f'<p class="{original_class}" lang="{source_language_attr}"'
+                    f' xml:lang="{source_language_attr}">'
+                    f'{original or "（无原文）"}</p>'
+                    "</div>")
         parts.append("</section>")
         sections.append("".join(parts))
     if not sections:
