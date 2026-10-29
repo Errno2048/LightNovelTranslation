@@ -355,10 +355,16 @@ class SummaryIndex:
                 break
         if boundary is not None and lower > boundary:
             lower = boundary
-        level1 = sorted((b for b in self.blocks.values()
-                         if b.level == 1 and b.end <= lower
-                         and b.status in allowed),
-                        key=lambda b: b.start)[-num_level1:]
+        # A level 1 block that starts before `lower` but ends between lower
+        # and target_order covers history too (the full-text window may cut
+        # through it); include it as the containing block, never blocks that
+        # start at/after target_order (future leakage).
+        level1_all = [b for b in self.blocks.values()
+                      if b.level == 1 and b.status in allowed
+                      and b.start < target_order]
+        level1 = sorted(level1_all, key=lambda b: b.start)[-num_level1:]
+        level1 = [b for b in level1 if b.start < lower or b.end <= lower or
+                  b.start < target_order]
         level1_start = level1[0].start if level1 else lower
         level2 = sorted((b for b in self.blocks.values()
                          if b.level == 2 and b.end <= level1_start
@@ -383,10 +389,16 @@ class SummaryIndex:
                                         full_start=full_start)
         return selection["gaps"]
 
-    def review_barrier(self, target_order: int, *, strict: bool) -> list[tuple[int, int]]:
-        """Gap check for review. Currently identical to translation_barrier:
-        with strict=False it also accepts PROVISIONAL coverage, although the
-        design intent is that review grounds on accepted (COMMITTED) facts and
-        may only read the current block's provisional summary. Reconcile this
-        before wiring the index into the runner (TODO)."""
-        return self.translation_barrier(target_order, strict=strict)
+    def review_barrier(self, target_order: int, *, strict: bool = False) -> list[tuple[int, int]]:
+        """Gap check for review.
+
+        Review always grounds on accepted facts: earlier history must be
+        covered by COMMITTED blocks regardless of ``strict``.  The only
+        provisional summary a reviewer may see is the one for the level 1
+        block containing the chapter under review (same-block context), which
+        never appears in this prefix gap check.
+        """
+        full_start = max(0, target_order - self.runner.history_chapters)
+        selection = self.context_blocks(
+            target_order, allowed=(COMMITTED,), full_start=full_start)
+        return selection["gaps"]

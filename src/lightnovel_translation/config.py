@@ -30,6 +30,8 @@ class WorkflowConfig:
     adjudication_mode: str = "normal"
     batch_size: int = 30
     full_chapters: int = 5
+    context_num_level1: int = 3
+    context_num_level2: str = "all"
     history_chapters: int = 3
     summary_every: int = 5
     summary_lag: int = 0
@@ -63,12 +65,14 @@ class WorkflowConfig:
     backfill: str = "ask"
     failure_policy: str = "stop_batch"
     review_start: str = "barrier"
+    execution_policy: str = "concurrent"
 
     def __post_init__(self):
         for name in ('translation_concurrency', 'review_concurrency',
                      'glossary_concurrency',
                      'pipeline_review_backlog', 'pipeline_manual_backlog',
-                     'batch_size', 'full_chapters', 'summary_every',
+                     'batch_size', 'full_chapters', 'context_num_level1',
+                     'summary_every',
                      'reference_chunk', 'translation_tokens', 'review_tokens',
                      'adjudication_tokens', 'summary_tokens', 'glossary_tokens',
                      'glossary_terms_per_chapter', 'evidence_excerpt_chars',
@@ -123,6 +127,16 @@ class WorkflowConfig:
             raise ConfigurationError(
                 "workflow.review_start must be 'barrier', 'as_completed' or "
                 "'prefix_as_completed'")
+        if self.context_num_level2 not in {'all'} and not (
+                type(self.context_num_level2) is int and self.context_num_level2 > 0):
+            raise ConfigurationError(
+                "workflow.context_num_level2 must be 'all' or a positive integer")
+        if self.execution_policy not in {'strict', 'concurrent'}:
+            raise ConfigurationError(
+                "workflow.execution_policy must be 'strict' or 'concurrent'")
+        if self.execution_policy == 'strict' and self.failure_policy == 'continue':
+            raise ConfigurationError(
+                "workflow.execution_policy='strict' requires failure_policy='stop_batch'")
         if self.review_start in {'as_completed', 'prefix_as_completed'} and self.failure_policy != 'continue':
             raise ConfigurationError(
                 "workflow.review_start='as_completed' or 'prefix_as_completed' "

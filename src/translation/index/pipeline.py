@@ -964,6 +964,7 @@ class TranslationRunner:
         self.translation_mode = getattr(workflow, "translation_mode", "batch")
         self.failure_policy = getattr(workflow, "failure_policy", "stop_batch")
         self.review_start = getattr(workflow, "review_start", "barrier")
+        self.execution_policy = getattr(workflow, "execution_policy", "concurrent")
         self.pipeline_review_backlog = getattr(
             workflow, "pipeline_review_backlog", 2)
         self.pipeline_manual_backlog = getattr(
@@ -1242,51 +1243,82 @@ class TranslationRunner:
     def snapshot(self, order: int, documents: Mapping[int, ContextDocument],
                  provisional_orders: Iterable[int] = ()) -> IndexSnapshot:
         artifacts = {}
-        reference_summary = self.store.summary("reference", 0, self.continuation_start)
-        if reference_summary:
-            ids = tuple(self.source(level).get("entry_id")
-                        for level in range(0, self.continuation_start)
-                        if level in self.source_by_order)
-            artifacts["reference-summary"] = Artifact(
-                artifact_id="reference-summary", kind="block", level=2,
-                source_ids=ids, status="accepted",
-                inputs=(InputRef("reference", "reference-summary"),),
-                content={"summary": reference_summary},
-                review_mode="rebuild_only",
-                quality_labels=("rebuild_only", "reference"))
-        accepted_summaries = self.store.summaries("target")
-        accepted_ranges = [(row["start_order"], row["end_order"])
-                           for row in accepted_summaries]
-        for row in accepted_summaries:
-            start, end = row["start_order"], row["end_order"]
-            ids = tuple(self.source(level).get("entry_id")
-                        for level in range(start, end) if level in self.source_by_order)
-            if not ids:
-                continue
-            artifact_id = f"target-summary-{start}-{end}"
-            artifacts[artifact_id] = Artifact(
-                artifact_id=artifact_id, kind="block", level=2,
-                source_ids=ids, status="accepted",
-                inputs=(InputRef("target", f"target-summary-{start}-{end}"),),
-                content={"summary": row["text"]},
-                review_mode="rebuild_only",
-                quality_labels=("rebuild_only", "target_summary"))
-        for row in self.store.summaries("target-provisional"):
-            start, end = row["start_order"], row["end_order"]
-            if any(a_start <= start and end <= a_end
-                   for a_start, a_end in accepted_ranges):
-                continue
-            ids = tuple(self.source(level).get("entry_id")
-                        for level in range(start, end) if level in self.source_by_order)
-            if not ids:
-                continue
-            artifact_id = f"target-provisional-summary-{start}-{end}"
-            artifacts[artifact_id] = Artifact(
-                artifact_id=artifact_id, kind="block", level=2,
-                source_ids=ids, status="provisional",
-                inputs=(InputRef("target-provisional", artifact_id),),
-                content={"summary": row["text"]},
-                quality_labels=("provisional_target_summary",))
+        # Hierarchical summary blocks are the primary history source.  When
+        # summary_blocks exist they supersede the legacy flat summaries.
+        has_blocks = self.store.db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+            " AND name='summary_blocks'").fetchone()
+        index_blocks = list(self.store.db.execute(
+            "SELECT block_id,level,start_order,end_order,status,summary,"
+            "content FROM summary_blocks WHERE summary<>'' "
+            "AND status IN ('provisional','committed') ORDER BY start_order")
+        ) if has_blocks else []
+        if index_blocks:
+            for row in index_blocks:
+                ids = tuple(self.source(level).get("entry_id")
+                            for level in range(row["start_order"], row["end_order"])
+                            if level in self.source_by_order)
+                if not ids:
+                    continue
+                status = ("accepted" if row["status"] == "committed"
+                          else "provisional")
+                artifact_id = f"index-block-L{row['level']}-{row['start_order']}-{row['end_order']}"
+                artifacts[artifact_id] = Artifact(
+                    artifact_id=artifact_id, kind="block",
+                    level=row["level"], source_ids=ids, status=status,
+                    inputs=(InputRef("summary-blocks", row["block_id"]),),
+                    content={"summary": row["summary"]},
+                    review_mode="rebuild_only",
+                    quality_labels=(f"index_{row['status']}", "rebuild_only"))
+        else:
+            reference_summary = self.store.summary(
+                "reference", 0, self.continuation_start)
+            if reference_summary:
+                ids = tuple(self.source(level).get("entry_id")
+                            for level in range(0, self.continuation_start)
+                            if level in self.source_by_order)
+                artifacts["reference-summary"] = Artifact(
+                    artifact_id="reference-summary", kind="block", level=2,
+                    source_ids=ids, status="accepted",
+                    inputs=(InputRef("reference", "reference-summary"),),
+                    content={"summary": reference_summary},
+                    review_mode="rebuild_only",
+                    quality_labels=("rebuild_only", "reference"))
+            accepted_summaries = self.store.summaries("target")
+            accepted_ranges = [(row["start_order"], row["end_order"])
+                               for row in accepted_summaries]
+            for row in accepted_summaries:
+                start, end = row["start_order"], row["end_order"]
+                ids = tuple(self.source(level).get("entry_id")
+                            for level in range(start, end)
+                            if level in self.source_by_order)
+                if not ids:
+                    continue
+                artifact_id = f"target-summary-{start}-{end}"
+                artifacts[artifact_id] = Artifact(
+                    artifact_id=artifact_id, kind="block", level=2,
+                    source_ids=ids, status="accepted",
+                    inputs=(InputRef("target", f"target-summary-{start}-{end}"),),
+                    content={"summary": row["text"]},
+                    review_mode="rebuild_only",
+                    quality_labels=("rebuild_only", "target_summary"))
+            for row in self.store.summaries("target-provisional"):
+                start, end = row["start_order"], row["end_order"]
+                if any(a_start <= start and end <= a_end
+                       for a_start, a_end in accepted_ranges):
+                    continue
+                ids = tuple(self.source(level).get("entry_id")
+                            for level in range(start, end)
+                            if level in self.source_by_order)
+                if not ids:
+                    continue
+                artifact_id = f"target-provisional-summary-{start}-{end}"
+                artifacts[artifact_id] = Artifact(
+                    artifact_id=artifact_id, kind="block", level=2,
+                    source_ids=ids, status="provisional",
+                    inputs=(InputRef("target-provisional", artifact_id),),
+                    content={"summary": row["text"]},
+                    quality_labels=("provisional_target_summary",))
         for level in sorted(self.reference_texts):
             if level >= self.continuation_start or level not in self.source_by_order:
                 continue
@@ -3194,6 +3226,7 @@ class TranslationRunner:
                 if manual_holds >= manual_backlog and self.manual_review_queue():
                     waiting_manual = True
                     break
+                self._enforce_barriers(batch)
                 accepted_now = set(self.store.accepted_orders())
                 prior_drafts = {
                     order: text for order, text in
@@ -3211,6 +3244,7 @@ class TranslationRunner:
                     glossary=glossary, unresolved=unresolved)
                 self.materialize_provisional_index(
                     batch, {draft.order: draft.text for draft in drafts})
+                self._maybe_build_parent_blocks(batch)
                 pending.append((batch, drafts, jobs))
             if blocked:
                 self._drain_pending_pipeline_batches(pending)
@@ -3305,6 +3339,7 @@ class TranslationRunner:
             while index < len(orders):
                 self._check_limits()
                 batch = orders[index:index + batch_size]
+                self._enforce_barriers(batch)
                 documents = self.documents(max(batch) + 1)
                 snapshot = self.snapshot(batch[0], documents)
                 glossary = self.ensure_batch_glossary(batch)
@@ -3460,6 +3495,7 @@ class TranslationRunner:
                         break
                 if update_summaries:
                     self.update_target_summary()
+                self._maybe_build_parent_blocks(batch)
                 if blocked:
                     order, reason = blocked
                     raise ChapterBlocked(
@@ -3682,6 +3718,10 @@ class TranslationRunner:
                     continue
                 draft = self._commit_translation_draft(draft)
                 done_translations[draft.order] = draft.text
+            # DAG interleave: build L1 provisional/committed summaries for
+            # blocks whose in-batch chapters just finished translating, so
+            # later chapters' reviews see them.
+            self._materialize_batch_blocks(batch, done_translations)
             # Submit reviews for every chapter whose full prefix is settled.
             for order in sorted(set(done_translations) - {
                     job_order for job_order, _ in review_jobs}):
@@ -3714,6 +3754,60 @@ class TranslationRunner:
                 order, self.store.chapter(order))
             self._commit_review_result(job, draft_obj, errors, results)
 
+    def _materialize_batch_blocks(self, batch: Sequence[int],
+                                  done_translations: Mapping[int, str]) -> None:
+        """Interleaved DAG step: once a level 1 block is fully translated in
+        this batch, build its provisional summary so later chapters in the
+        same batch (and the reviewer) can see it.
+
+        Blocks fully accepted are rebuilt committed; partial blocks get a
+        provisional summary over the translated prefix.
+        """
+        index = self._summary_index()
+        built = any(b.status != "not_created" for b in index.blocks.values())
+        if not built:
+            return
+        batch_set = set(batch)
+        for block in sorted(index.blocks.values(),
+                            key=lambda b: (b.level, b.start)):
+            if block.level != 1:
+                continue
+            covered = [int(c[1:]) for c in block.children]
+            in_batch = [o for o in covered if o in batch_set]
+            if not in_batch:
+                continue
+            translated = [o for o in in_batch
+                          if done_translations.get(o) is not None]
+            if len(translated) != len(in_batch):
+                continue  # block still partial within this batch
+            accepted = set(self.store.accepted_orders())
+            full = all(o in accepted for o in covered)
+            if full and block.status != "committed":
+                index.build_level1(block, committed=True)
+            elif block.status in ("not_created", "provisional"):
+                index.build_level1(block, committed=False)
+            self.store.event(
+                "index_block_interleaved", start=block.start,
+                end=block.end, status=block.status)
+
+    def _maybe_build_parent_blocks(self, batch: Sequence[int]) -> None:
+        """After a batch: roll up level 2 parents whose L1 children are done."""
+        index = self._summary_index()
+        built = any(b.status != "not_created" for b in index.blocks.values())
+        if not built:
+            return
+        accepted = set(self.store.accepted_orders())
+        for parent in sorted((b for b in index.blocks.values()
+                              if b.level == 2), key=lambda b: b.start):
+            if parent.status != "not_created" or not parent.children:
+                continue
+            children = [index.blocks[c] for c in parent.children]
+            if all(c.status == "committed" for c in children):
+                index.build_level2(parent)
+                # Commit through the shared gate so the accepted-coverage
+                # invariant is checked in one place.
+                index.commit_block(parent, accepted_orders=accepted)
+
     def _draft_from_store(self, order: int, row) -> "DraftChapter":
         return DraftChapter(
             order=order, source_id=row["source_id"],
@@ -3722,6 +3816,69 @@ class TranslationRunner:
             paragraphs=tuple(p for p in row["text"].split("\n\n") if p),
             version=row["version"],
             review=_json_dict(row["review"]), assets=_json_dict(row["assets"]))
+
+    def _summary_index(self):
+        """Lazy SummaryIndex bound to this runner; None when unavailable."""
+        if getattr(self, "_summary_index_cache", None) is not None:
+            return self._summary_index_cache
+        from .summary_index import ChapterRef
+        chapters = []
+        for order in sorted(self.source_by_order):
+            doc = self.source_by_order[order]
+            zh = self.store.chapter(order)
+            zh_text = None
+            if zh and zh.get("status") == "accepted":
+                zh_text = zh.get("text")
+            elif order in self.reference_texts:
+                zh_text = self.reference_texts[order]
+            chapters.append(ChapterRef(order=order, title=doc["raw_title"],
+                                       ja_text=doc["text"], zh_text=zh_text))
+        from .block_builder import SummaryIndex
+        spec = self.project.config.index
+        if spec.child_max_chapters >= 100 and spec.expected_l2_count >= 10:
+            # Defaults keep every chapter in one L1 block; use the design
+            # defaults (10-chapter L1, 100-chapter L2) unless configured.
+            from translation.editions.index import EditionIndexSpec
+            spec = EditionIndexSpec(child_max_chapters=10,
+                                    parent_max_chapters=100,
+                                    expected_l2_count=10,
+                                    parent_build_mode="direct_then_rollup")
+        self._summary_index_cache = SummaryIndex(self, chapters, spec=spec)
+        return self._summary_index_cache
+
+    def _enforce_barriers(self, batch: Sequence[int]) -> None:
+        """Materialize blocks until translation/review barriers are clear.
+
+        strict mode: translation needs committed coverage; review always
+        does (review_barrier ignores strict).  Gaps that cannot be closed
+        because their chapters are not accepted yet raise, so callers stop
+        instead of silently translating without history.  No-op when the
+        project has no summary-block infrastructure or no built blocks and
+        the configuration never materialized any (legacy projects).
+        """
+        index = self._summary_index()
+        built = any(b.status != "not_created" for b in index.blocks.values())
+        if not built:
+            return
+        strict = getattr(self, "execution_policy", "concurrent") == "strict"
+        target = batch[0]  # barrier covers history before this batch
+        gaps = index.translation_barrier(target, strict=strict)
+        for gap_start, gap_end in list(gaps):
+            for block in sorted(index.blocks.values(),
+                                 key=lambda b: b.start):
+                if block.status != "not_created":
+                    continue
+                if block.start >= gap_start and block.end <= gap_end:
+                    if block.level == 1:
+                        index.build_level1(block, committed=strict)
+                    else:
+                        index.build_level2(block)
+        remaining = index.translation_barrier(target, strict=strict)
+        if remaining:
+            raise PipelineError(
+                "summary_barrier",
+                "history coverage gaps remain after materialization",
+                details={"order": target, "gaps": remaining})
 
     def _run_concurrent_continue(self, orders, *, start, end,
                                  translation_concurrency, review_concurrency,
@@ -3736,6 +3893,7 @@ class TranslationRunner:
                 batch = orders[index:index + batch_size]
                 if not batch:
                     continue
+                self._enforce_barriers(batch)
                 ctx = self._batch_continue_context(batch)
                 jobs = {}
 
@@ -3778,6 +3936,7 @@ class TranslationRunner:
                             batch, drafts, ctx, review_pool, errors, results)
                 processed += len(batch)
                 self.accept_ready_prefix()
+                self._maybe_build_parent_blocks(batch)
                 if update_summaries:
                     self.update_target_summary()
         self.accept_ready_prefix()
@@ -3811,6 +3970,134 @@ class TranslationRunner:
         self.accept_ready_prefix()
         return {"repaired": repaired, "errors": errors,
                 "stats": self.store.stats()}
+
+    def stale_review_pass(self, *, force: bool = False) -> dict:
+        """One full-chapter re-review at the pre-export stabilization point.
+
+        Candidates are accepted chapters whose review context changed after
+        their acceptance: term-revision markers (`term_revision_required`),
+        manual glossary fixes (`manual_glossary_fix`/`manual_text_fix`) or
+        index-block rebuilds that landed after the chapter's own review.
+        Each candidate is re-reviewed at most once per stabilization; a
+        fingerprint (chapter + glossary + block generations) is recorded in
+        the review payload so repeated triggers do not loop.  Chapters that
+        still produce a major finding after re-review go to manual_review.
+        """
+        from .summary_index import COMMITTED
+        reviewed = []
+        skipped = []
+        manual = []
+        index = None
+        try:
+            index = self._summary_index()
+        except Exception:
+            index = None
+
+        # Collect change markers with their event ids.  Only markers recorded
+        # AFTER a chapter's own review count as stale causes; index_block
+        # fan-out is limited to chapters accepted before the rebuild (a block
+        # built from already-accepted prose cannot invalidate that prose).
+        markers: dict[int, list[str]] = {}
+        chapters_last_event: dict[int, int] = {}
+        for row in self.store.db.execute(
+                "SELECT edition_order,event_id FROM events"
+                " WHERE kind='accept' AND edition_order IS NOT NULL"):
+            order = row["edition_order"]
+            if order not in chapters_last_event or row["event_id"] > chapters_last_event[order]:
+                chapters_last_event[order] = row["event_id"]
+        for row in self.store.db.execute(
+                "SELECT event_id, edition_order, kind, payload FROM events"
+                " WHERE kind IN ('term_revision_required','manual_glossary_fix',"
+                "'manual_text_fix','index_block') ORDER BY event_id"):
+            order = row["edition_order"]
+            payload = _json_dict(row["payload"]) if row["payload"] else {}
+            if row["kind"] == "index_block":
+                start = int(payload.get("start", -1))
+                end = int(payload.get("end", -1))
+                order_list = [o for o in range(start, end)
+                              if o in self.source_by_order
+                              and o in chapters_last_event
+                              and chapters_last_event[o] < row["event_id"]]
+                for affected in order_list:
+                    markers.setdefault(affected, []).append(
+                        f"index_block[{start}:{end})")
+                continue
+            if order is None:
+                continue
+            markers.setdefault(order, []).append(row["kind"])
+
+        block_generations = {}
+        if index is not None:
+            for block in index.blocks.values():
+                block_generations[block.block_id] = block.generation
+
+        for order in sorted(self.contiguous_accepted_range()):
+            row = self.store.chapter(order)
+            if not row or row["status"] != "accepted":
+                continue
+            review = _json_dict(row["review"])
+            prior_fp = review.get("stale_review_fingerprint")
+            import hashlib as _hashlib
+            fp_source = {
+                "order": order,
+                "text_hash": digest(row["text"]),
+                "markers": sorted(set(markers.get(order, []))),
+                "blocks": sorted(block_generations.items()),
+            }
+            fp = _hashlib.sha256(json.dumps(
+                fp_source, ensure_ascii=False, sort_keys=True)
+                .encode("utf-8")).hexdigest()[:16]
+            if order not in markers:
+                skipped.append(order)
+                continue
+            if prior_fp == fp and not force:
+                skipped.append(order)
+                continue
+            self.store.event("stale_review", order=order,
+                             causes=sorted(set(markers[order])),
+                             fingerprint=fp)
+            try:
+                draft = self._draft_from_store(order, row)
+                review_outcome = self.review_order(draft)
+                if review_outcome.errors:
+                    raise ChapterBlocked(
+                        "review_protocol", "stale re-review output invalid",
+                        details={"order": order})
+                decisions = self.adjudicate(draft, review_outcome)
+                confirmed = {f["id"]: f for f in review_outcome.findings
+                             if decisions.get(f["id"], {}).get(
+                                 "decision") == "confirmed"}
+                major = self._revision_findings(confirmed, review_outcome)
+                major.update(self._unresolved_term_findings(
+                    review_outcome, draft, terms=None))
+                updated = _json_dict(row["review"])
+                updated["stale_review_fingerprint"] = fp
+                updated["stale_review"] = {
+                    "causes": sorted(set(markers[order])),
+                    "major": sorted(major),
+                    "rounds": review_outcome.rounds if hasattr(
+                        review_outcome, "rounds") else 0,
+                }
+                if major:
+                    self.store.set_status(order, "manual_review", updated)
+                    self.store.event("stale_review_manual", order=order,
+                                     findings=sorted(major))
+                    manual.append(order)
+                else:
+                    self.store.set_status(order, "accepted", updated)
+                    reviewed.append(order)
+            except ChapterBlocked as exc:
+                self.store.set_status(order, "manual_review",
+                                      {"stale_review_error": str(exc)})
+                manual.append(order)
+        return {"reviewed": reviewed, "skipped": skipped,
+                "manual": manual}
+
+    def contiguous_accepted_range(self) -> list[int]:
+        accepted = set(self.store.accepted_orders())
+        return [order for order in range(self.continuation_start,
+                                         self.main_end)
+                if order in accepted]
 
     def contiguous_accepted_end(self) -> int:
         accepted = set(self.store.accepted_orders())

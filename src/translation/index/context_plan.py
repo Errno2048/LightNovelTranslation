@@ -179,6 +179,13 @@ def _select_level(snapshot, documents, level, boundary, remaining_budget,
     selected.sort(key=lambda item: (item[0], item[1]))
     required_ids = {row[2].artifact_id for row in selected}
     used = sum(estimator.count(_block_text(row[2])) for row in selected)
+    if level == 1:
+        # Level 1 keeps exactly the configured recent blocks (plus the
+        # sibling completion above); deeper history belongs to level 2.
+        new_boundary = min(row[0] for row in selected)
+        return selected, new_boundary, warnings
+    # Level 2 and above: fill the remaining budget with earlier parents so
+    # the whole prefix stays covered when configured as "all".
     if used <= remaining_budget:
         for row in reversed([item for item in rows if item[2].artifact_id not in required_ids]):
             cost = estimator.count(_block_text(row[2]))

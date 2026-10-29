@@ -53,6 +53,14 @@ class TranslationWorkflow:
             self.full_chapters = workflow.full_chapters
         if self.reference_summary_tokens is None:
             self.reference_summary_tokens = workflow.summary_tokens
+        # Level selection counts follow the workflow config: level 1 keeps
+        # the most recent N blocks; level 2 includes every earlier parent
+        # unless a numeric cap is configured.
+        n_l1 = int(getattr(workflow, "context_num_level1", 3) or 3)
+        n_l2_cfg = getattr(workflow, "context_num_level2", "all")
+        n_l2 = n_l1 if n_l2_cfg == "all" else int(n_l2_cfg)
+        self.levels = LevelConfig(self.levels.max_children,
+                                  (n_l1, n_l2))
         self.archive = self.project._archive([self.source_edition, self.reference_edition])
         self._source_docs = self.archive.documents(self.source_edition)
         self._reference_docs = self.archive.documents(self.reference_edition)
