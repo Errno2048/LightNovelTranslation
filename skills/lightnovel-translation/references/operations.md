@@ -102,6 +102,9 @@ bilingual_mode = "auto"   # auto | pairs | blocks
 backfill = "ask"          # ask | all | extras | none
 failure_policy = "stop_batch" # stop_batch | continue
 review_start = "barrier"      # barrier | as_completed | prefix_as_completed（后两者需 continue）
+execution_policy = "concurrent" # concurrent | strict（strict 要求 committed 覆盖 + stop_batch）
+context_num_level1 = 3        # 上下文保留的最近 level-1 块数
+context_num_level2 = "all"    # level-2 块数："all" 或正整数
 ```
 
 实测提示：`batch_size=30` + 30/30 能获得很高的单批吞吐，但当前 provider 在 30 并发下会出现 network/timeout，`repair_pending()` 又是串行的。生产建议 `batch_size=30`、`translation_concurrency=8–10`、`review_concurrency=8–10`；若坚持 30/30，保留 `failure_policy="continue"` + `review_start="as_completed"`，并在导出前跑 `repair_pending()`。review worker 只能在主线程传入的 `tool_context`/`glossary` 上工作，不能读写 SQLite。
@@ -112,9 +115,9 @@ review_start = "barrier"      # barrier | as_completed | prefix_as_completed（�
 - `as_completed`：任一章翻译完成即提交审校；此时审校历史里可能还看不到批内更早章节的译文。需 `failure_policy="continue"`。
 - `prefix_as_completed`：某章的批内前序章节全部落定（译完或终态失败）后才提交该章审校，保住审校历史的完整性；吞吐介于两者之间。需 `failure_policy="continue"`。
 
-### 0.2 层级摘要块物化（规划中，TODO）
+### 0.2 层级摘要块物化（0.6 已接入）
 
-当前 runner **没有** level 1 / level 2 分层摘要物化。`summaries` 表里只有四个扁平 scope，块位置按章数/批次界定，与 token 预算和层级无关：
+层级摘要块是 0.6 起的主历史来源；旧的扁平 `summaries` scope 仅在项目没有任何 `summary_blocks` 时作为 legacy 回退。扁平 scope 的触发/边界（legacy 回退路径）：
 
 | scope | 触发点 | 块位置 |
 |---|---|---|
@@ -122,14 +125,22 @@ review_start = "barrier"      # barrier | as_completed | prefix_as_completed（�
 | `target-provisional` | pipelined 每批全部 draft 落库后 | 整批一块 `[batch_first, batch_last+1)`；模型失败降级为每章前 300 字拼接 |
 | `target` | `update_target_summary()`：batch 每批后、逐章模式每章后、pipelined 仅收尾无 blocked 时 | 从 `continuation_start` 起、按 `summary_every`（默认 5 章）对齐的连续 accepted 前缀；范围内有未接受章节则指针停住 |
 
-`translation.index.summary_index` 与 `translation.index.block_builder`（`SummaryIndex`）实现了真正的分层物化，但**尚未接入 runner、未从 `translation.index` 导出**，属于规划能力：
+`translation.index.summary_index` 与 `translation.index.block_builder`（`SummaryIndex`）提供分层物化，**已接入全部 runner 执行路径**：
 
 - 块边界由 `plan_blocks()` 按 token 预算贪心划分：level 1 受 `level1_capacity`（上下文窗口 − 摘要输出 − 安全余量 − 8192）和 `child_max_chapters` 约束，level 2 按 `expected_l2_count` / `parent_max_chapters` 归堆。
 - level 2 物化先尝试 direct 直出，捕获 `context_budget` 后回退为“先物化全部 level-1 子块，再 rollup”（`lazy.required_children_for_high_level` 的不变量）。
-- `translation_barrier()` / `review_barrier()` 把全文窗口对齐到 level-1 边界，用 `coverage_gap` 返回必须先补齐的区间；调用方负责物化。
-- provisional → committed 的门槛是块覆盖章节全部 accepted（`commit_block`），与章号无关。
+- `translation_barrier()` / `review_barrier()` 把全文窗口对齐到 level-1 边界，用 `coverage_gap` 返回必须先补齐的区间；`review_barrier` 无论 strict 与否只认 COMMITTED 覆盖（审校基于 accepted 事实）。
+- provisional → committed 的门槛是块覆盖章节全部 accepted（`commit_block`），与章号无关；L2 rollup 后同样经 `commit_block` 统一检查。
 
-已知待办：`review_barrier` 当前直接复用 `translation_barrier`，`strict=False` 时审校屏障也接受 PROVISIONAL 覆盖，与“审校只基于 accepted 事实”的设计意图不符（docstring 已标注 TODO）。接线前需先裁决该差异。
+已接线行为（0.6）：
+
+- `runner.snapshot()` 优先读取 `summary_blocks` 表，把 committed/provisional 块变成 level 1/2 artifacts 喂给 `build_context_plan`；无块时回退旧 flat summaries（legacy 兼容）。
+- `_select_level`：level 1 只保留 `context_num_level1`（默认 3）个最近块 + sibling 补齐；level 2+ 按 `context_num_level2`（默认 "all"）用预算填满全部更早父块。全文窗口自动向下对齐到 level 1 边界；包含 lower 的 L1 块作为 containing block 计入，不泄漏 target 之后的块。
+- `_enforce_barriers`：`run_concurrent`（stop_batch 与 continue 两条路径）和 `run_pipelined` 每批翻译前都会检查 `translation_barrier`（`execution_policy=strict` 时要求 committed，否则接受 provisional），缺口先物化，无法闭合则抛 `summary_barrier`。旧项目无块时 no-op。
+- `execution_policy = "strict" | "concurrent"`（workflow 配置）。strict 强制 `failure_policy=stop_batch`。
+- 批内 DAG：`prefix_as_completed`/`as_completed` 路径在批内某 L1 块的章全部译完时即时物化该块（accepted 满员→committed，否则 provisional），事件 `index_block_interleaved`；所有执行路径批结束后 `_maybe_build_parent_blocks` rollup 全 committed 的 L2 父块（经 `commit_block` 提交）。
+- 导出前 `runner.stale_review_pass()`：以 `term_revision_required`/`manual_glossary_fix`/`manual_text_fix`/`index_block`（限 accept 之后重建的块）为 stale 原因，对受影响 accepted 章做一次全章重审；指纹（章文本+markers+块 generation）写入 review 防止重复；重审仍有 major → `manual_review`。
+
 
 ## 1. 运行前检查
 

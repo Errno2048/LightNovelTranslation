@@ -974,19 +974,19 @@ Token 预算由 `plan_request` 统一计算；workset/实体/线程/定向证据
 - 需要旧完整自动管线时使用 `legacy-sequence` 分支。
 - 验证：共享测试、新索引测试和 pipeline 离线测试通过；离线示例输出摘要 + 全文 + target 段并完成两次 provider 调用；真实 Web 章节已跑通翻译 → 审校 → 裁决 → 修订 → 复审 → accepted。
 
-### 21.1 摘要物化现状与分层块 TODO（2026-10-29）
+### 21.1 摘要物化现状与分层块接线（2026-10-29 更新）
 
-当前接线的摘要物化是扁平滚动 scope，块位置按章数/批次界定，与层级和 token 预算无关：
+分层块已接入 runner（0.6）。当前双路径行为：
 
-- `reference` / `reference-progress`：`ensure_reference_summary()` 按 `reference_chunk`（默认 16 章）分块推进。
-- `target`：`update_target_summary()` 从 `continuation_start` 起按 `summary_every`（默认 5 章）对 accepted 连续前缀切块；范围内有未接受章节时指针停住。`run_concurrent`/`run` 每批/每章后触发，`run_pipelined` 仅在收尾且无 blocked 时触发。
-- `target-provisional`：pipelined 每批 draft 落库后整批一块，模型失败时降级为每章前 300 字拼接。
+- **分层块路径（主）**：`summary_blocks` 表（level 1 章组块 + level 2 父块）是主要历史来源。`runner.snapshot()` 把 committed/provisional 块包装成 level 1/2 artifacts；`run_concurrent`（stop_batch 与 continue 两条路径）和 `run_pipelined` 每批前经 `_enforce_barriers` 检查 `translation_barrier`（`execution_policy=strict` 要求 committed，默认 concurrent 接受 provisional），缺口自动物化，无法闭合抛 `summary_barrier`；`review_barrier` 无论模式只认 COMMITTED。批内 DAG：`prefix_as_completed`/`as_completed` 路径下批内某 L1 块译完即物化其摘要（事件 `index_block_interleaved`）；所有路径批结束后 rollup 全 committed 子块的 L2 父块，经 `commit_block` 统一提交。导出前 `stale_review_pass()` 按 stale 指纹重审受影响的 accepted 章。
+- **扁平 scope 路径（legacy 回退）**：项目没有任何 `summary_blocks` 时沿用 `summaries` 扁平 scope——`reference`/`reference-progress` 按 `reference_chunk` 分块；`target` 按 `summary_every` 对 accepted 连续前缀切块（有未接受章节则指针停住）；`target-provisional` 整批一块。`run_pipelined` 仅收尾无 blocked 时更新 accepted 摘要。
 
-`translation.index.summary_index` 与 `translation.index.block_builder`（`SummaryIndex`）实现了 level 1 / level 2 分层物化，**未接入 runner、未从 `translation.index` 导出**，仅有测试覆盖。其设计语义：块边界由 token 预算贪心划分（level 1 受 `level1_capacity` 约束，level 2 归堆 level-1 块）；level 2 direct 优先、超容量回退为“先物化全部 level-1 子块再 rollup”；`translation_barrier()`/`review_barrier()` 以 coverage gap 声明物化前置条件；`commit_block()` 在覆盖章节全部 accepted 后升 committed。
+上下文分层选择（`context_plan._select_level`）：level 1 保留最近 `context_num_level1`（默认 3）块 + sibling 补齐后立即返回，更早历史交给 level 2+；level 2+ 按 `context_num_level2`（默认 "all"）用剩余预算回填更早父块。全文窗口向下对齐到 L1 边界；包含窗口起点的 L1 块作为 containing block 计入，起点在 target 之后的块排除（防未来泄漏）。
 
-接线前待办（TODO）：
+接线时已完成的原待办：`review_barrier` 与 `translation_barrier` 分离并固定为 COMMITTED-only；L2 rollup 经 `commit_block` 统一 accepted 覆盖检查；屏障覆盖全部执行路径。
 
-1. 裁决 `review_barrier` 语义：当前直接复用 `translation_barrier`，`strict=False` 时审校屏障接受 PROVISIONAL 覆盖，与“审校基于 accepted 事实”的设计意图不符（docstring 已标注）。
-2. 把扁平 scope 迁移或映射到分层块（含 `summary_every` 节奏与 token 预算边界的取舍）。
-3. 在 runner 批次循环中按 barrier gap 自动物化缺失块，并从 `translation.index` 导出 `SummaryIndex`。
-4. 更新技能文档（operations.md 0.2、new-architecture.md 7.5）中的“规划中”标注。
+仍未完成：
+
+1. `SummaryIndex` 未从 `translation.index` 导出（runner 内部使用，外部 API 面不变）。
+2. 扁平 scope → 分层块的无缝迁移工具（旧项目需重建块或继续走 legacy 回退）。
+3. `_summary_index()` 对退化默认 spec 的探测改用显式配置而非魔法数判断。

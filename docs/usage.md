@@ -221,7 +221,7 @@ runner.run_mode(start=199, end=260)
 
 `failure_policy="continue"` 时单章翻译/审校失败不再阻断同批或后续批次；`review_start` 控制审校启动时机：`barrier`（批内全部译完后）、`as_completed`（每章译完即审）、`prefix_as_completed`（该章批内前序章节全部落定后即审，保住审校历史完整性）；后两者要求 `failure_policy="continue"`。导出前调用 `runner.repair_pending()` 统一重试 blocked/draft 章节。
 
-当前的摘要块均为扁平滚动 scope，按章数/批次界定边界；level 1 / level 2 分层物化（`translation.index.summary_index` / `block_builder` 的 `SummaryIndex`）尚未接入 runner，属于规划能力，见技能文档 [operations.md 0.2](../skills/lightnovel-translation/references/operations.md)（TODO）。
+0.6 起层级摘要块（`summary_blocks` 表，level 1 章组块 + level 2 父块）是主要历史来源：每批前按 `execution_policy` 检查覆盖屏障（strict 要求 committed，默认 concurrent 接受 provisional），缺口自动物化；批内某 level-1 块译完即物化其摘要供后续审校使用；导出前可用 `stale_review_pass()` 对受术语修订/人工修补/块重建影响的 accepted 章重审。旧项目的扁平滚动 scope 仍作 legacy 回退，详见技能文档 [operations.md 0.2](../skills/lightnovel-translation/references/operations.md) 与 [new-architecture.md 7.5](../skills/lightnovel-translation/references/new-architecture.md)。
 
 ### 4.2 实体/形式术语表
 

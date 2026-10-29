@@ -246,18 +246,18 @@ from translation.index import (
 - **资产**：`load_asset_index` 在 source EPUB 无图片资源时跳过逐页解析。
 - **双语**：`build_epub(..., bilingual=True)` 读取每章 `bilingual_mode`；`blocks` 不再产生逐段“段落数不一致”提示。
 
-### 7.5 层级摘要块物化（TODO，规划中）
+### 7.5 层级摘要块物化（0.6 已接入）
 
-当前 runner 的摘要全部是 `summaries` 表里的扁平滚动 scope（`reference`、`reference-progress`、`target`、`target-provisional`），块位置按章数/批次界定：`target` 从 `continuation_start` 起每 `summary_every`（默认 5）章对 accepted 连续前缀切块，`target-provisional` 整批一块；范围内出现未接受章节时 `update_target_summary()` 会停住指针，不允许跳过打洞。快照把这些摘要包装成 level-2 Artifact 供 ContextPlan 使用，**level 1 在已接线路径中从未出现**。
+0.6 起，层级摘要块（`translation.index.summary_index` / `block_builder` 的 `SummaryIndex`）是主要历史来源，已接入全部 runner 执行路径：
 
-真正的 level 1 / level 2 分层物化存在于 `translation.index.summary_index` / `translation.index.block_builder`（`SummaryIndex`），**尚未接入 runner、未从 `translation.index` 导出**，属于规划能力（TODO）：
+- 块边界由 token 预算贪心划分：level 1 受 `level1_capacity` 与 `child_max_chapters` 约束，level 2 按 `expected_l2_count` / `parent_max_chapters` 归堆。runner 检测到配置处于退化默认（单块容纳全部章节）时自动改用设计默认（L1=10 章、L2=100 章）。
+- `runner.snapshot()` 优先把 `summary_blocks` 表中的 committed/provisional 块包装成 level 1/2 artifacts 喂给 ContextPlan；项目没有任何分层块时回退旧扁平 `summaries` scope（`target` 每 `summary_every` 章一块、`target-provisional` 每批一块），legacy 项目行为不变。
+- 每批翻译前 `_enforce_barriers` 检查 `translation_barrier`：`execution_policy="strict"` 要求 committed 覆盖，`concurrent`（默认）接受 provisional；缺口先自动物化，无法闭合抛 `summary_barrier`。`review_barrier` 无论模式只认 COMMITTED（审校基于 accepted 事实）。
+- 批内 DAG 交错物化：`prefix_as_completed`/`as_completed` 路径下，批内某 L1 块的章全部译完即物化该块摘要（覆盖章全部 accepted→committed，否则 provisional，事件 `index_block_interleaved`），后续章节审校可见；所有路径批结束后 rollup 全 committed 子块的 L2 父块，经 `commit_block` 统一提交。
+- 上下文分层选择：level 1 保留最近 `context_num_level1`（默认 3）块 + sibling 补齐，level 2+ 按 `context_num_level2`（默认 "all"）用预算回填更早父块；全文窗口自动对齐到 L1 边界，不泄漏 target 之后的块。
+- 导出前稳定化 `runner.stale_review_pass()`：accept 之后发生过术语修订、人工修补或相关块重建的 accepted 章，做一次全章重审（指纹防重复）；仍有 major → `manual_review`。
 
-- 块边界由 token 预算贪心划分：level 1 受 `level1_capacity` 与 `child_max_chapters` 约束，level 2 按 `expected_l2_count` / `parent_max_chapters` 归堆；与现行固定章数节奏不同。
-- level 2 物化 direct 优先，`context_budget` 超限时回退为“先物化该父块全部 level-1 子块再 rollup”，对应 `required_children_for_high_level` 的覆盖不变量。
-- `translation_barrier()` / `review_barrier()` 以 coverage gap 形式声明“翻译/审校某章前必须先物化哪些区间”，由调用方执行；`commit_block()` 在块覆盖章节全部 accepted 后把 provisional 升为 committed。
-- 已知差异：`review_barrier` 目前直接复用 `translation_barrier`，`strict=False` 时审校也接受 PROVISIONAL 覆盖，与“审校基于 accepted 事实”的设计意图不符；接线前需裁决（docstring 已标注 TODO）。
-
-在接线完成前，不要把这些模块当作可用 API；摘要触发表与边界规则详见 [operations.md 0.2](operations.md#02-层级摘要块物化规划中todo)。
+扁平 scope 的触发/边界表与运维细节见 [operations.md 0.2](operations.md#02-层级摘要块物化06-已接入)。`SummaryIndex` 仍由 runner 内部使用，未从 `translation.index` 导出。
 
 ## 8. 当前自动化边界与手动接管
 

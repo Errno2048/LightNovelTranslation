@@ -29,7 +29,7 @@ description: 使用 lightnovel_translation 的新分层索引工作流标准化 
 - **双语模式**：参考章默认 `bilingual_mode="blocks"`（按章对照），流水线生成章默认 `pairs`（逐段 S/T）。
 - **错误隔离**：`failure_policy="continue"` 时单章翻译/审校失败不再阻断同批或后续批次；成功章节继续成为 `ready`/`accepted`，失败章节记为 `blocked`。可配 `review_start="as_completed"`（每章译完即审）或 `"prefix_as_completed"`（批内前序章节落定后即审）让审校随翻译推进，两者都要求 `failure_policy="continue"`。最终导出前调用 `runner.repair_pending()` 统一重试 blocked/draft 章节；manual_review 仍需人工。
 - **补译**：`runner.backfill_plan()` / `runner.run_backfill()` 处理参考区间内无参考的缺口；执行前先把 `plan.report` 给用户确认。
-- **层级摘要块**：当前 runner 只使用扁平滚动摘要 scope（`target` 每 `summary_every` 章一块、`target-provisional` 每批一块）；level 1/level 2 分层物化（`summary_index`/`block_builder` 的 `SummaryIndex`）尚未接入 runner，属规划能力（TODO），不要当作可用 API。
+- **层级摘要块**：0.6 起层级摘要块（`summary_blocks` 表）是主要历史来源，已接入全部执行路径：每批前按 `execution_policy`（`strict`/`concurrent`）检查覆盖屏障并自动物化缺口；批内某 level-1 块译完即物化摘要（`prefix_as_completed`/`as_completed` 路径）；`review_barrier` 只认 committed。导出前可跑 `runner.stale_review_pass()` 重审受影响的 accepted 章。旧扁平 scope 仅作 legacy 回退。
 - **配置与探针**：生成阶段用 `TranslationProject(path)`，不要传空的 `TranslationConfig()`；provider 探针 `max_tokens >= 256`。
 - **资产索引**：无图片 EPUB 会跳过全页资产解析；有图片时仍会构建索引。
 
